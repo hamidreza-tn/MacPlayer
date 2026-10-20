@@ -21,6 +21,9 @@ jobs:
       - name: Install libmpv
         run: brew install mpv
 
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
       - name: Run offline locked tests
         run: make test
 
