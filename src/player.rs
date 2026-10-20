@@ -32,6 +32,8 @@ use crate::widgets::{
 };
 
 const PLAYLIST_EXT: &[&str] = crate::util::PLAYLIST_EXT;
+const VIDEO_EXT: &[&str] = crate::util::VIDEO_EXT;
+const AUDIO_EXT: &[&str] = crate::util::AUDIO_EXT;
 const FS_EDGE_TIMEOUT: f64 = 3.0;
 
 /// A single thing the UI wants the player to do. Chrome, menus and dialogs all push into
@@ -543,17 +545,15 @@ impl Player {
     }
 
     fn update_sub_margin(&mut self) {
-        let mut margin = 22.0;
-        if self.fullscreen && self.fs_bottom {
-            margin += ((SEEK_H + CTRL_H + 2.0) * 720.0 / self.window_height().max(1.0)).round();
-        }
-        self.set_prop("sub-margin-y", margin as f64);
+        self.update_sub_margin_for_height(self.settings.window_h as f32);
     }
 
-    fn window_height(&self) -> f32 {
-        // The renderer knows the current viewport; we only need an approximate height for the
-        // subtitle margin heuristic, so fall back to the configured size.
-        self.settings.window_h as f32
+    fn update_sub_margin_for_height(&mut self, viewport_height: f32) {
+        let mut margin = 22.0;
+        if self.fullscreen && self.fs_bottom {
+            margin += ((SEEK_H + CTRL_H + 2.0) * 720.0 / viewport_height.max(1.0)).round();
+        }
+        self.set_prop("sub-margin-y", margin as f64);
     }
 
     fn remember_window_geometry(&mut self, ctx: &Context) {
@@ -1324,12 +1324,32 @@ impl Player {
         self.osd(format!("Subtitle sync: {value:+.1} sec"));
     }
 
+    fn set_sub_delay(&mut self, value: f64) {
+        let value = if value.is_finite() {
+            (value.clamp(-600.0, 600.0) * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
+        self.set_prop("sub-delay", value);
+        self.osd(format!("Subtitle sync: {value:+.1} sec"));
+    }
+
     fn sub_scale(&mut self, delta: f64) {
         let value = if let Some(engine) = self.engine() {
             engine.add("sub-scale", delta, Some(0.3), Some(3.0))
         } else {
             1.0
         };
+        self.osd(format!("Subtitle size: {:.0}%", value * 100.0));
+    }
+
+    fn set_sub_scale(&mut self, value: f64) {
+        let value = if value.is_finite() {
+            value.clamp(0.3, 3.0)
+        } else {
+            1.0
+        };
+        self.set_prop("sub-scale", value);
         self.osd(format!("Subtitle size: {:.0}%", value * 100.0));
     }
 
@@ -1455,6 +1475,16 @@ impl Player {
         self.osd(format!("{name}{rest}: {value:+.0}"));
     }
 
+    fn set_image_adjust(&mut self, prop: &str, value: f64) {
+        let value = if value.is_finite() {
+            value.clamp(-100.0, 100.0).round()
+        } else {
+            0.0
+        };
+        self.set_prop(prop, value);
+        self.osd(format!("{prop}: {value:+.0}"));
+    }
+
     fn image_reset(&mut self) {
         for prop in ["brightness", "contrast", "saturation", "hue", "gamma"] {
             self.set_prop(prop, 0.0);
@@ -1505,6 +1535,16 @@ impl Player {
         let value = match delta {
             None => 0.0,
             Some(d) => (self.get_f64("audio-delay") + d).round() * 1000.0 / 1000.0,
+        };
+        self.set_prop("audio-delay", value);
+        self.osd(format!("Audio sync: {value:+.2} sec"));
+    }
+
+    fn set_audio_delay(&mut self, value: f64) {
+        let value = if value.is_finite() {
+            (value.clamp(-60.0, 60.0) * 1000.0).round() / 1000.0
+        } else {
+            0.0
         };
         self.set_prop("audio-delay", value);
         self.osd(format!("Audio sync: {value:+.2} sec"));
@@ -2221,7 +2261,9 @@ impl Player {
                 self.remember_secondary_subtitle(selection);
             }
             Action::SubDelay(delta) => self.sub_delay(delta),
+            Action::SetSubDelay(value) => self.set_sub_delay(value),
             Action::SubScale(delta) => self.sub_scale(delta),
+            Action::SetSubScale(value) => self.set_sub_scale(value),
             Action::SubMove(direction) => self.sub_move(direction),
             Action::SubReset => self.sub_reset(),
             Action::SubSeek(direction) => {
@@ -2241,6 +2283,7 @@ impl Player {
             Action::Rotate(degrees) => self.rotate(degrees),
             Action::ToggleFlip(name) => self.toggle_flip(name),
             Action::ImageAdjust(prop, direction) => self.image_adjust(prop, direction),
+            Action::SetImageAdjust(prop, value) => self.set_image_adjust(prop, value),
             Action::ImageReset => self.image_reset(),
             Action::ToggleDeinterlace => self.toggle_deinterlace(),
             Action::SetHwdec(enabled) => self.set_hwdec(enabled),
@@ -2249,6 +2292,7 @@ impl Player {
             Action::VolumeStep(direction) => self.volume_step(direction),
             Action::ToggleMute => self.toggle_mute(),
             Action::AudioDelay(delta) => self.audio_delay(delta),
+            Action::SetAudioDelay(value) => self.set_audio_delay(value),
             Action::SetAudioDevice(name) => self.set_prop("audio-device", name.as_str()),
             Action::ToggleNormalize => self.set_normalize(!self.normalize),
             Action::SetNormalize(enabled) => self.set_normalize(enabled),
@@ -2309,6 +2353,7 @@ impl Player {
             Action::SetOnTop(mode) => self.set_on_top(&mode),
             Action::CycleOnTop => self.cycle_on_top(),
             Action::ToggleInfo => self.toggle_info(),
+            Action::ToggleRemaining => self.toggle_remaining(),
             Action::ToggleFullscreen => self.toggle_fullscreen(ctx),
             Action::ExitFullscreen => {
                 if self.fullscreen {
@@ -2477,6 +2522,7 @@ impl Player {
             K::Num2 if none => (Action::SetWindowScale(100), false),
             K::Num3 if none => (Action::SetWindowScale(150), false),
             K::Num4 if none => (Action::SetWindowScale(200), false),
+            K::W if ctrl => (Action::Close, false),
             K::W if none => (Action::ImageAdjust("brightness", -1), true),
             K::E if none => (Action::ImageAdjust("brightness", 1), true),
             K::R if none => (Action::ImageAdjust("contrast", -1), true),
@@ -2501,8 +2547,19 @@ impl Player {
         self.now = self.started_at.elapsed().as_secs_f64();
         self.osd.tick();
 
-        if let Some(error) = &self.startup_error {
-            ui.label(error.clone());
+        if let Some(error) = self.startup_error.clone() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("MacPlayer could not start");
+                ui.add_space(12.0);
+                ui.label(error);
+                ui.add_space(16.0);
+                if ui.button("Exit").clicked() {
+                    self.quit();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
 
@@ -2686,6 +2743,7 @@ impl Player {
             )
         });
         let window = ctx.content_rect();
+        let previous_fs_bottom = self.fs_bottom;
         let top_zone = Rect::from_min_max(
             window.min,
             pos2(
@@ -2720,6 +2778,9 @@ impl Player {
             self.fs_bottom = false;
             self.fs_top_deadline = 0.0;
             self.fs_bottom_deadline = 0.0;
+        }
+        if previous_fs_bottom != self.fs_bottom {
+            self.update_sub_margin_for_height(window.height());
         }
         let video_rect = self.layout(window).video;
         self.mouse_in_video = hover.is_some_and(|pos| video_rect.contains(pos));
@@ -2978,7 +3039,7 @@ impl Player {
             let time_rect =
                 Rect::from_min_size(pos2(time_x, rect.top()), vec2(time_w, rect.height()));
             if time_label(ui, time_rect, Id::new("time"), &left, &right) {
-                self.pending.push(Action::ToggleInfo);
+                self.pending.push(Action::ToggleRemaining);
             }
         }
         if badge_w > 0.0 {
@@ -3208,9 +3269,11 @@ impl eframe::App for Player {
         self.remember_position();
         self.settings.first_run = false;
         self.settings.save();
-        if let (Some(renderer), Some(gl)) = (self.renderer.take(), gl) {
+        if let Some(renderer) = self.renderer.take() {
             if let Ok(mut renderer) = renderer.lock() {
-                unsafe { renderer.shutdown(gl) };
+                if let Some(gl) = gl {
+                    unsafe { renderer.shutdown(gl) };
+                }
             }
         }
         if let Some(mut engine) = self.engine.take() {
@@ -3298,13 +3361,12 @@ fn open_folder(path: &str) {
 }
 
 fn media_extensions() -> Vec<String> {
-    [
-        "mkv", "mp4", "avi", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg", "ts", "m2ts",
-        "ogv", "3gp",
-    ]
-    .iter()
-    .map(|e| e.to_string())
-    .collect()
+    VIDEO_EXT
+        .iter()
+        .chain(AUDIO_EXT)
+        .chain(PLAYLIST_EXT)
+        .map(|extension| extension.trim_start_matches('.').to_string())
+        .collect()
 }
 
 fn sub_extensions() -> Vec<String> {

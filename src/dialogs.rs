@@ -1065,7 +1065,7 @@ impl ControlPanel {
             label(ui, "Audio sync (sec):");
             let mut d = self.state.audio_delay;
             if spin(ui, "audio-delay", &mut d, 0.05, -60.0, 60.0, "") {
-                actions.push(Action::AudioDelay(Some(d)));
+                actions.push(Action::SetAudioDelay(d));
                 self.state.audio_delay = d;
             }
         });
@@ -1107,7 +1107,7 @@ impl ControlPanel {
                     self.loading = false;
                 }
                 if r.changed() {
-                    actions.push(Action::ImageAdjust(prop, v as i32));
+                    actions.push(Action::SetImageAdjust(prop, v));
                 }
                 ui.add_space(4.0);
                 ui.label(
@@ -1140,7 +1140,7 @@ impl ControlPanel {
         row(ui, "Subtitle sync (sec)", |ui| {
             let mut v = self.state.sub_delay;
             if spin(ui, "sub-delay", &mut v, 0.5, -600.0, 600.0, "") {
-                actions.push(Action::SubDelay(Some(v)));
+                actions.push(Action::SetSubDelay(v));
                 self.state.sub_delay = v;
             }
         });
@@ -1152,7 +1152,7 @@ impl ControlPanel {
                     .show_value(false),
             );
             if r.changed() {
-                actions.push(Action::SubScale(v / 100.0));
+                actions.push(Action::SetSubScale(v / 100.0));
                 self.state.sub_scale = v / 100.0;
             }
         });
