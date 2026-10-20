@@ -726,9 +726,6 @@ impl Player {
             }
             EngineMsg::StartFile => {}
             EngineMsg::PlaybackRestart | EngineMsg::Seek | EngineMsg::VideoReconfig => {}
-            EngineMsg::Log(line) => {
-                let _ = line;
-            }
         }
     }
 

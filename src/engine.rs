@@ -171,8 +171,6 @@ pub enum EngineMsg {
     PlaybackRestart,
     VideoReconfig,
     Seek,
-    /// A log line, already formatted as `[level] component: text`.
-    Log(String),
 }
 
 /// `mpv` raw handle wrapper. The client API is thread-safe, only a handful of functions
@@ -813,7 +811,6 @@ fn event_loop(
                     if verbose {
                         eprintln!("{line}");
                     }
-                    let _ = tx.send(EngineMsg::Log(line));
                 }
             }
             _ => {}
