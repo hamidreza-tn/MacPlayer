@@ -146,6 +146,19 @@ framework_inventory() {
         | LC_ALL=C sort
 }
 
+framework_inventory_union() {
+    local arm_app="$1"
+    local x86_app="$2"
+    local arm_inventory
+    local x86_inventory
+
+    arm_inventory="$(framework_inventory "$arm_app")"
+    x86_inventory="$(framework_inventory "$x86_app")"
+    printf '%s\n%s\n' "$arm_inventory" "$x86_inventory" \
+        | awk 'NF' \
+        | LC_ALL=C sort -u
+}
+
 validate_bundle() {
     local app="$1"
     local expected_arch="$2"
@@ -187,9 +200,6 @@ check_output_paths() {
 }
 
 validate_inputs() {
-    local arm_inventory
-    local x86_inventory
-
     [[ -d "$ARM_APP" ]] || die "arm64 app bundle does not exist: $ARM_APP"
     [[ -d "$X86_APP" ]] || die "x86_64 app bundle does not exist: $X86_APP"
 
@@ -212,11 +222,6 @@ validate_inputs() {
 
     [[ "$(basename "$ARM_EXECUTABLE")" == "$(basename "$X86_EXECUTABLE")" ]] || die \
         "app executable names differ: $(basename "$ARM_EXECUTABLE") vs $(basename "$X86_EXECUTABLE")"
-
-    arm_inventory="$(framework_inventory "$ARM_APP")"
-    x86_inventory="$(framework_inventory "$X86_APP")"
-    [[ "$arm_inventory" == "$x86_inventory" ]] || die \
-        "framework dylib inventories differ between the arm64 and x86_64 bundles"
 }
 
 merge_macho() {
@@ -234,6 +239,26 @@ merge_macho() {
     verify_architecture "$staged_path" "arm64 x86_64" "Universal Mach-O file"
 }
 
+merge_framework() {
+    local relative="$1"
+    local arm_path="$ARM_APP/$relative"
+    local x86_path="$X86_APP/$relative"
+    local staged_path="$WORK_DIR/app/$APP_NAME/$relative"
+
+    if [[ -f "$arm_path" && -f "$x86_path" ]]; then
+        merge_macho "$relative"
+    elif [[ -f "$arm_path" ]]; then
+        verify_architecture "$arm_path" "arm64" "arm64-only framework dylib"
+    elif [[ -f "$x86_path" ]]; then
+        mkdir -p "$(dirname "$staged_path")"
+        cp "$x86_path" "$staged_path"
+        chmod 755 "$staged_path"
+        verify_architecture "$staged_path" "x86_64" "x86_64-only framework dylib"
+    else
+        die "framework dylib disappeared during merge: $relative"
+    fi
+}
+
 build_universal_app() {
     local relative
     local inventory
@@ -242,10 +267,10 @@ build_universal_app() {
     ditto "$ARM_APP" "$WORK_DIR/app/$APP_NAME"
 
     merge_macho "Contents/MacOS/$(basename "$ARM_EXECUTABLE")"
-    inventory="$(framework_inventory "$ARM_APP")"
+    inventory="$(framework_inventory_union "$ARM_APP" "$X86_APP")"
     while IFS= read -r relative; do
         [[ -n "$relative" ]] || continue
-        merge_macho "$relative"
+        merge_framework "$relative"
     done <<< "$inventory"
 
     # The arm64 code signature no longer describes the merged Mach-O files.
@@ -311,6 +336,7 @@ main() {
     [[ "$(uname -s)" == "Darwin" ]] || die "macOS packaging must run on macOS (Darwin)"
     require_command find
     require_command sort
+    require_command awk
     require_command lipo
     require_command plutil
     require_command ditto
