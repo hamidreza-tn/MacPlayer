@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Check out source
@@ -35,10 +35,10 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
             rust_target: aarch64-apple-darwin
           - arch: x86_64
-            runner: macos-13
+            runner: macos-15-intel
             rust_target: x86_64-apple-darwin
 
     steps:
@@ -72,7 +72,7 @@ jobs:
   universal:
     name: Merge Universal bundle
     needs: [test, build]
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Check out source
