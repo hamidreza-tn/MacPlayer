@@ -10,6 +10,20 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test
+    runs-on: macos-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install libmpv
+        run: brew install mpv
+
+      - name: Run offline locked tests
+        run: make test
+
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -54,7 +68,7 @@ jobs:
 
   universal:
     name: Merge Universal bundle
-    needs: build
+    needs: [test, build]
     runs-on: macos-14
 
     steps:

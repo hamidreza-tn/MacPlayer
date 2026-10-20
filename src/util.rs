@@ -302,14 +302,11 @@ pub fn similar_files(path: &str) -> Vec<String> {
         .unwrap_or_default();
     let name = title_of(path);
     let extension = ext(&name);
-    let kind: Option<&[&str]> = if VIDEO_EXT.contains(&extension.as_str()) {
-        Some(VIDEO_EXT)
+    let kind = if VIDEO_EXT.contains(&extension.as_str()) {
+        VIDEO_EXT
     } else if AUDIO_EXT.contains(&extension.as_str()) {
-        Some(AUDIO_EXT)
+        AUDIO_EXT
     } else {
-        None
-    };
-    let Some(kind) = kind else {
         return vec![path.to_string()];
     };
 

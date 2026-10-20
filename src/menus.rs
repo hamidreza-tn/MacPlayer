@@ -131,7 +131,9 @@ pub enum Action {
     CycleTrack(TrackKind),
     SetSecondarySub(TrackSel),
     SubDelay(Option<f64>),
+    SetSubDelay(f64),
     SubScale(f64),
+    SetSubScale(f64),
     SubMove(i32),
     SubReset,
     SubSeek(i32),
@@ -147,6 +149,7 @@ pub enum Action {
     Rotate(Option<i64>),
     ToggleFlip(&'static str),
     ImageAdjust(&'static str, i32),
+    SetImageAdjust(&'static str, f64),
     ImageReset,
     ToggleDeinterlace,
     SetHwdec(bool),
@@ -155,6 +158,7 @@ pub enum Action {
     VolumeStep(i32),
     ToggleMute,
     AudioDelay(Option<f64>),
+    SetAudioDelay(f64),
     SetAudioDevice(String),
     ToggleNormalize,
     SetNormalize(bool),
@@ -180,6 +184,7 @@ pub enum Action {
     SetOnTop(String),
     CycleOnTop,
     ToggleInfo,
+    ToggleRemaining,
     ToggleFullscreen,
     ExitFullscreen,
     ToggleMaximize,
@@ -388,13 +393,21 @@ pub fn main_menu(c: &MenuCtx<'_>) -> Vec<Entry> {
 
     let mut bookmarks = Vec::new();
     for bookmark in c.bookmarks.iter().rev().take(100) {
+        let label = format!(
+            "{}   {}",
+            bookmark.title,
+            crate::util::fmt_time(bookmark.time)
+        );
         bookmarks.push(Entry::item(
-            format!(
-                "{}   {}",
-                bookmark.title,
-                crate::util::fmt_time(bookmark.time)
-            ),
+            label.clone(),
             Action::SeekBookmark {
+                path: bookmark.path.clone(),
+                time: bookmark.time,
+            },
+        ));
+        bookmarks.push(Entry::item(
+            format!("Remove: {label}"),
+            Action::RemoveBookmark {
                 path: bookmark.path.clone(),
                 time: bookmark.time,
             },
