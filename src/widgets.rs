@@ -568,12 +568,15 @@ impl SeekUi {
 
     fn time_at(&self, x: f32, width: f32) -> f64 {
         let (left, span) = self.span(width);
+        if span <= 0.0 || !self.duration.is_finite() || self.duration <= 0.0 {
+            return 0.0;
+        }
         (((x - left) / span).clamp(0.0, 1.0) as f64) * self.duration
     }
 
     fn x_of(&self, seconds: f64, width: f32) -> f32 {
         let (left, span) = self.span(width);
-        if self.duration <= 0.0 {
+        if span <= 0.0 || !self.duration.is_finite() || self.duration <= 0.0 {
             return left;
         }
         left + ((seconds / self.duration).clamp(0.0, 1.0) as f32) * span
@@ -1165,5 +1168,17 @@ mod tests {
             ColorImage::filled([MAX_THUMBNAIL_EDGE, MAX_THUMBNAIL_EDGE], Color32::WHITE),
         ));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn seek_geometry_handles_empty_or_invalid_ranges() {
+        let mut seek = SeekUi::default();
+        seek.duration = 120.0;
+        assert_eq!(seek.time_at(10.0, 0.0), 0.0);
+        assert_eq!(seek.x_of(30.0, 0.0), 0.0);
+
+        seek.duration = f64::NAN;
+        assert_eq!(seek.time_at(10.0, 100.0), 0.0);
+        assert_eq!(seek.x_of(30.0, 100.0), 5.0);
     }
 }
