@@ -305,6 +305,8 @@ fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<Atom
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                 let mut payload = Vec::new();
                 let valid = (&mut stream)
                     .take((MAX_IPC_BYTES + 1) as u64)
