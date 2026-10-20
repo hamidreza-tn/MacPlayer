@@ -1,0 +1,101 @@
+name: Build macOS Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install libmpv
+        run: brew install mpv
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.rust_target }}"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Build single-architecture app
+        run: make package-macos ARCH=${{ matrix.arch }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      - name: Archive app bundle for the merge job
+        run: tar -czf "MacPlayer-${{ matrix.arch }}.app.tar.gz" -C "dist/macos-${{ matrix.arch }}" MacPlayer.app
+
+      - name: Upload single-architecture app
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacPlayer-app-${{ matrix.arch }}
+          path: MacPlayer-${{ matrix.arch }}.app.tar.gz
+          if-no-files-found: error
+
+  universal:
+    name: Merge Universal bundle
+    needs: build
+    runs-on: macos-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download architecture bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: MacPlayer-app-*
+          path: input-bundles
+
+      - name: Extract architecture bundles
+        run: |
+          mkdir -p dist/macos-arm64 dist/macos-x86_64
+          tar -xzf input-bundles/MacPlayer-app-arm64/MacPlayer-arm64.app.tar.gz -C dist/macos-arm64
+          tar -xzf input-bundles/MacPlayer-app-x86_64/MacPlayer-x86_64.app.tar.gz -C dist/macos-x86_64
+
+      - name: Merge and validate Universal bundle
+        run: |
+          make package-macos-universal \
+            ARM_APP=dist/macos-arm64/MacPlayer.app \
+            X86_APP=dist/macos-x86_64/MacPlayer.app \
+            OUT=dist/macos-universal
+
+      - name: Upload Universal package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacPlayer-macos-universal
+          path: |
+            dist/macos-universal/MacPlayer-macos-universal.zip
+            dist/macos-universal/MacPlayer-macos-universal.dmg
+          if-no-files-found: error
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MacPlayer ${{ github.ref_name }}
+          files: |
+            dist/macos-universal/MacPlayer-macos-universal.zip
+            dist/macos-universal/MacPlayer-macos-universal.dmg
+          generate_release_notes: true
