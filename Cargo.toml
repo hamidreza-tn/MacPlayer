@@ -1,0 +1,23 @@
+[package]
+name = "macplayer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = "3.6.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links"] }
+egui = "0.36.2"
+egui_glow = "0.36.2"
+glow = "0.17.0"
+libloading = "0.9.0"
+rand = "0.10.3"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
