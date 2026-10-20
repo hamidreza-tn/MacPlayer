@@ -1,29 +1,70 @@
 # MacPlayer
 
-MacPlayer is a native Rust media player for macOS. It uses egui for the custom
-interface and libmpv for playback, so it supports the formats, codecs,
-subtitles and network sources supported by mpv.
+> A fast, native media player for macOS — built with Rust, egui and libmpv.
 
-## Requirements
+[![Build macOS Release](https://github.com/hamidreza-tn/MacPlayer/actions/workflows/release.yml/badge.svg)](https://github.com/hamidreza-tn/MacPlayer/actions/workflows/release.yml)
 
-- macOS 13 (Ventura) or newer on Apple Silicon (`arm64`) or Intel (`x86_64`)
-- Rust `1.95.0` (selected automatically by `rust-toolchain.toml`)
-- Homebrew `mpv` for development-time native playback
-- Apple Command Line Tools (`swift` and `iconutil`) for app icon generation
+MacPlayer is a focused desktop player for local media, network sources,
+subtitles and playlists. It uses libmpv for playback and a custom egui
+interface for a responsive, keyboard-friendly experience.
 
-Install the development dependency once:
+## Highlights
+
+- Native macOS application with a custom, decoration-free title bar.
+- One Universal release for Apple Silicon and Intel Macs.
+- Hardware decoding when supported, with software fallback.
+- Local files, folders, URLs, playlists and external subtitles.
+- Playlist queueing, sorting, repeat, shuffle, filtering and drag reorder.
+- Subtitle and audio track selection, synchronization and language preferences.
+- Chapters, A/B repeat, speed control, frame stepping, zoom, pan and rotation.
+- HDR-to-SDR tone mapping, equalizer controls and screenshot capture.
+- Bookmarks, resume positions, recent files and single-instance forwarding.
+- Clipboard opening for local paths and URLs.
+- Keyboard shortcuts that use macOS conventions such as `Cmd` and `Option`.
+
+## Download
+
+Open the [Releases](https://github.com/hamidreza-tn/MacPlayer/releases) page and
+download the latest Universal package:
+
+```text
+MacPlayer-macos-universal.dmg
+```
+
+It runs on:
+
+- Apple Silicon: M1, M2, M3, M4 and newer
+- Intel: x86_64 Macs
+
+MacPlayer targets **macOS 13 Ventura and newer**. The packaged application is
+compiled with `MACOSX_DEPLOYMENT_TARGET=13.0`.
+
+> Local ad-hoc builds are suitable for testing. For public distribution, use
+> an Apple Developer ID signature and notarize the application so Gatekeeper
+> can verify it smoothly.
+
+## Build from source
+
+### Requirements
+
+- macOS 13 or newer
+- Rust `1.95.0` — selected automatically by `rust-toolchain.toml`
+- Homebrew `mpv` and its `libmpv` runtime
+- Apple Command Line Tools for `swift` and `iconutil`
+
+Install the native playback dependency:
 
 ```sh
 brew install mpv
 export MACPLAYER_LIBMPV="$(brew --prefix mpv)/lib/libmpv.2.dylib"
 ```
 
-The environment variable is optional when Homebrew is installed in a standard
-location. It is useful when several libmpv versions are installed.
+`MACPLAYER_LIBMPV` is optional when Homebrew uses its standard location. Set it
+explicitly when multiple libmpv installations are available.
 
-## Build and run from source
+### Run the player
 
-From this directory:
+From the repository root:
 
 ```sh
 cargo fetch --locked
@@ -31,7 +72,7 @@ make build
 ./target/release/macplayer ~/Movies/example.mp4
 ```
 
-For development:
+For an incremental development build:
 
 ```sh
 cargo run --release -- ~/Movies/example.mp4
@@ -41,73 +82,50 @@ The command-line interface is:
 
 ```text
 macplayer [OPTIONS] [FILES...]
-  -f, --fullscreen  start in full screen
-      --new         do not reuse the running instance
-      --verbose     request verbose libmpv logging
-  -h, --help        show help
-      --version     show the version
+
+Options:
+    -f, --fullscreen  Start in full screen
+        --new         Start without reusing the existing instance
+        --verbose     Request verbose libmpv logging
+    -h, --help        Show this help
+        --version     Show the version
 ```
 
-Opening a second copy normally sends its files to the running MacPlayer
-instance. Use `--new` to force a separate window.
+Opening another copy normally forwards its files to the running MacPlayer
+instance. Use `--new` when a separate window is required.
 
-## Installable macOS package
+## Create macOS packages
 
-MacPlayer targets macOS 13 (Ventura) and newer on both Intel and Apple Silicon.
-The release workflow builds a single Universal bundle containing both `arm64`
-and `x86_64` slices, so users can download one file without identifying their
-Mac's processor. The Rust binary is compiled with `MACOSX_DEPLOYMENT_TARGET=13.0`.
+### Single-architecture packages
 
-For a local single-architecture package, pass the target explicitly. For an
-Apple Silicon package:
+Build an Apple Silicon package:
 
 ```sh
 make package-macos ARCH=arm64
 ```
 
-The command creates separate, single-architecture artifacts:
+Build an Intel package:
+
+```sh
+rustup target add x86_64-apple-darwin
+MACPLAYER_LIBMPV=/path/to/x86_64/libmpv.2.dylib \
+  make package-macos ARCH=x86_64
+```
+
+Each command creates a separate output directory:
 
 ```text
-dist/macos-arm64/MacPlayer.app
-dist/macos-arm64/MacPlayer-macos-arm64.zip
-dist/macos-arm64/MacPlayer-macos-arm64.dmg   # when hdiutil is available
+dist/macos-arm64/
+dist/macos-x86_64/
 ```
 
-For an Intel package, use an Intel Rust target and a matching x86_64 libmpv:
-
-```sh
-MACPLAYER_LIBMPV=/path/to/x86_64/libmpv.2.dylib make package-macos ARCH=x86_64
-```
-
-This creates the corresponding files under `dist/macos-x86_64/`. The package
-script builds with `--offline --locked` and validates that the application,
-libmpv, and bundled non-system dylibs contain exactly the requested
-architecture. It does not turn an arm64 libmpv into an Intel build: on an
-Apple Silicon host, an x86_64 package requires an installed
-`x86_64-apple-darwin` Rust target and an actual x86_64 libmpv (for example,
-from an Intel Homebrew installation or another compatible build). If either
-is unavailable, packaging stops with an error.
-
-`MacPlayer.app` includes the MacPlayer executable and the libmpv runtime under
-`Contents/Frameworks`. The package script also adds the app's private
-Frameworks directory to the dynamic loader path and registers media, subtitle
-and playlist file associations in `Info.plist`. It generates a high-resolution
-MacPlayer play-button icon and embeds it in the app bundle.
-
-The package script runs on macOS and supports native or cross-target builds
-when the requested Rust target and matching libmpv are available. For public
-distribution, sign and notarize the app with an Apple Developer ID before
-uploading it to GitHub; an unsigned first launch may be blocked by Gatekeeper.
-
-If libmpv is in a non-standard location:
-
-```sh
-MACPLAYER_LIBMPV=/path/to/libmpv.2.dylib make package-macos ARCH=arm64
-```
+The packaging script validates that the executable, libmpv and bundled dylibs
+contain exactly the requested architecture. It refuses to use a mismatched or
+Universal dependency for a single-architecture package.
 
 ### Universal package
 
-After building both single-architecture app bundles, merge them on macOS:
+After both single-architecture app bundles are available, merge them on macOS:
 
 ```sh
 make package-macos-universal \
@@ -116,30 +134,42 @@ make package-macos-universal \
   OUT=dist/macos-universal
 ```
 
-The merger validates the executable and every bundled dylib before using
-`lipo`, then signs the resulting bundle ad hoc and creates:
+The merger validates the executable and every bundled dylib, combines matching
+files with `lipo`, signs the result ad hoc and creates:
 
 ```text
 dist/macos-universal/MacPlayer.app
 dist/macos-universal/MacPlayer-macos-universal.zip
-dist/macos-universal/MacPlayer-macos-universal.dmg   # when hdiutil is available
+dist/macos-universal/MacPlayer-macos-universal.dmg
 ```
 
-Both slices must be built from matching dependency versions. The merger refuses
-to produce a partial Universal bundle when a dylib is missing, single-arch, or
-present in only one input bundle.
+The DMG is created when `hdiutil` is available. A partial Universal bundle is
+never produced: missing files, mismatched framework inventories or incorrect
+architecture slices stop the merge.
 
-The GitHub Actions workflow in `.github/workflows/release.yml` builds the two
-slices on native Intel and Apple Silicon runners, merges them, and attaches the
-Universal ZIP and DMG to a GitHub Release when a `v*` tag is pushed.
+## Automated releases
 
-For public distribution, replace the local ad-hoc signature with an Apple
-Developer ID signature and notarize the app. A signature is required for a
-smooth Gatekeeper experience but is not needed to verify the architecture merge.
+The workflow in
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds:
 
-## Tests and reproducible checks
+1. An arm64 app on a native Apple Silicon runner.
+2. An x86_64 app on a native Intel runner.
+3. A validated Universal app, ZIP and DMG.
 
-Dependencies are locked in `Cargo.lock`; the project test command is offline:
+To publish a release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions then attaches the Universal packages to the matching GitHub
+Release. The workflow also supports manual runs from the **Actions** tab.
+
+## Tests and checks
+
+The project keeps its dependency versions in `Cargo.lock` and uses offline,
+locked commands for repeatable local checks:
 
 ```sh
 make test
@@ -148,17 +178,15 @@ make build
 cargo fmt --all -- --check
 ```
 
-`make test` currently covers settings validation, playlist
-selection and probing, IPC payloads, mpv ABI layouts, renderer helpers and
-click-to-open submenu state.
-
+The test suite covers settings validation, playlist behavior, IPC payloads,
+mpv ABI layouts, renderer helpers, keyboard/menu state and window layout logic.
 The tests do not require a display, audio device or libmpv. Real playback and
-the app bundle require a macOS GUI/audio host and libmpv.
+macOS packaging require a macOS GUI host and libmpv.
 
 ## Docker / Linux development
 
-The Dockerfile is retained for a reproducible Linux build/runtime experiment;
-it is not a macOS installer:
+The Dockerfile provides a reproducible Linux build/runtime experiment. It is
+not a macOS installer:
 
 ```sh
 make docker-build
@@ -167,38 +195,36 @@ docker run --rm --name macplayer \
   macplayer:latest /media/example.mp4
 ```
 
-## Features
+## Settings and generated files
 
-- Hardware-decoded playback through libmpv when available, with software fallback.
-- Drag-and-drop files, folders, URLs and external subtitles.
-- Playlist queueing, repeat, shuffle, sorting, duplicate/missing-file cleanup
-  and drag reorder.
-- Resume positions, recent files, automatic window fitting and single-instance
-  file forwarding.
-- Subtitle stream selection, secondary subtitles, encoding, size, position and
-  synchronisation controls.
-- Audio stream/device selection, volume, mute, delay, normalisation and a
-  ten-band equalizer.
-- Chapters, A-B repeat, speed control, frame stepping, zoom, pan, rotation,
-  deinterlacing and screenshots.
-- Open one or more local paths or URLs directly from the clipboard with
-  `Ctrl+Shift+V` (`Cmd+Shift+V` on macOS).
-- Persistent bookmarks with direct seek actions, per-file audio/subtitle track preferences,
-  HDR-to-SDR tone mapping controls, fullscreen display selection, clipboard frame capture,
-  and live playlist filtering.
-- Custom keyboard and mouse controls, including shortcuts that work with
-  non-Latin keyboard layouts.
-- Preferences and Control Panel both include an explicit Exit button.
-
-## Settings
-
-On macOS settings are stored at:
+On macOS, settings are stored at:
 
 ```text
 ~/Library/Application Support/MacPlayer/settings.json
 ```
 
-## License and third-party components
+Build output and local artifacts are intentionally ignored:
 
-MacPlayer is distributed under the license in `LICENSE`. Playback is provided
-by [mpv](https://mpv.io) and FFmpeg through the libmpv runtime.
+```text
+target/
+dist/
+.DS_Store
+```
+
+## Project structure
+
+```text
+src/                         Rust application
+macos/                       App metadata and icon generation
+scripts/                    macOS packaging tools
+.github/workflows/           Automated Universal releases
+Cargo.toml / Cargo.lock      Dependencies and reproducible versions
+Makefile                     Common development commands
+Dockerfile                   Linux build/runtime experiment
+```
+
+## Third-party components
+
+Playback is provided by [mpv](https://mpv.io) and FFmpeg through the libmpv
+runtime. The interface and application logic are written in Rust with
+[egui](https://github.com/emilk/egui) and [eframe](https://github.com/emilk/eframe).
