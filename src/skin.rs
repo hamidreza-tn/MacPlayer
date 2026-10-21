@@ -48,6 +48,8 @@ pub const TEXT_E4: Color32 = Color32::from_rgb(0xe4, 0xe4, 0xe4);
 pub const TEXT_A8: Color32 = Color32::from_rgb(0xa8, 0xa8, 0xa8);
 pub const TEXT_9A: Color32 = Color32::from_rgb(0x9a, 0x9a, 0x9a);
 pub const CLOSE_HOVER: Color32 = Color32::from_rgb(0xff, 0x6a, 0x5e);
+pub const FOCUS: Color32 = Color32::from_rgb(0xff, 0xea, 0x55);
+pub const SHADOW: Color32 = Color32::from_rgba_premultiplied(0x00, 0x00, 0x00, 0xb8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThemeColors {
@@ -85,6 +87,8 @@ pub struct ThemeColors {
     pub text_a8: Color32,
     pub text_9a: Color32,
     pub close_hover: Color32,
+    pub focus: Color32,
+    pub shadow: Color32,
 }
 
 impl ThemeColors {
@@ -124,6 +128,8 @@ impl ThemeColors {
             text_a8: TEXT_A8,
             text_9a: TEXT_9A,
             close_hover: CLOSE_HOVER,
+            focus: FOCUS,
+            shadow: SHADOW,
         }
     }
 }
@@ -443,6 +449,12 @@ pub fn draw_icon(p: &Painter, name: &str, cx: f32, cy: f32, color: Color32, bg: 
                 rect(-6.0, dy, 12.0, 1.0);
             }
         }
+        "playlist" => {
+            for dy in [-5.0f32, 0.0, 5.0] {
+                p.circle_filled(pos2(cx - 6.0, cy + dy), 1.2, color);
+                rect(-3.0, dy - 1.0, 9.0, 2.0);
+            }
+        }
         "gear" => gear(p, cx, cy, color, bg),
         "volume" | "volume_low" | "volume_mute" => {
             rect(-5.0, -2.0, 3.0, 4.0);
@@ -684,6 +696,13 @@ pub fn style() -> egui::Style {
     v.panel_fill = colors.dialog_bg;
     v.window_fill = colors.dialog_bg;
     v.window_stroke = Stroke::new(1.0, colors.dialog_line);
+    v.window_corner_radius = 8.into();
+    v.window_shadow = egui::epaint::Shadow {
+        offset: [0, 4],
+        blur: 18,
+        spread: 2,
+        color: colors.shadow,
+    };
     v.extreme_bg_color = colors.base;
     v.faint_bg_color = colors.tab_bg;
     v.selection.bg_fill = colors.select;
@@ -703,6 +722,11 @@ pub fn style() -> egui::Style {
     style.spacing.item_spacing = vec2(6.0, 6.0);
     style.spacing.button_padding = vec2(10.0, 4.0);
     style.spacing.interact_size = vec2(28.0, 22.0);
-    v.popup_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 3],
+        blur: 12,
+        spread: 1,
+        color: colors.shadow,
+    };
     style
 }

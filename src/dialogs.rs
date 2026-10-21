@@ -10,7 +10,9 @@ use crate::skin;
 use crate::skin::*;
 use crate::util::parse_time;
 use crate::value::Value;
-use egui::{Align2, Frame, Id, Rect, RichText, Sense, Stroke, TextEdit, Window, pos2, vec2};
+use egui::{
+    Align, Align2, Frame, Id, Layout, Rect, RichText, Sense, Stroke, TextEdit, Window, pos2, vec2,
+};
 
 fn active_colors() -> skin::ThemeColors {
     skin::active_colors()
@@ -22,7 +24,36 @@ fn dlg_frame() -> Frame {
     Frame::new()
         .fill(active_colors().dialog_bg)
         .stroke(Stroke::new(1.0, active_colors().dialog_line))
+        .corner_radius(8.0)
+        .outer_margin(egui::Margin::same(4))
         .inner_margin(egui::Margin::same(10))
+}
+
+fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .size(14.0)
+                .color(active_colors().text_e4)
+                .strong(),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let response = ui
+                .add_sized(
+                    vec2(28.0, 26.0),
+                    egui::Button::new(RichText::new("×").size(18.0).color(active_colors().text_e4)),
+                )
+                .on_hover_text("Close");
+            if response.clicked() {
+                close = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(6.0);
+    close
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
@@ -902,17 +933,22 @@ impl ControlPanel {
             return;
         }
         let mut open = self.open;
+        let mut close = false;
         Window::new("Control Panel")
             .open(&mut open)
             .title_bar(false)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .frame(dlg_frame())
             .default_width(470.0)
+            .default_height(500.0)
+            .max_height((ctx.content_rect().height() - 32.0).max(240.0))
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.set_min_width(450.0);
-                heading(ui, "Control Panel");
+                if dialog_header(ui, "Control Panel") {
+                    close = true;
+                }
                 tabs(
                     ui,
                     &["Audio", "Video", "Subtitles", "Playback"],
@@ -920,10 +956,11 @@ impl ControlPanel {
                 );
                 ui.separator();
                 ui.add_space(4.0);
+                let scroll_height = ui.available_height().max(260.0);
                 egui::ScrollArea::vertical()
                     .id_salt("cp-scroll")
-                    .auto_shrink([false, true])
-                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
                     .show(ui, |ui| match self.tab {
                         0 => self.audio_tab(ui, settings, actions),
                         1 => self.video_tab(ui, actions),
@@ -935,6 +972,9 @@ impl ControlPanel {
                     self.open = false;
                 }
             });
+        if close {
+            self.open = false;
+        }
         self.open = self.open && open;
     }
 
@@ -1291,13 +1331,17 @@ impl PreferencesDialog {
             .open(&mut open)
             .title_bar(false)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .frame(dlg_frame())
+            .default_height(520.0)
+            .max_height((ctx.content_rect().height() - 32.0).max(240.0))
             .default_width(560.0)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.set_min_width(540.0);
-                heading(ui, "Preferences");
+                if dialog_header(ui, "Preferences") {
+                    close = true;
+                }
                 tabs(
                     ui,
                     &["General", "Playback", "Subtitles", "Audio"],
@@ -1305,10 +1349,11 @@ impl PreferencesDialog {
                 );
                 ui.separator();
                 ui.add_space(4.0);
+                let scroll_height = ui.available_height().max(280.0);
                 egui::ScrollArea::vertical()
                     .id_salt("pref-scroll")
-                    .auto_shrink([false, true])
-                    .max_height(330.0)
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
                     .show(ui, |ui| match self.tab {
                         0 => self.tab_general(ui),
                         1 => self.tab_playback(ui),
