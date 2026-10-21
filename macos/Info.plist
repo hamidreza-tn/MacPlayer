@@ -12,6 +12,8 @@
 	<string>com.macplayer.player</string>
 	<key>CFBundleIconFile</key>
 	<string>MacPlayer.icns</string>
+	<key>CFBundleIconName</key>
+	<string>MacPlayer</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
