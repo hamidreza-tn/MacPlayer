@@ -2950,26 +2950,23 @@ impl Player {
         painter.rect_filled(rect, 0.0, BG);
 
         let playing = self.is_playing();
+        // Keep the playlist toggle separate from the primary transport controls so it can
+        // sit at the right edge of the control bar. The seventh slot is still reserved for
+        // it when sizing the controls, which keeps the layout stable at narrow widths.
         let button_w = (rect.width() / 7.0).min(BTN_W).max(0.0);
-        let button_area = button_w * 7.0;
+        let left_button_area = button_w * 6.0;
 
-        // Buttons: menu, play, prev, next, open, gear, list.
-        let buttons: [(&str, f32); 7] = [
+        // Left-side buttons: menu, prev, play, next, open, gear.
+        let buttons: [(&str, f32); 6] = [
             ("menu", 0.0),
             ("prev", BTN_W as f32),
             ("play", BTN_W as f32 * 2.0),
             ("next", BTN_W as f32 * 3.0),
             ("eject", BTN_W as f32 * 4.0),
             ("gear", BTN_W as f32 * 5.0),
-            ("menu", BTN_W as f32 * 6.0),
         ];
         let mut clicks = [Click::default(); 7];
         for (index, (glyph, x)) in buttons.iter().enumerate() {
-            let glyph = if *glyph == "menu" && index == 6 {
-                "menu"
-            } else {
-                glyph
-            };
             let r = Rect::from_min_size(
                 pos2(rect.left() + *x / BTN_W * button_w, rect.top()),
                 vec2(button_w, rect.height()),
@@ -2984,9 +2981,6 @@ impl Player {
             if index == 5 {
                 btn = btn.tip("Control Panel");
             }
-            if index == 6 {
-                btn = btn.tip("Playlist");
-            }
             let clicked = btn.ui(ui, ui.id().with(("ctrl-btn", index)), r);
             clicks[index] = clicked;
             if index == 2 {
@@ -3000,6 +2994,14 @@ impl Player {
                 );
             }
         }
+        let playlist_rect = Rect::from_min_size(
+            pos2(rect.right() - button_w, rect.top()),
+            vec2(button_w, rect.height()),
+        );
+        clicks[6] = IconBtn::new("menu", button_w, rect.height())
+            .tip("Playlist")
+            .flat(true)
+            .ui(ui, ui.id().with(("ctrl-btn", 6)), playlist_rect);
         if clicks[0].any() {
             self.menu.open_at(rect.left_top());
             self.track_menu_kind = None;
@@ -3028,10 +3030,11 @@ impl Player {
 
         // Time label on the right of the buttons.
         let (left, right) = self.time_parts();
-        let remaining = (rect.width() - button_area).max(0.0);
+        let right_content_edge = rect.right() - button_w;
+        let remaining = (right_content_edge - rect.left() - left_button_area).max(0.0);
         let time_w = remaining.min(150.0);
         let badge_w = (remaining - time_w).min(180.0);
-        let time_x = rect.right() - badge_w - time_w;
+        let time_x = right_content_edge - badge_w - time_w;
         if time_w > 0.0 {
             let time_rect =
                 Rect::from_min_size(pos2(time_x, rect.top()), vec2(time_w, rect.height()));
@@ -3041,7 +3044,7 @@ impl Player {
         }
         if badge_w > 0.0 {
             let badge_rect = Rect::from_min_size(
-                pos2(rect.right() - badge_w, rect.top()),
+                pos2(right_content_edge - badge_w, rect.top()),
                 vec2(badge_w, rect.height()),
             );
             info_badges(ui, badge_rect, &self.badges);

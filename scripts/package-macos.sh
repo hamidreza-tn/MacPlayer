@@ -160,6 +160,22 @@ bundle_runtime() {
     done < <(dylib_dependencies "$APP_FRAMEWORK")
 }
 
+verify_app_icon() {
+    local app_bundle="$1"
+    local icon_path="$app_bundle/Contents/Resources/MacPlayer.icns"
+    local icon_file
+    local icon_type
+
+    [[ -f "$icon_path" && ! -L "$icon_path" && -s "$icon_path" ]] || die \
+        "app bundle does not contain a non-empty MacPlayer.icns: $icon_path"
+    icon_file="$(plutil -extract CFBundleIconFile raw -o - "$app_bundle/Contents/Info.plist" 2>/dev/null || true)"
+    [[ "$icon_file" == "MacPlayer.icns" ]] || die \
+        "Info.plist must refer to MacPlayer.icns (found: ${icon_file:-none})"
+    icon_type="$(file -b "$icon_path")"
+    [[ "$icon_type" == *"Mac OS X icon"* ]] || die \
+        "MacPlayer.icns is not a valid macOS icon: $icon_path"
+}
+
 verify_architecture() {
     local path="$1"
     local description="$2"
@@ -238,6 +254,8 @@ require_command mkdir
 require_command cp
 require_command rm
 require_command chmod
+require_command file
+require_command ln
 require_command plutil
 require_command ditto
 require_command otool
@@ -306,6 +324,7 @@ iconset_dir="$iconset_stage/MacPlayer.iconset"
 mkdir -p "$iconset_dir"
 swift "$PROJECT_ROOT/macos/generate-icon.swift" "$iconset_dir"
 iconutil -c icns "$iconset_dir" -o "$APP_ICON"
+verify_app_icon "$APP_BUNDLE"
 
 # The Rust player loads libmpv dynamically. Add the bundle's Frameworks directory
 # to dyld's runtime search paths without changing the release binary in target/.
@@ -324,7 +343,8 @@ COPYFILE_DISABLE=1 ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "$ZIP_ARCHIVE
 
 if command -v hdiutil >/dev/null 2>&1; then
     dmg_stage="$(mktemp -d "${TMPDIR:-/tmp}/macplayer-dmg.XXXXXX")"
-    cp -R "$APP_BUNDLE" "$dmg_stage/$APP_NAME"
+    ditto "$APP_BUNDLE" "$dmg_stage/$APP_NAME"
+    ln -s /Applications "$dmg_stage/Applications"
     hdiutil create \
         -ov \
         -format UDZO \

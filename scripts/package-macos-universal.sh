@@ -125,6 +125,23 @@ bundle_executable() {
     printf '%s/Contents/MacOS/%s\n' "$app" "$executable"
 }
 
+bundle_icon() {
+    local app="$1"
+    local plist="$app/Contents/Info.plist"
+    local icon_path="$app/Contents/Resources/MacPlayer.icns"
+    local icon_file
+    local icon_type
+
+    [[ -f "$icon_path" && ! -L "$icon_path" && -s "$icon_path" ]] || die \
+        "app bundle does not contain a non-empty MacPlayer.icns: $icon_path"
+    icon_file="$(plutil -extract CFBundleIconFile raw -o - "$plist" 2>/dev/null || true)"
+    [[ "$icon_file" == "MacPlayer.icns" ]] || die \
+        "Info.plist must refer to MacPlayer.icns (found: ${icon_file:-none}): $plist"
+    icon_type="$(file -b "$icon_path")"
+    [[ "$icon_type" == *"Mac OS X icon"* ]] || die \
+        "MacPlayer.icns is not a valid macOS icon: $icon_path"
+}
+
 framework_inventory() {
     local app="$1"
     local frameworks="$app/Contents/Frameworks"
@@ -168,6 +185,7 @@ validate_bundle() {
     local inventory
 
     executable="$(bundle_executable "$app")"
+    bundle_icon "$app"
     verify_architecture "$executable" "$expected_arch" "$description executable"
 
     inventory="$(framework_inventory "$app")"
@@ -276,6 +294,7 @@ build_universal_app() {
 
     # The arm64 code signature no longer describes the merged Mach-O files.
     rm -rf "$WORK_DIR/app/$APP_NAME/Contents/_CodeSignature"
+    bundle_icon "$WORK_DIR/app/$APP_NAME"
     codesign --force --deep --sign - "$WORK_DIR/app/$APP_NAME" >/dev/null || die \
         "ad-hoc signing failed: $WORK_DIR/app/$APP_NAME"
     codesign --verify --deep --strict "$WORK_DIR/app/$APP_NAME" >/dev/null || die \
@@ -292,6 +311,7 @@ build_archives() {
         dmg_stage="$WORK_DIR/dmg"
         mkdir -p "$dmg_stage"
         ditto "$WORK_DIR/app/$APP_NAME" "$dmg_stage/$APP_NAME"
+        ln -s /Applications "$dmg_stage/Applications"
         hdiutil create \
             -ov \
             -format UDZO \
@@ -338,6 +358,8 @@ main() {
     require_command find
     require_command sort
     require_command awk
+    require_command file
+    require_command ln
     require_command lipo
     require_command plutil
     require_command ditto
