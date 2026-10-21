@@ -263,6 +263,7 @@ build_universal_app() {
     local relative
     local inventory
 
+    MERGE_TMP="$WORK_DIR/merge"
     mkdir -p "$WORK_DIR/app" "$MERGE_TMP"
     ditto "$ARM_APP" "$WORK_DIR/app/$APP_NAME"
 
