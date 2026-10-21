@@ -620,7 +620,35 @@ impl Playlist {
                     self.scroll = (self.scroll + wheel).clamp(0.0, max_scroll);
                 }
             }
-            self.paint_rows(ui, ctx, view, &visible_rows, &mut out);
+            if visible_rows.is_empty() {
+                let title = if count == 0 {
+                    "Playlist is empty"
+                } else {
+                    "No matching items"
+                };
+                let detail = if count == 0 {
+                    "Add files, a folder, or a URL to start playing"
+                } else {
+                    "Try a different filter"
+                };
+                let center = view.center();
+                painter.text(
+                    pos2(center.x, center.y - 12.0),
+                    egui::Align2::CENTER_CENTER,
+                    title,
+                    skin::font(14.0, false),
+                    colors.text_bright,
+                );
+                painter.text(
+                    pos2(center.x, center.y + 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    detail,
+                    skin::font(11.0, false),
+                    colors.text_dim,
+                );
+            } else {
+                self.paint_rows(ui, ctx, view, &visible_rows, &mut out);
+            }
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
 
@@ -633,18 +661,38 @@ impl Playlist {
             Stroke::new(1.0, colors.line),
         );
         let footer_y = rect.bottom() - FOOTER_H + 1.0;
-        let add_rect = Rect::from_min_size(pos2(rect.left(), footer_y), vec2(46.0, FOOTER_H - 1.0));
+        let compact = w < 220.0;
+        let right_button_w = if compact { 24.0 } else { 28.0 };
+        let left_room = (w - right_button_w * 2.0 - 4.0).max(0.0);
+        let action_w = ((left_room - 2.0) / 3.0).max(24.0);
+        let add_rect =
+            Rect::from_min_size(pos2(rect.left(), footer_y), vec2(action_w, FOOTER_H - 1.0));
         let del_rect = Rect::from_min_size(
-            pos2(rect.left() + 47.0, footer_y),
-            vec2(44.0, FOOTER_H - 1.0),
+            pos2(add_rect.right() + 1.0, footer_y),
+            vec2(action_w, FOOTER_H - 1.0),
         );
         let sort_rect = Rect::from_min_size(
-            pos2(rect.left() + 92.0, footer_y),
-            vec2(52.0, FOOTER_H - 1.0),
+            pos2(del_rect.right() + 1.0, footer_y),
+            vec2(action_w, FOOTER_H - 1.0),
         );
-        text_button(ui, ui.id().with("pl-add"), add_rect, "Add");
-        text_button(ui, ui.id().with("pl-del"), del_rect, "Del");
-        text_button(ui, ui.id().with("pl-sort"), sort_rect, "Sort");
+        text_button(
+            ui,
+            ui.id().with("pl-add"),
+            add_rect,
+            if compact { "+" } else { "Add" },
+        );
+        text_button(
+            ui,
+            ui.id().with("pl-del"),
+            del_rect,
+            if compact { "−" } else { "Del" },
+        );
+        text_button(
+            ui,
+            ui.id().with("pl-sort"),
+            sort_rect,
+            if compact { "↕" } else { "Sort" },
+        );
         if ui
             .interact(add_rect, ui.id().with("pl-add-hit"), Sense::click())
             .clicked()
@@ -680,25 +728,25 @@ impl Playlist {
         }
 
         let repeat_rect = Rect::from_min_size(
-            pos2(rect.right() - 57.0, footer_y),
-            vec2(28.0, FOOTER_H - 1.0),
+            pos2(rect.right() - right_button_w * 2.0, footer_y),
+            vec2(right_button_w, FOOTER_H - 1.0),
         );
         let shuffle_rect = Rect::from_min_size(
-            pos2(rect.right() - 28.0, footer_y),
-            vec2(28.0, FOOTER_H - 1.0),
+            pos2(rect.right() - right_button_w, footer_y),
+            vec2(right_button_w, FOOTER_H - 1.0),
         );
         let repeat_tip = match self.repeat_mode.as_str() {
             "one" => "Repeat: current file",
             "all" => "Repeat: playlist",
             _ => "Repeat: off",
         };
-        out.repeat = IconBtn::new("repeat", 28.0, FOOTER_H - 1.0)
+        out.repeat = IconBtn::new("repeat", right_button_w, FOOTER_H - 1.0)
             .tip(repeat_tip)
             .color(colors.icon_dim)
             .checked(self.repeat_mode != "off")
             .ui(ui, ui.id().with("pl-repeat"), repeat_rect)
             .primary;
-        out.shuffle = IconBtn::new("shuffle", 28.0, FOOTER_H - 1.0)
+        out.shuffle = IconBtn::new("shuffle", right_button_w, FOOTER_H - 1.0)
             .tip("Shuffle")
             .color(colors.icon_dim)
             .checked(self.shuffle)
@@ -779,6 +827,28 @@ impl Playlist {
                 colors.bg
             };
             painter.rect_filled(row_rect, 0.0, bg);
+            if current {
+                painter.rect_filled(
+                    Rect::from_min_size(row_rect.left_top(), vec2(3.0, row_rect.height())),
+                    0.0,
+                    colors.accent,
+                );
+            }
+            if selected {
+                painter.rect_stroke(
+                    row_rect.shrink(1.0),
+                    2.0,
+                    Stroke::new(
+                        1.0,
+                        if self.has_focus {
+                            colors.focus
+                        } else {
+                            colors.text_dim
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
 
             let mut right = row_rect.right() - 8.0;
             if let Some(duration) = self.items[row].duration {

@@ -1125,6 +1125,15 @@ fn panel(
             let painter = ui.painter().clone();
             let panel_rect = Rect::from_min_size(panel_pos, vec2(width, height));
             let corner_radius = ctx.style_of(egui::Theme::Dark).visuals.menu_corner_radius;
+            painter.add(
+                egui::epaint::Shadow {
+                    offset: [0, 3],
+                    blur: 12,
+                    spread: 2,
+                    color: colors.shadow,
+                }
+                .as_shape(panel_rect, corner_radius),
+            );
             painter.rect_filled(panel_rect, corner_radius, colors.menu_bg);
             painter.rect_stroke(
                 panel_rect,
@@ -1170,7 +1179,13 @@ fn panel(
                 let response = ui.interact(item_rect, id, Sense::click());
                 let hovered = response.hovered() && enabled;
                 if hovered {
-                    painter.rect_filled(item_rect, 0.0, colors.menu_sel);
+                    painter.rect_filled(item_rect.shrink2(vec2(2.0, 1.0)), 4.0, colors.menu_sel);
+                    painter.rect_stroke(
+                        item_rect.shrink2(vec2(2.0, 1.0)),
+                        4.0,
+                        Stroke::new(1.0, colors.focus),
+                        egui::StrokeKind::Outside,
+                    );
                 }
                 let text_color = if !enabled {
                     colors.icon_off

@@ -602,13 +602,22 @@ pub fn seek_bar(
     let response = ui.interact(rect, id_salt, Sense::click_and_drag());
     let was_hovered = state.hover;
     state.hover = response.hovered();
-    let y = (rect.height() / 2.0 - 1.0).round();
+    let y = (rect.height() / 2.0 - 2.0).round();
     let (left, span) = state.span(rect.width());
-    painter.rect_filled(
-        Rect::from_min_size(pos2(rect.left() + left, rect.top() + y), vec2(span, 2.0)),
-        0.0,
-        colors.line,
-    );
+    let track_rect = Rect::from_min_size(pos2(rect.left() + left, rect.top() + y), vec2(span, 4.0));
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(
+            track_rect.expand(3.0),
+            3.0,
+            Color32::from_rgba_unmultiplied(
+                colors.focus.r(),
+                colors.focus.g(),
+                colors.focus.b(),
+                34,
+            ),
+        );
+    }
+    painter.rect_filled(track_rect, 2.0, colors.line);
 
     if response.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0) {
         out.wheel = if ui.input(|i| i.smooth_scroll_delta.y) > 0.0 {
@@ -662,8 +671,8 @@ pub fn seek_bar(
         if let Some(cache_end) = state.cache_end.filter(|end| *end > current) {
             let x_end = state.x_of(cache_end, rect.width());
             painter.rect_filled(
-                Rect::from_min_size(pos2(rect.left() + x, rect.top() + y), vec2(x_end - x, 2.0)),
-                0.0,
+                Rect::from_min_size(pos2(rect.left() + x, rect.top() + y), vec2(x_end - x, 4.0)),
+                2.0,
                 colors.buffer,
             );
         }
@@ -675,7 +684,7 @@ pub fn seek_bar(
                 painter.rect_filled(
                     Rect::from_min_size(
                         pos2(rect.left() + xa, rect.top() + y - 2.0),
-                        vec2(xb - xa, 1.0),
+                        vec2(xb - xa, 2.0),
                     ),
                     0.0,
                     colors.accent,
@@ -685,9 +694,9 @@ pub fn seek_bar(
         painter.rect_filled(
             Rect::from_min_size(
                 pos2(rect.left() + left, rect.top() + y),
-                vec2((x - left).max(0.0), 2.0),
+                vec2((x - left).max(0.0), 4.0),
             ),
-            0.0,
+            2.0,
             colors.accent,
         );
         for chapter in &state.chapters {
@@ -696,7 +705,7 @@ pub fn seek_bar(
                 painter.rect_filled(
                     Rect::from_min_size(
                         pos2(rect.left() + cx, rect.top() + y - 2.0),
-                        vec2(1.0, 6.0),
+                        vec2(2.0, 8.0),
                     ),
                     0.0,
                     colors.text_dim,
@@ -706,15 +715,15 @@ pub fn seek_bar(
         for point in [a, b].into_iter().flatten() {
             let px = state.x_of(point, rect.width()).round();
             painter.rect_filled(
-                Rect::from_min_size(pos2(rect.left() + px, rect.top() + y - 4.0), vec2(1.0, 4.0)),
+                Rect::from_min_size(pos2(rect.left() + px, rect.top() + y - 5.0), vec2(2.0, 6.0)),
                 0.0,
                 colors.accent,
             );
         }
         let radius = if state.hover || state.dragging {
-            4.5
+            5.5
         } else {
-            4.0
+            4.5
         };
         painter.circle_filled(
             pos2(
@@ -769,7 +778,7 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     }
     let response = response.on_hover_text(format!("Volume: {}%", state.volume));
 
-    let y = (rect.height() / 2.0 - 1.0).round();
+    let y = (rect.height() / 2.0 - 2.0).round();
     let icon = if state.muted || state.volume == 0 {
         "volume_mute"
     } else if state.volume < 50 {
@@ -790,14 +799,23 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
         colors.bg,
     );
     let knob_x = knob_x0 + (knob_x1 - knob_x0) * state.volume as f32 / 100.0;
-    painter.rect_filled(
-        Rect::from_min_size(
-            pos2(rect.left() + line_x0, rect.top() + y),
-            vec2((line_x1 - line_x0).max(0.0), 2.0),
-        ),
-        0.0,
-        colors.line,
+    let track_rect = Rect::from_min_size(
+        pos2(rect.left() + line_x0, rect.top() + y),
+        vec2((line_x1 - line_x0).max(0.0), 4.0),
     );
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(
+            track_rect.expand(3.0),
+            3.0,
+            Color32::from_rgba_unmultiplied(
+                colors.focus.r(),
+                colors.focus.g(),
+                colors.focus.b(),
+                30,
+            ),
+        );
+    }
+    painter.rect_filled(track_rect, 2.0, colors.line);
     let fill = if state.muted {
         colors.text_dim
     } else {
@@ -806,14 +824,18 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     painter.rect_filled(
         Rect::from_min_size(
             pos2(rect.left() + line_x0, rect.top() + y),
-            vec2((knob_x - line_x0).max(0.0), 2.0),
+            vec2((knob_x - line_x0).max(0.0), 4.0),
         ),
-        0.0,
+        2.0,
         fill,
     );
     painter.circle_filled(
         pos2(rect.left() + knob_x, rect.top() + y + 1.0),
-        4.0,
+        if state.dragging || response.hovered() {
+            5.0
+        } else {
+            4.5
+        },
         colors.knob,
     );
 
@@ -868,23 +890,45 @@ pub fn time_label(ui: &mut Ui, rect: Rect, id_salt: Id, left: &str, right: &str)
     let colors = skin::active_colors();
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, colors.bg);
-    let font_id = skin::font(11.0, false);
+    let mut font_id = skin::font(11.0, false);
+    let available = rect.width().max(0.0);
+    let mut left_text = left.to_string();
+    let mut right_text = right.to_string();
+    for size in [10.0, 9.0] {
+        let total = skin::text_width(&painter, &left_text, &font_id)
+            + skin::text_width(&painter, &right_text, &font_id)
+            + 3.0;
+        if total <= available {
+            break;
+        }
+        font_id = skin::font(size, false);
+    }
+    let left_width = skin::text_width(&painter, &left_text, &font_id);
+    let right_width = skin::text_width(&painter, &right_text, &font_id);
+    if left_width + right_width + 3.0 > available {
+        let left_room = (available - 3.0).max(0.0);
+        left_text = skin::elide(&painter, &left_text, &font_id, left_room);
+        right_text.clear();
+    }
     let center_y = rect.center().y + 1.0;
+    let painter = painter.with_clip_rect(rect);
     painter.text(
         pos2(rect.left(), center_y),
         egui::Align2::LEFT_CENTER,
-        left,
+        left_text.as_str(),
         font_id.clone(),
         colors.text_bright,
     );
-    let offset = skin::text_width(&painter, left, &font_id);
-    painter.text(
-        pos2(rect.left() + offset, center_y),
-        egui::Align2::LEFT_CENTER,
-        right,
-        font_id,
-        colors.text_dim,
-    );
+    if !right_text.is_empty() {
+        let offset = skin::text_width(&painter, left_text.as_str(), &font_id) + 3.0;
+        painter.text(
+            pos2(rect.left() + offset, center_y),
+            egui::Align2::LEFT_CENTER,
+            right_text.as_str(),
+            font_id,
+            colors.text_dim,
+        );
+    }
     let response = ui.interact(rect, id_salt, Sense::click());
     let response = response.on_hover_text("Click to switch between elapsed and remaining time");
     response.clicked()
@@ -1099,7 +1143,21 @@ pub fn paint_logo(ui: &mut Ui, rect: Rect, audio_title: &str) {
         scale,
         "MacPlayer",
     );
-    if !audio_title.is_empty() {
+    let hint = if audio_title.is_empty() {
+        Some("Drop a media file here  •  Click to open  •  Ctrl+O")
+    } else {
+        None
+    };
+    if let Some(hint) = hint {
+        let font_id = skin::font(12.0, false);
+        painter.text(
+            pos2(rect.center().x, rect.bottom() - 24.0),
+            egui::Align2::CENTER_CENTER,
+            hint,
+            font_id,
+            colors.text_dim,
+        );
+    } else if !audio_title.is_empty() {
         let font_id = skin::font(13.0, false);
         let text = skin::elide(
             &painter,

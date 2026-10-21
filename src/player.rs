@@ -124,6 +124,7 @@ pub struct Player {
     cursor_hidden: bool,
     mouse_in_video: bool,
     last_pointer_move: Option<Instant>,
+    playlist_resize_dragging: bool,
 
     // -- drag and drop -------------------------------------------------------------------------------
     hovered_files: Vec<String>,
@@ -210,6 +211,7 @@ impl Player {
             cursor_hidden: false,
             mouse_in_video: false,
             last_pointer_move: None,
+            playlist_resize_dragging: false,
             hovered_files: Vec::new(),
             gl_ready: false,
             pending_open: Vec::new(),
@@ -2939,9 +2941,69 @@ impl Player {
 
         // Playlist.
         if let Some(rect) = layout.playlist {
+            self.paint_playlist_splitter(ui, window, rect);
             let ctx2 = ctx.clone();
             let out = self.playlist.ui(ui, rect, &ctx2);
             self.apply_playlist_out(out, ctx);
+        }
+    }
+
+    fn paint_playlist_splitter(&mut self, ui: &mut Ui, window: Rect, playlist: Rect) {
+        let colors = skin::active_colors();
+        let splitter_x = playlist.left() - 1.0;
+        let splitter = Rect::from_min_max(
+            pos2(splitter_x - 4.0, playlist.top()),
+            pos2(splitter_x + 4.0, playlist.bottom()),
+        );
+        let response = ui.interact(
+            splitter,
+            Id::new("playlist-splitter"),
+            Sense::click_and_drag(),
+        );
+        if response.hovered() || self.playlist_resize_dragging {
+            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+        }
+        let line_color = if response.hovered() || self.playlist_resize_dragging {
+            colors.accent
+        } else {
+            colors.line
+        };
+        ui.painter().line_segment(
+            [
+                pos2(splitter_x, playlist.top()),
+                pos2(splitter_x, playlist.bottom()),
+            ],
+            egui::Stroke::new(
+                if response.hovered() || self.playlist_resize_dragging {
+                    2.0
+                } else {
+                    1.0
+                },
+                line_color,
+            ),
+        );
+
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.playlist_resize_dragging = true;
+        }
+        if self.playlist_resize_dragging {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let edge_inset = if self.fullscreen { 0.0 } else { FRAME };
+                let available = (window.width() - 2.0 * edge_inset).max(0.0);
+                let max_width = (available - MIN_MAIN_W - 1.0).max(MIN_PLAYLIST_W);
+                let width = (window.right() - edge_inset - pointer.x - 1.0)
+                    .clamp(MIN_PLAYLIST_W, max_width);
+                self.settings.playlist_width = width as f64;
+                ui.ctx().request_repaint();
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.playlist_resize_dragging = false;
+                self.settings.playlist_width = self
+                    .settings
+                    .playlist_width
+                    .clamp(MIN_PLAYLIST_W as f64, 1000.0);
+                self.settings.save();
+            }
         }
     }
 
@@ -2998,9 +3060,10 @@ impl Player {
             pos2(rect.right() - button_w, rect.top()),
             vec2(button_w, rect.height()),
         );
-        clicks[6] = IconBtn::new("menu", button_w, rect.height())
+        clicks[6] = IconBtn::new("playlist", button_w, rect.height())
             .tip("Playlist")
             .flat(true)
+            .checked(self.playlist_visible)
             .ui(ui, ui.id().with(("ctrl-btn", 6)), playlist_rect);
         if clicks[0].any() {
             self.menu.open_at(rect.left_top());
@@ -3110,11 +3173,18 @@ impl Player {
 
         // Click / double-click on the video area.
         let response = ui.interact(rect, Id::new("video"), Sense::click());
-        if response.clicked() {
-            self.pending.push(Action::TogglePause);
-        }
         if response.double_clicked() {
-            self.pending.push(Action::ToggleFullscreen);
+            if self.has_file() {
+                self.pending.push(Action::ToggleFullscreen);
+            } else {
+                self.pending.push(Action::OpenFiles { append: false });
+            }
+        } else if response.clicked() {
+            if self.has_file() {
+                self.pending.push(Action::TogglePause);
+            } else {
+                self.pending.push(Action::OpenFiles { append: false });
+            }
         }
         if response.hovered() {
             self.mouse_in_video = true;
