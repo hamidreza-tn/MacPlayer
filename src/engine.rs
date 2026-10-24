@@ -2,6 +2,7 @@
 //!
 //! All messages leave mpv through a channel that the UI drains once per frame, so no mpv
 //! callback ever touches egui state directly.
+#![allow(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
@@ -11,11 +12,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use crate::ffi::{
-    self, Api, MPV_END_FILE_REASON_ERROR, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED,
-    MPV_EVENT_LOG_MESSAGE, MPV_EVENT_NONE, MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE,
-    MPV_EVENT_SEEK, MPV_EVENT_SHUTDOWN, MPV_EVENT_START_FILE, MPV_EVENT_VIDEO_RECONFIG,
-    MPV_FORMAT_NODE, MPV_FORMAT_NONE, mpv_event, mpv_event_end_file, mpv_event_log_message,
-    mpv_event_property, mpv_handle, mpv_node,
+    self, Api, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_LOG_MESSAGE, MPV_EVENT_NONE,
+    MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN, MPV_FORMAT_NODE, MPV_FORMAT_NONE, mpv_event,
+    mpv_event_end_file, mpv_event_log_message, mpv_event_property, mpv_handle, mpv_node,
 };
 use crate::value::Value;
 
@@ -90,22 +89,16 @@ impl TrackSelection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioTrackState {
     pub primary: TrackSelection,
-    pub secondary: TrackSelection,
     pub primary_volume: f64,
-    pub secondary_volume: f64,
     pub primary_delay: f64,
-    pub secondary_delay: f64,
 }
 
 impl Default for AudioTrackState {
     fn default() -> Self {
         Self {
             primary: TrackSelection::Auto,
-            secondary: TrackSelection::None,
             primary_volume: 100.0,
-            secondary_volume: 100.0,
             primary_delay: 0.0,
-            secondary_delay: 0.0,
         }
     }
 }
@@ -161,16 +154,12 @@ pub enum EngineMsg {
     /// `observe_property` notification; `None` means the property is currently unavailable.
     Prop(String, Value),
     /// Lifecycle events the playlist logic reacts to.
-    StartFile,
     FileLoaded,
     EndFile {
         reason: i32,
         error: i32,
         entry_id: i64,
     },
-    PlaybackRestart,
-    VideoReconfig,
-    Seek,
 }
 
 /// `mpv` raw handle wrapper. The client API is thread-safe, only a handful of functions
@@ -252,7 +241,56 @@ impl Engine {
                     .into(),
             ),
             ("ytdl", "yes".into()),
+            (
+                "ytdl-format",
+                Self::ytdl_format(&settings.ytdl_quality).into(),
+            ),
+            (
+                "volume-max",
+                settings.volume_max.clamp(100, 200).to_string(),
+            ),
+            (
+                "audio-pitch-correction",
+                yes_no(settings.audio_pitch_correction),
+            ),
+            ("audio-channels", settings.audio_channels.clone()),
+            (
+                "video-sync",
+                Self::video_sync_value(&settings.video_sync).into(),
+            ),
+            ("scale", settings.scale_profile.clone()),
         ];
+        if settings.interpolation {
+            options.extend([
+                ("interpolation", "yes".into()),
+                ("tscale", "oversample".into()),
+            ]);
+        }
+        if !settings.audio_spdif.is_empty() {
+            options.push(("audio-spdif", settings.audio_spdif.clone()));
+        }
+        if settings.audio_exclusive {
+            options.push(("audio-exclusive-mode", "yes".into()));
+        }
+        if settings.cache_secs > 0 {
+            options.extend([
+                ("cache", "yes".into()),
+                ("cache-secs", settings.cache_secs.to_string()),
+            ]);
+        }
+        if settings.demuxer_max_mb > 0 {
+            options.push((
+                "demuxer-max-bytes",
+                format!("{}MiB", settings.demuxer_max_mb),
+            ));
+        }
+        if !settings.http_user_agent.is_empty() {
+            options.push(("user-agent", settings.http_user_agent.clone()));
+        }
+        let headers = http_header_fields(&settings.http_headers);
+        if !headers.is_empty() {
+            options.push(("http-header-fields", headers));
+        }
         if !settings.sub_font.is_empty() {
             options.push(("sub-font", settings.sub_font.clone()));
         }
@@ -289,11 +327,9 @@ impl Engine {
                 return Err(error);
             }
         };
-        if !first_pass {
-            if let Err(error) = apply_options(true) {
-                unsafe { (api.terminate_destroy)(mpv) };
-                return Err(error);
-            }
+        if !first_pass && let Err(error) = apply_options(true) {
+            unsafe { (api.terminate_destroy)(mpv) };
+            return Err(error);
         }
 
         let log_level = std::env::var("MACPLAYER_LOGLEVEL")
@@ -322,7 +358,9 @@ impl Engine {
         let (tx, rx) = channel::<EngineMsg>();
 
         for (index, name) in OBSERVED.iter().enumerate() {
-            let c_name = CString::new(*name).unwrap();
+            let Ok(c_name) = CString::new(*name) else {
+                continue;
+            };
             unsafe {
                 (api.observe_property)(mpv, (index + 1) as u64, c_name.as_ptr(), MPV_FORMAT_NODE)
             };
@@ -381,6 +419,17 @@ impl Engine {
             "no"
         } else {
             "vaapi-copy,nvdec-copy,auto-copy-safe"
+        }
+    }
+
+    /// Map the settings vocabulary onto values mpv's `video-sync` option accepts.
+    /// mpv has no "auto": its default clock is `audio`; the resync/desync ids map
+    /// onto their real option names.
+    pub fn video_sync_value(mode: &str) -> &'static str {
+        match mode {
+            "display-resync" => "display-resample",
+            "display-desync" => "display-desync",
+            _ => "audio",
         }
     }
 
@@ -451,10 +500,6 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    pub fn second_audio_track(&self) -> Option<AudioTrackInfo> {
-        self.audio_tracks().into_iter().nth(1)
-    }
-
     pub fn file_track_state(&self) -> FileTrackState {
         FileTrackState::from_engine(self)
     }
@@ -467,18 +512,11 @@ impl Engine {
                 .unwrap_or(TrackSelection::Auto),
             primary_volume: self.get_f64("volume").clamp(0.0, 100.0),
             primary_delay: self.get_f64("audio-delay"),
-            ..AudioTrackState::default()
         }
     }
 
     pub fn set_audio_track(&self, selection: TrackSelection) -> bool {
         self.set("aid", &selection.as_value())
-    }
-
-    pub fn set_second_audio_track(&self) -> bool {
-        self.second_audio_track()
-            .map(|track| self.set_audio_track(TrackSelection::Id(track.id)))
-            .unwrap_or(false)
     }
 
     pub fn set_subtitle_track(&self, selection: TrackSelection) -> bool {
@@ -493,32 +531,6 @@ impl Engine {
         self.set_audio_track(state.audio)
             & self.set_subtitle_track(state.subtitle)
             & self.set_secondary_subtitle(state.secondary_subtitle)
-    }
-
-    pub fn set_volume_percent(&self, volume: f64) -> bool {
-        self.set("volume", &Value::Float(volume.clamp(0.0, 100.0)))
-    }
-
-    pub fn set_audio_delay_seconds(&self, delay: f64) -> bool {
-        if !delay.is_finite() {
-            return false;
-        }
-        self.set("audio-delay", &Value::Float(delay.clamp(-600.0, 600.0)))
-    }
-
-    pub fn add_audio_track(&self, path: &str) -> bool {
-        if path.is_empty() {
-            return false;
-        }
-        self.cmd(&["audio-add", path, "select"])
-    }
-
-    pub fn remove_audio_track(&self, id: i64) -> bool {
-        if id <= 0 {
-            return false;
-        }
-        let id = id.to_string();
-        self.cmd(&["audio-remove", &id])
     }
 
     pub fn set(&self, name: &str, value: &Value) -> bool {
@@ -645,32 +657,37 @@ impl Engine {
         true
     }
 
-    /// Replace the current file, optionally starting at `start` seconds.
-    pub fn load(&self, path: &str, start: Option<f64>) -> bool {
-        match start {
-            None => self.cmd(&["loadfile", path, "replace"]),
-            Some(seconds) => {
-                let option = format!("start={seconds:.2}");
-                self.cmd(&["loadfile", path, "replace", "-1", &option])
+    /// Replace the current file with extra per-load mpv options (`k=v,k=v`).
+    /// `options` may be empty; it must not contain commas inside values.
+    pub fn load_with_options(&self, path: &str, start: Option<f64>, options: &str) -> bool {
+        let mut all = String::new();
+        if let Some(seconds) = start {
+            all.push_str(&format!("start={seconds:.2}"));
+        }
+        if !options.is_empty() {
+            if !all.is_empty() {
+                all.push(',');
             }
+            all.push_str(options);
+        }
+        match all.is_empty() {
+            true => self.cmd(&["loadfile", path, "replace"]),
+            false => self.cmd(&["loadfile", path, "replace", "-1", &all]),
         }
     }
 
-    /// Fetch a property by name, synchronously, coercing to a string.
-    pub fn get_string(&self, name: &str) -> Option<String> {
-        if !self.alive.load(Ordering::Relaxed) {
-            return None;
+    /// yt-dlp format selector for a quality id ("best", "1080", "audio", ...).
+    pub fn ytdl_format(quality: &str) -> &'static str {
+        match quality {
+            "2160" => "bestvideo[height<=?2160]+bestaudio/best[height<=?2160]",
+            "1440" => "bestvideo[height<=?1440]+bestaudio/best[height<=?1440]",
+            "1080" => "bestvideo[height<=?1080]+bestaudio/best[height<=?1080]",
+            "720" => "bestvideo[height<=?720]+bestaudio/best[height<=?720]",
+            "480" => "bestvideo[height<=?480]+bestaudio/best[height<=?480]",
+            "360" => "bestvideo[height<=?360]+bestaudio/best[height<=?360]",
+            "audio" => "bestaudio/best",
+            _ => "bestvideo+bestaudio/best",
         }
-        let c_name = CString::new(name).ok()?;
-        let ptr = unsafe { (self.api.get_property_string)(self.mpv, c_name.as_ptr()) };
-        if ptr.is_null() {
-            return None;
-        }
-        let text = unsafe { CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { (self.api.free)(ptr as *mut c_void) };
-        Some(text)
     }
 
     pub fn add(&self, name: &str, delta: f64, lo: Option<f64>, hi: Option<f64>) -> f64 {
@@ -690,8 +707,10 @@ impl Engine {
             if lines.len() >= 200 {
                 lines.pop_front();
             }
-            lines.push_back(line);
+            lines.push_back(line.clone());
         }
+        // Mirror failures to the diagnostic log file (best-effort).
+        crate::logging::write(&line);
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -722,6 +741,16 @@ impl Drop for Engine {
 
 fn yes_no(value: bool) -> String {
     if value { "yes".into() } else { "no".into() }
+}
+
+/// `Key: Value` lines (and/or comma-separated) joined into the single
+/// comma-separated form mpv's `http-header-fields` option expects.
+fn http_header_fields(raw: &str) -> String {
+    raw.split(['\n', ','])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && line.contains(':'))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Render scalar values in the format expected by mpv option and property strings.
@@ -757,66 +786,48 @@ fn event_loop(
                 alive.store(false, Ordering::Release);
                 break;
             }
-            MPV_EVENT_START_FILE => {
-                let _ = tx.send(EngineMsg::StartFile);
-            }
             MPV_EVENT_FILE_LOADED => {
                 let _ = tx.send(EngineMsg::FileLoaded);
             }
-            MPV_EVENT_PLAYBACK_RESTART => {
-                let _ = tx.send(EngineMsg::PlaybackRestart);
+            MPV_EVENT_END_FILE if !event.data.is_null() => {
+                let end = unsafe { &*(event.data as *const mpv_event_end_file) };
+                let _ = tx.send(EngineMsg::EndFile {
+                    reason: end.reason,
+                    error: end.error,
+                    entry_id: end.playlist_entry_id,
+                });
             }
-            MPV_EVENT_VIDEO_RECONFIG => {
-                let _ = tx.send(EngineMsg::VideoReconfig);
-            }
-            MPV_EVENT_SEEK => {
-                let _ = tx.send(EngineMsg::Seek);
-            }
-            MPV_EVENT_END_FILE => {
-                if !event.data.is_null() {
-                    let end = unsafe { &*(event.data as *const mpv_event_end_file) };
-                    let _ = tx.send(EngineMsg::EndFile {
-                        reason: end.reason,
-                        error: end.error,
-                        entry_id: end.playlist_entry_id,
-                    });
+            MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
+                let prop = unsafe { &*(event.data as *const mpv_event_property) };
+                let name = unsafe { cstr(prop.name) };
+                if prop.format != MPV_FORMAT_NONE && !prop.data.is_null() {
+                    let node = unsafe { &*(prop.data as *const mpv_node) };
+                    let value = unsafe { Value::from_mpv_node(node) };
+                    let _ = tx.send(EngineMsg::Prop(name, value));
+                } else {
+                    let _ = tx.send(EngineMsg::Prop(name, Value::None));
                 }
             }
-            MPV_EVENT_PROPERTY_CHANGE => {
-                if !event.data.is_null() {
-                    let prop = unsafe { &*(event.data as *const mpv_event_property) };
-                    let name = unsafe { cstr(prop.name) };
-                    if prop.format != MPV_FORMAT_NONE && !prop.data.is_null() {
-                        let node = unsafe { &*(prop.data as *const mpv_node) };
-                        let value = unsafe { Value::from_mpv_node(node) };
-                        let _ = tx.send(EngineMsg::Prop(name, value));
-                    } else {
-                        let _ = tx.send(EngineMsg::Prop(name, Value::None));
+            MPV_EVENT_LOG_MESSAGE if !event.data.is_null() => {
+                let msg = unsafe { &*(event.data as *const mpv_event_log_message) };
+                let level = unsafe { cstr(msg.level) };
+                let prefix = unsafe { cstr(msg.prefix) };
+                let text = unsafe { cstr(msg.text) };
+                let line = format!("[{level}] {prefix}: {text}");
+                if let Ok(mut lines) = log_lines.lock() {
+                    if lines.len() >= 200 {
+                        lines.pop_front();
                     }
+                    lines.push_back(line.clone());
                 }
-            }
-            MPV_EVENT_LOG_MESSAGE => {
-                if !event.data.is_null() {
-                    let msg = unsafe { &*(event.data as *const mpv_event_log_message) };
-                    let level = unsafe { cstr(msg.level) };
-                    let prefix = unsafe { cstr(msg.prefix) };
-                    let text = unsafe { cstr(msg.text) };
-                    let line = format!("[{level}] {prefix}: {text}");
-                    if let Ok(mut lines) = log_lines.lock() {
-                        if lines.len() >= 200 {
-                            lines.pop_front();
-                        }
-                        lines.push_back(line.clone());
-                    }
-                    if verbose {
-                        eprintln!("{line}");
-                    }
+                if verbose {
+                    eprintln!("{line}");
                 }
+                crate::logging::write(&line);
             }
             _ => {}
         }
     }
-    let _ = MPV_END_FILE_REASON_ERROR; // referenced for symmetry with end-file handling in the UI
 }
 
 /// # Safety
@@ -834,6 +845,38 @@ unsafe fn cstr(ptr: *const c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ytdl_quality_ids_map_to_format_selectors() {
+        assert_eq!(Engine::ytdl_format("best"), "bestvideo+bestaudio/best");
+        assert!(Engine::ytdl_format("720").contains("height<=?720"));
+        assert_eq!(Engine::ytdl_format("audio"), "bestaudio/best");
+        // Unknown ids degrade to "best", never to an invalid selector.
+        assert_eq!(Engine::ytdl_format("bogus"), Engine::ytdl_format("best"));
+    }
+
+    #[test]
+    fn video_sync_ids_map_onto_real_mpv_values() {
+        // mpv has no "auto"; both auto and audio select the audio clock.
+        assert_eq!(Engine::video_sync_value("auto"), "audio");
+        assert_eq!(Engine::video_sync_value("audio"), "audio");
+        assert_eq!(
+            Engine::video_sync_value("display-resync"),
+            "display-resample"
+        );
+        assert_eq!(Engine::video_sync_value("display-desync"), "display-desync");
+        // Unknown ids degrade to the default clock, never an invalid option.
+        assert_eq!(Engine::video_sync_value("bogus"), "audio");
+    }
+
+    #[test]
+    fn http_headers_accept_lines_and_commas() {
+        assert_eq!(
+            http_header_fields("Referer: https://x\nCookie: a=b"),
+            "Referer: https://x,Cookie: a=b"
+        );
+        assert_eq!(http_header_fields("no-colon, "), "");
+    }
 
     #[test]
     fn shutdown_state_can_only_be_claimed_once() {

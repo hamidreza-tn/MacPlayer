@@ -2,39 +2,49 @@
 //!
 //! The MacPlayer application state, restructured around egui's immediate-mode frame.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Context, Id, Pos2, Rect, Sense, Ui, Vec2, pos2, vec2};
+use egui::{Align2, Color32, Context, Id, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
 use crate::dialogs::{
-    ControlPanel, GoToDialog, GoToMode, PreferencesDialog, TextDialog, UrlDialog,
+    ControlPanel, GoToDialog, GoToMode, HistoryDialog, PreferencesDialog, ResumeChoice,
+    ResumeDialog, SettingsPopover, TextDialog, UrlDialog,
 };
 use crate::engine::{Engine, EngineMsg, FileTrackState, TrackSelection};
 use crate::ffi;
+use crate::i18n::{self, Lang};
 use crate::menus::{self, Action, MenuCtx, MenuState, TrackKind, TrackSel};
-use crate::playlist::{Playlist, PlaylistOut};
+use crate::playlist::{MediaStatus, Playlist, PlaylistOut, progress_fraction};
 use crate::render::{RectPx, Renderer};
+use crate::services::{PlatformServices, Services};
 use crate::settings::Settings;
 use crate::skin::{self, *};
+use crate::thumbs::Thumbnails;
 use crate::util::{
     expand_paths, ext, fmt_time, human_size, is_sub, is_url, read_playlist_file, similar_files,
-    title_of,
+    title_of, write_m3u,
 };
 use crate::value::Value;
 use crate::widgets::{
-    self, Badge, Click, IconBtn, Osd, SeekUi, VolumeUi, apply_cursor, fmt_pair, info_badges,
-    seek_bar, time_label, title_bar, volume_bar,
+    IconBtn, Osd, OsdTone, SeekUi, VolumeUi, apply_cursor, fmt_pair, seek_bar, volume_bar,
 };
 
+/// How long the floating chrome stays visible without pointer activity.
+const CHROME_HIDE_SECS: f64 = 2.2;
+/// How long the big play/pause flash stays on the video.
+const FLASH_SECS: f64 = 0.55;
+/// Widest playlist drawer.
+const DRAWER_MAX_W: f32 = 420.0;
+/// Window in which a second stage click upgrades to a double-click, so a plain
+/// click-to-pause never also triggers full screen.
+const VIDEO_DOUBLE_CLICK_SECS: f64 = 0.30;
 const PLAYLIST_EXT: &[&str] = crate::util::PLAYLIST_EXT;
 const VIDEO_EXT: &[&str] = crate::util::VIDEO_EXT;
 const AUDIO_EXT: &[&str] = crate::util::AUDIO_EXT;
-const FS_EDGE_TIMEOUT: f64 = 3.0;
 
 /// A single thing the UI wants the player to do. Chrome, menus and dialogs all push into
 /// one queue; it is drained once per frame, after painting.
@@ -43,16 +53,11 @@ struct Pending {
     actions: Vec<Action>,
     /// (paths, append)
     open: Vec<(Vec<String>, bool)>,
-    quit: bool,
 }
 
 impl Pending {
     fn new() -> Self {
-        Self {
-            actions: Vec::new(),
-            open: Vec::new(),
-            quit: false,
-        }
+        Self::default()
     }
 
     fn push(&mut self, action: Action) {
@@ -64,13 +69,49 @@ impl Pending {
     }
 }
 
+/// Rows shown at once in the command palette.
+const PALETTE_MAX_RESULTS: usize = 12;
+
+/// The Ctrl+K command palette: a flat, filterable view over the menu tree.
+#[derive(Debug, Default)]
+struct CommandPalette {
+    open: bool,
+    query: String,
+    selected: usize,
+    focused: bool,
+}
+
+/// mpv state arrays the menu model reads; kept alive beside the borrowed [`MenuCtx`].
+struct MenuSnapshot {
+    tracks: Vec<Value>,
+    chapters: Vec<Value>,
+    audio_devices: Vec<Value>,
+}
+
+impl CommandPalette {
+    fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.selected = 0;
+        self.focused = true;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.selected = 0;
+    }
+}
+
 pub struct Player {
     engine: Option<Engine>,
     renderer: Option<Arc<Mutex<Renderer>>>,
     startup_error: Option<String>,
     ipc_rx: Receiver<Vec<String>>,
+    services: Box<dyn Services>,
 
     settings: Settings,
+    settings_error: Option<String>,
     state: HashMap<String, Value>,
 
     playlist: Playlist,
@@ -86,10 +127,11 @@ pub struct Player {
     osd: Osd,
     seek: SeekUi,
     volume: VolumeUi,
-    badges: Vec<Badge>,
 
     title_text: String,
     aspect_name: String,
+    /// mpv value of the selected aspect override ("-1" = default).
+    aspect_value: String,
     display_mode: String,
     flips: (bool, bool),
     normalize: bool,
@@ -100,31 +142,35 @@ pub struct Player {
     menu: MenuState,
     track_menu_kind: Option<TrackKind>,
     goto_dialog: GoToDialog,
+    resume_dialog: ResumeDialog,
     url_dialog: UrlDialog,
     text_dialog: TextDialog,
     prefs: PreferencesDialog,
     panel: ControlPanel,
+    settings_pop: SettingsPopover,
+    palette: CommandPalette,
 
     pending: Pending,
 
     // -- window state -----------------------------------------------------------------------------
     playlist_visible: bool,
+    /// Animated 0..1 drawer slide (1 = fully open); egui eases it every frame.
+    drawer_slide: f32,
     fullscreen: bool,
     maximized: bool,
-    fs_top: bool,
-    fs_bottom: bool,
-    fs_right: bool,
-    fs_pin: bool,
-    was_maximized: bool,
     on_top: bool,
     state_changed: f64,
-    press_origin: Option<Pos2>,
 
-    // -- cursor ------------------------------------------------------------------------------------
-    cursor_hidden: bool,
-    mouse_in_video: bool,
-    last_pointer_move: Option<Instant>,
-    playlist_resize_dragging: bool,
+    // -- floating chrome ---------------------------------------------------------------------------
+    chrome_visible: bool,
+    chrome_hide_at: f64,
+    last_pointer: Option<Pos2>,
+    flash_glyph: String,
+    flash_until: f64,
+    video_click_at: Option<f64>,
+    settings_anchor: Rect,
+    /// Actual current viewport height (fullscreen-aware), for subtitle margins.
+    viewport_h: f32,
 
     // -- drag and drop -------------------------------------------------------------------------------
     hovered_files: Vec<String>,
@@ -132,14 +178,44 @@ pub struct Player {
     gl_ready: bool,
     pending_open: Vec<(Vec<String>, bool)>,
     closing: bool,
+    /// Last window title actually sent to the viewport; avoids re-sending it every frame.
+    applied_title: String,
+    /// Last always-on-top state actually sent; `None` until the first frame.
+    applied_on_top: Option<bool>,
     next_save: f64,
     next_autofit: f64,
-    next_cursor: f64,
-    fs_top_deadline: f64,
-    fs_bottom_deadline: f64,
     next_info: f64,
     now: f64,
     started_at: Instant,
+    /// Set once the first frame verified the restored window is on-screen.
+    position_checked: bool,
+
+    // -- new feature state -----------------------------------------------------------------------
+    history_dialog: HistoryDialog,
+    thumbs: Thumbnails,
+    /// Absolute `now` deadline after which playback pauses; None = off.
+    sleep_deadline: Option<f64>,
+    /// Pause once the playlist reaches its end.
+    sleep_after_playlist: bool,
+    mini_player: bool,
+    /// Window size before entering the mini player.
+    mini_prev_size: Option<Vec2>,
+    /// (deband, denoise, sharpen) toggle state for the video filter menu.
+    video_filters: (bool, bool, bool),
+    /// True while the lavfi visualizer filter is installed.
+    viz_active: bool,
+    /// Set at load for files with no real video track (visualizer/autofit).
+    file_is_audio_only: bool,
+    /// Pinch gesture latch: one gesture = one fullscreen toggle.
+    pinch_latched: bool,
+    /// Accumulated pinch scale for the current gesture (1.0 = neutral).
+    pinch_scale: f32,
+    /// Time of the last magnify event, to detect gesture end.
+    pinch_last_at: f64,
+    /// Leftover horizontal wheel distance for two-finger seeking.
+    video_scroll_acc: f32,
+    /// Leftover vertical ctrl/cmd wheel distance for video zooming.
+    zoom_scroll_acc: f32,
 }
 
 impl Player {
@@ -151,6 +227,12 @@ impl Player {
         verbose: bool,
         fullscreen: bool,
     ) -> Self {
+        // Appearance globals must be set before the first style/font application.
+        skin::set_theme(Theme::from_str(&settings.theme));
+        skin::set_accent(Accent::from_str(&settings.accent));
+        i18n::set_lang(Lang::from_str(&settings.language));
+        skin::apply(&ctx);
+        skin::apply_fonts(&ctx, i18n::rtl());
         let playlist_visible = settings.playlist_visible;
         let show_remaining = settings.show_remaining;
         let on_top = settings.on_top == "always";
@@ -159,14 +241,21 @@ impl Player {
                 let renderer = Renderer::new(engine.api(), engine.handle(), ctx);
                 (Some(engine), Some(Arc::new(Mutex::new(renderer))), None)
             }
-            Err(error) => (None, None, Some(error)),
+            Err(error) => {
+                crate::logging::write(&format!("engine startup failed: {error}"));
+                (None, None, Some(error))
+            }
         };
+        // First run opens quietly: video + controls only, no drawer over the idle screen.
+        let first_run = settings.first_run;
         let mut player = Self {
             engine,
             renderer,
             startup_error,
             ipc_rx,
+            services: Box::new(PlatformServices),
             settings,
+            settings_error: None,
             state: HashMap::new(),
             playlist: Playlist::default(),
             current_path: None,
@@ -180,9 +269,9 @@ impl Player {
             osd: Osd::default(),
             seek: SeekUi::default(),
             volume: VolumeUi::default(),
-            badges: Vec::new(),
             title_text: String::new(),
             aspect_name: "Default".into(),
+            aspect_value: "-1".into(),
             display_mode: "fit".into(),
             flips: (false, false),
             normalize: false,
@@ -192,46 +281,77 @@ impl Player {
             menu: MenuState::default(),
             track_menu_kind: None,
             goto_dialog: GoToDialog::default(),
+            resume_dialog: ResumeDialog::default(),
             url_dialog: UrlDialog::default(),
             text_dialog: TextDialog::default(),
             prefs: PreferencesDialog::default(),
             panel: ControlPanel::default(),
+            settings_pop: SettingsPopover::default(),
+            palette: CommandPalette::default(),
             pending: Pending::new(),
-            playlist_visible,
+            playlist_visible: playlist_visible && !first_run,
+            drawer_slide: if playlist_visible && !first_run {
+                1.0
+            } else {
+                0.0
+            },
             fullscreen,
             maximized: false,
-            fs_top: false,
-            fs_bottom: false,
-            fs_right: false,
-            fs_pin: false,
-            was_maximized: false,
             on_top,
             state_changed: 0.0,
-            press_origin: None,
-            cursor_hidden: false,
-            mouse_in_video: false,
-            last_pointer_move: None,
-            playlist_resize_dragging: false,
+            chrome_visible: true,
+            chrome_hide_at: f64::INFINITY,
+            last_pointer: None,
+            flash_glyph: String::new(),
+            flash_until: 0.0,
+            video_click_at: None,
+            settings_anchor: Rect::NOTHING,
+            viewport_h: 720.0,
             hovered_files: Vec::new(),
             gl_ready: false,
             pending_open: Vec::new(),
             closing: false,
+            applied_title: String::new(),
+            applied_on_top: None,
             next_save: 0.0,
             next_autofit: 0.0,
-            next_cursor: 0.0,
-            fs_top_deadline: 0.0,
-            fs_bottom_deadline: 0.0,
             next_info: 0.0,
             now: 0.0,
             started_at: Instant::now(),
+            position_checked: false,
+            history_dialog: HistoryDialog::default(),
+            thumbs: Thumbnails::new(),
+            sleep_deadline: None,
+            sleep_after_playlist: false,
+            mini_player: false,
+            mini_prev_size: None,
+            video_filters: (false, false, false),
+            viz_active: false,
+            file_is_audio_only: false,
+            pinch_latched: false,
+            pinch_scale: 1.0,
+            pinch_last_at: 0.0,
+            video_scroll_acc: 0.0,
+            zoom_scroll_acc: 0.0,
         };
         if !args.is_empty() {
             player.pending.open_paths(args, false);
+        } else if !player.settings.playlist_paths.is_empty() {
+            let paths = player.settings.playlist_paths.clone();
+            player.playlist.set_items(&paths);
+            if let Some(current) = player.settings.playlist_current.as_deref()
+                && let Some(row) = paths.iter().position(|path| path == current)
+            {
+                player.playlist.set_current(Some(row));
+            }
         }
         player
             .playlist
             .set_modes(&player.settings.repeat_mode, player.settings.shuffle);
         player.apply_eq();
+        // Push the engine-backed feature settings (loop, styling, sync, ...)
+        // once so a fresh engine matches the saved preferences.
+        player.apply_settings(false);
         player
     }
 
@@ -287,6 +407,18 @@ impl Player {
         self.engine.as_ref()
     }
 
+    fn save_settings(&mut self) {
+        if let Err(error) = self.settings.try_save() {
+            self.settings_error = Some(error.clone());
+            self.osd_error(
+                format!("{}: {error}", i18n::tr("Could not save settings")),
+                5000,
+            );
+        } else {
+            self.settings_error = None;
+        }
+    }
+
     fn set_prop(&self, name: &str, value: impl Into<Value>) {
         if let Some(engine) = self.engine() {
             engine.set(name, &value.into());
@@ -319,7 +451,7 @@ impl Player {
         }
         self.settings
             .set_track_preference(&path, audio, subtitle, secondary);
-        self.settings.save();
+        self.save_settings();
     }
 
     fn remember_secondary_subtitle(&mut self, selection: TrackSelection) {
@@ -333,7 +465,7 @@ impl Player {
             existing.as_ref().map(|p| p.subtitle).unwrap_or(-2),
             Self::track_code(selection),
         );
-        self.settings.save();
+        self.save_settings();
     }
 
     fn apply_saved_track_preference(&mut self) {
@@ -358,6 +490,34 @@ impl Player {
         }
     }
 
+    /// Restore the per-file aspect ratio and speed remembered from last time.
+    fn apply_saved_media_preference(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        let Some(preference) = self.settings.track_preference(&path) else {
+            return;
+        };
+        if preference.aspect_label != "Default" && preference.aspect_value != "-1" {
+            self.aspect_name = preference.aspect_label.clone();
+            self.set_prop("video-aspect-override", preference.aspect_value.as_str());
+        }
+        if preference.speed > 0.0 {
+            self.set_prop("speed", normalize_speed(preference.speed));
+        }
+    }
+
+    /// Remember the current aspect/speed for the file being played.
+    fn remember_media_preference(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        let speed = self.get_f64("speed");
+        self.settings
+            .set_media_preference(&path, &self.aspect_name, &self.aspect_value, speed);
+        self.save_settings();
+    }
+
     fn cmd(&self, args: &[&str]) {
         if let Some(engine) = self.engine() {
             engine.cmd(args);
@@ -376,186 +536,107 @@ impl Player {
     }
 
     fn osd(&mut self, text: impl Into<String>) {
-        self.osd.show_message(text, 1800, TEXT_E4);
+        self.osd.show_message(text, 1800, OsdTone::Normal);
     }
 
     fn osd_ms(&mut self, text: impl Into<String>, ms: u64) {
-        self.osd.show_message(text, ms, TEXT_E4);
+        self.osd.show_message(text, ms, OsdTone::Normal);
     }
 
     fn osd_error(&mut self, text: impl Into<String>, ms: u64) {
-        self.osd.show_message(text, ms, DANGER);
+        self.osd.show_message(text, ms, OsdTone::Danger);
     }
 
     // -- layout --------------------------------------------------------------------------------------
 
     /// Window chrome beyond the video: borders, title bar, seek row, control bar and playlist.
-    fn chrome_extra(&self) -> Vec2 {
-        let width = 2.0 * FRAME
-            + if self.playlist_visible {
-                self.settings.playlist_width as f32 + 1.0
-            } else {
-                0.0
-            };
-        let height = 2.0 * FRAME + TITLE_H + 1.0 + 1.0 + SEEK_H + 1.0 + CTRL_H;
-        vec2(width, height)
-    }
-
-    fn chrome_extra_fullscreen(&self) -> Vec2 {
-        let width = if self.fs_right {
-            self.settings.playlist_width as f32 + 1.0
-        } else {
-            0.0
-        };
-        let height = if self.fs_bottom {
-            SEEK_H + CTRL_H + 2.0
-        } else {
-            0.0
-        };
-        vec2(width, height)
-    }
-
-    /// Where each chrome piece goes, given the full window rect.
+    /// Where each chrome piece goes. The video always fills the window; every control
+    /// floats over it (quiet-player design). `controls`/`top_actions` are always laid
+    /// out — the fade in [`Self::paint_chrome`] decides how much of them shows.
     fn layout(&self, window: Rect) -> Layout {
-        let mut l = Layout::default();
-        if self.fullscreen {
-            let top = self.fs_top;
-            let bottom = self.fs_bottom;
-            let requested_right = self.fs_right || self.fs_pin;
-            let available_width = window.width().max(0.0);
-            let right = requested_right && available_width >= MIN_MAIN_W + MIN_PLAYLIST_W + 1.0;
-            let pw = if right {
-                (self.settings.playlist_width as f32).clamp(
-                    MIN_PLAYLIST_W,
-                    (available_width - MIN_MAIN_W - 1.0).max(MIN_PLAYLIST_W),
-                )
-            } else {
-                0.0
-            };
-            let chrome_right = if right {
-                window.right() - pw - 1.0
-            } else {
-                window.right()
-            };
-            let ctrl_top = (window.bottom() - CTRL_H).max(window.top());
-            let seek_bottom = (ctrl_top - 1.0).max(window.top());
-            let seek_top = (seek_bottom - SEEK_H).max(window.top());
-            let video_top = if top {
-                (window.top() + TITLE_H + 1.0).min(seek_top)
-            } else {
-                window.top()
-            };
-            let video_bottom = if bottom {
-                (seek_top - 1.0).max(video_top)
-            } else {
-                window.bottom()
-            };
-            l.video = Rect::from_min_max(
-                pos2(window.left(), video_top),
-                pos2(chrome_right, video_bottom),
-            );
-            if top {
-                l.title = Some(Rect::from_min_size(
-                    window.min,
-                    vec2((chrome_right - window.left()).max(0.0), TITLE_H),
-                ));
-            }
-            if bottom {
-                let controls_width = (chrome_right - window.left()).max(0.0);
-                let volume_width = VOLUME_W.min((controls_width * 0.32).max(0.0));
-                let seek_width = (controls_width - volume_width).max(0.0);
-                l.seek = Some(Rect::from_min_max(
-                    pos2(window.left(), seek_top),
-                    pos2(window.left() + seek_width, seek_bottom),
-                ));
-                l.volume = Some(Rect::from_min_size(
-                    pos2(window.left() + seek_width, seek_top),
-                    vec2(volume_width, (seek_bottom - seek_top).max(0.0)),
-                ));
-                l.ctrl = Some(Rect::from_min_max(
-                    pos2(window.left(), ctrl_top),
-                    pos2(chrome_right, window.bottom()),
-                ));
-            }
-            if right {
-                let py = if top { TITLE_H + 1.0 } else { 0.0 };
-                let panel_top = window.top() + py;
-                let panel_bottom = (window.bottom()
-                    - if bottom { SEEK_H + CTRL_H + 2.0 } else { 0.0 })
-                .max(panel_top);
-                l.playlist = Some(Rect::from_min_size(
-                    pos2(chrome_right + 1.0, panel_top),
-                    vec2(pw, panel_bottom - panel_top),
-                ));
-            }
-            l.playlist_right = right;
-            l.has_top = top;
-            l.has_bottom = bottom;
-        } else {
-            let content_left = window.left() + FRAME;
-            let content_right = window.right() - FRAME;
-            let available_width = (content_right - content_left).max(0.0);
-            let right =
-                self.playlist_visible && available_width >= MIN_MAIN_W + MIN_PLAYLIST_W + 1.0;
-            let pw = if right {
-                (self.settings.playlist_width as f32).clamp(
-                    MIN_PLAYLIST_W,
-                    (available_width - MIN_MAIN_W - 1.0).max(MIN_PLAYLIST_W),
-                )
-            } else {
-                0.0
-            };
-            let x1 = content_right - if right { pw + 1.0 } else { 0.0 };
-            let cw = (x1 - content_left).max(0.0);
-            l.title = Some(Rect::from_min_size(
-                pos2(content_left, window.top() + FRAME),
-                vec2(cw, TITLE_H),
+        let mut l = Layout {
+            video: window,
+            controls: Some(Rect::from_min_max(
+                pos2(window.left(), (window.bottom() - CTRL_H).max(window.top())),
+                pos2(window.right(), window.bottom()),
+            )),
+            top_actions: Some(Rect::from_min_size(
+                pos2(
+                    (window.right() - 78.0).max(window.left()),
+                    window.top() + 10.0,
+                ),
+                vec2(68.0, 32.0),
+            )),
+            ..Layout::default()
+        };
+        // The drawer slides over the right edge; `drawer_slide` eases 0..1 so both
+        // the drawer and the floating controls animate together.
+        if self.drawer_slide > 0.001 {
+            let width = (self.settings.playlist_width as f32)
+                .clamp(MIN_PLAYLIST_W, DRAWER_MAX_W)
+                .min(window.width().max(MIN_PLAYLIST_W));
+            let left = (window.right() - width * self.drawer_slide).max(window.left());
+            l.playlist = Some(Rect::from_min_max(
+                pos2(left, window.top()),
+                pos2(
+                    window.right() + (1.0 - self.drawer_slide) * width,
+                    window.bottom(),
+                ),
             ));
-            let vy = window.top() + FRAME + TITLE_H + 1.0;
-            let ctrl_top = (window.bottom() - FRAME - CTRL_H).max(window.top() + FRAME);
-            let seek_bottom = (ctrl_top - 1.0).max(window.top() + FRAME);
-            let sy = (seek_bottom - SEEK_H).max(window.top() + FRAME);
-            let volume_width = VOLUME_W.min((cw * 0.32).max(0.0));
-            let seek_width = (cw - volume_width).max(0.0);
-            l.video = Rect::from_min_max(
-                pos2(content_left, vy.min(sy)),
-                pos2(content_left + cw, (sy - 1.0).max(vy.min(sy))),
-            );
-            l.seek = Some(Rect::from_min_size(
-                pos2(content_left, sy),
-                vec2(seek_width, (seek_bottom - sy).max(0.0)),
-            ));
-            l.volume = Some(Rect::from_min_size(
-                pos2(content_left + seek_width, sy),
-                vec2(volume_width, (seek_bottom - sy).max(0.0)),
-            ));
-            l.ctrl = Some(Rect::from_min_max(
-                pos2(content_left, ctrl_top),
-                pos2(content_left + cw, window.bottom() - FRAME),
-            ));
-            if right {
-                l.playlist = Some(Rect::from_min_size(
-                    pos2(x1 + 1.0, window.top() + FRAME),
-                    vec2(pw, (window.height() - 2.0 * FRAME).max(0.0)),
-                ));
-            }
-            l.playlist_right = right;
-            l.has_top = true;
-            l.has_bottom = true;
+        }
+        // The drawer owns the right edge; the floating controls and top actions
+        // shrink to the left of it so volume/fullscreen never end up under it.
+        let chrome_right = l
+            .playlist
+            .map_or(window.right(), |playlist| playlist.left());
+        if let Some(controls) = l.controls.as_mut() {
+            controls.max.x = chrome_right;
+        }
+        if let Some(actions) = l.top_actions.as_mut() {
+            actions.min.x = (chrome_right - 78.0).max(window.left());
+            actions.max.x = actions.min.x + 68.0;
         }
         l
     }
 
     fn update_sub_margin(&mut self) {
-        self.update_sub_margin_for_height(self.settings.window_h as f32);
+        self.update_sub_margin_for_height(self.viewport_h);
     }
 
     fn update_sub_margin_for_height(&mut self, viewport_height: f32) {
-        let mut margin = 22.0;
-        if self.fullscreen && self.fs_bottom {
-            margin += ((SEEK_H + CTRL_H + 2.0) * 720.0 / viewport_height.max(1.0)).round();
+        // Lift subtitles above the floating control bar. The lift is constant whether
+        // the chrome is currently visible or not, so subtitles never jump on pause;
+        // mpv measures margins in a 720p reference space.
+        let margin = 22.0 + (CTRL_H * 720.0 / viewport_height.max(1.0)).round();
+        self.set_prop("sub-margin-y", margin as i64);
+    }
+
+    /// A window position saved on a monitor that is no longer attached would
+    /// restore the window completely off-screen; detect that once and center.
+    fn recover_offscreen_window(&mut self, ctx: &Context) {
+        let Some(monitor) = ctx.input(|input| input.viewport().monitor_size) else {
+            return;
+        };
+        let offscreen = ctx
+            .input(|input| input.viewport().inner_rect)
+            .is_some_and(|rect| {
+                rect.right() < 40.0
+                    || rect.bottom() < 40.0
+                    || rect.left() > monitor.x - 40.0
+                    || rect.top() > monitor.y - 40.0
+            });
+        if offscreen {
+            self.settings.window_x = None;
+            self.settings.window_y = None;
+            // No Center command in this egui version; place the window in the
+            // middle of the current monitor using the remembered size.
+            let x = (monitor.x - self.settings.window_w as f32) / 2.0;
+            let y = (monitor.y - self.settings.window_h as f32) / 2.0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(
+                x.max(0.0),
+                y.max(0.0),
+            )));
         }
-        self.set_prop("sub-margin-y", margin as f64);
     }
 
     fn remember_window_geometry(&mut self, ctx: &Context) {
@@ -594,9 +675,12 @@ impl Player {
             "duration" => {
                 let d = value.as_f64().unwrap_or(0.0);
                 self.seek.duration = d;
-                if d > 0.0 {
-                    if let Some(path) = self.current_path.clone() {
-                        self.playlist.set_duration(&path, d);
+                if d > 0.0
+                    && let Some(path) = self.current_path.clone()
+                {
+                    self.playlist.set_duration(&path, d);
+                    if !is_url(&path) {
+                        self.thumbs.queue(&path, d);
                     }
                 }
             }
@@ -608,14 +692,22 @@ impl Player {
                     self.last_pos = 0.0;
                     self.seek.reset();
                     self.osd.center.clear();
+                    // Repaint the video surface once more so mpv replaces the last
+                    // decoded frame with the idle background instead of leaving the
+                    // stale frame visible under the idle screen.
+                    if let Some(renderer) = &self.renderer
+                        && let Ok(renderer) = renderer.lock()
+                    {
+                        renderer.request_render();
+                    }
                 }
                 self.update_title();
-                self.update_badges();
             }
             "media-title" | "path" => self.update_title(),
             "volume" => {
                 if let Some(v) = value.as_f64() {
-                    let volume = v.round().clamp(0.0, 100.0) as i64;
+                    let ceiling = self.settings.volume_max.max(100) as f64;
+                    let volume = v.round().clamp(0.0, ceiling) as i64;
                     self.volume.volume = volume;
                     self.settings.volume = volume;
                 }
@@ -624,9 +716,7 @@ impl Player {
                 self.volume.muted = value.as_bool();
                 self.settings.mute = value.as_bool();
             }
-            "track-list" => {
-                self.update_badges();
-            }
+            "track-list" => {}
             "chapter-list" => {
                 self.seek.chapters = value
                     .as_array()
@@ -634,12 +724,9 @@ impl Player {
                     .filter_map(|c| c.get("time").as_f64())
                     .collect();
             }
-            "video-params" => {
-                if value.get("dw").as_f64().is_some() && self.autofit_pending {
-                    self.autofit_pending = false;
-                    self.next_autofit = self.now + 0.05;
-                }
-                self.update_badges();
+            "video-params" if value.get("dw").as_f64().is_some() && self.autofit_pending => {
+                self.autofit_pending = false;
+                self.next_autofit = self.now + 0.05;
             }
             "demuxer-cache-time" => {
                 if let Some(path) = &self.current_path {
@@ -675,7 +762,18 @@ impl Player {
         {
             self.play_row(row, false);
         } else {
-            self.stop(false);
+            // Playlist exhausted: honor keep-open — stay on the last frame, paused,
+            // with a brief replay hint. Space or a video click restarts the file;
+            // an explicit Stop (F4) is what returns to the idle screen.
+            if self.sleep_after_playlist {
+                self.sleep_after_playlist = false;
+                self.set_prop("pause", true);
+                self.osd_ms(i18n::tr("Paused by the sleep timer"), 3500);
+            }
+            self.osd.center.clear();
+            self.flash_glyph = "play".to_string();
+            self.flash_until = self.now + FLASH_SECS;
+            self.schedule_chrome_hide();
         }
     }
 
@@ -683,23 +781,55 @@ impl Player {
         match msg {
             EngineMsg::Prop(name, value) => self.on_prop(&name, value),
             EngineMsg::FileLoaded => {
+                if let Some(engine_path) = self.state.get("path").and_then(|value| value.as_str())
+                    && !engine_path.is_empty()
+                    && self.current_path.as_deref() != Some(engine_path)
+                {
+                    return;
+                }
                 self.file_ready = true;
+                self.update_sub_margin();
+                self.schedule_chrome_hide();
+                if let Some(path) = self.current_path.as_deref() {
+                    self.playlist.set_status(path, MediaStatus::Ready);
+                }
                 self.fail_count = 0;
                 self.aspect_name = "Default".into();
                 if let Some(path) = self.current_path.clone() {
                     self.settings.add_recent(&path);
+                    self.settings.add_history(&path, &path);
                 }
                 for sub in std::mem::take(&mut self.pending_subs) {
                     let sub = sub.clone();
                     self.cmd(&["sub-add", &sub, "select"]);
                 }
                 self.apply_saved_track_preference();
+                self.apply_saved_media_preference();
+                // Decide "audio-only" before the visualizer can install its own
+                // synthetic video track; drive the music-mode visualizer off it.
+                self.file_is_audio_only = !self.has_video();
+                if self.file_is_audio_only
+                    && self.settings.auto_visualizer
+                    && self.settings.visualizer != "off"
+                    && !self.viz_active
+                {
+                    let mode = match self.settings.visualizer.as_str() {
+                        "spectrum" => "spectrum",
+                        _ => "wave",
+                    };
+                    self.set_visualizer(mode);
+                }
+                if self.thumbs.available() {
+                    let path = self.current_path.clone();
+                    let duration = self.duration();
+                    if let Some(path) = path.filter(|p| !is_url(p)) {
+                        self.thumbs.queue(&path, duration);
+                    }
+                }
                 self.update_title();
                 if let Some(at) = self.resumed_at {
-                    self.osd(format!(
-                        "Resumed at {}  (Backspace: play from the beginning)",
-                        fmt_time(at)
-                    ));
+                    self.set_prop("pause", true);
+                    self.resume_dialog.open(at);
                 } else if let Some(path) = &self.current_path {
                     let title = title_of(path);
                     self.osd(title);
@@ -711,29 +841,47 @@ impl Player {
                 error,
                 entry_id,
             } => {
-                let _ = entry_id;
+                // mpv exposes the playlist entry id only for end-file events.  The app loads
+                // files with `replace`, so the path property is the reliable guard against a
+                // late event from the media that was just replaced.  Keep the id in the event
+                // for diagnostics and future command correlation.
+                let path_matches = self
+                    .state
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .filter(|path| !path.is_empty())
+                    .is_none_or(|path| self.current_path.as_deref() == Some(path));
+                if !path_matches {
+                    return;
+                }
+                let _entry_id = entry_id;
                 if reason == ffi::MPV_END_FILE_REASON_ERROR && error != 0 {
                     self.file_ready = false;
+                    if let Some(path) = self.current_path.as_deref() {
+                        self.playlist
+                            .set_status(path, MediaStatus::Failed(format!("mpv error {error}")));
+                    }
                     self.fail_count += 1;
                     let name = title_of(self.current_path.as_deref().unwrap_or(""));
-                    self.osd_error(format!("Cannot open: {name}"), 3500);
-                    if self.fail_count < 3 && self.playlist.count() > 1 {
-                        if let Some(row) = self.playlist.step(1, "off", false) {
-                            self.next_autofit = self.now + 1.2;
-                            self.autofit_pending = false;
-                            self.play_row(row, true);
-                        }
+                    self.osd_error(
+                        format!("{}: {name}", i18n::tr("Could not open media")),
+                        3500,
+                    );
+                    if self.fail_count < 3
+                        && self.playlist.count() > 1
+                        && let Some(row) = self.playlist.step(1, "off", false)
+                    {
+                        self.next_autofit = self.now + 1.2;
+                        self.autofit_pending = false;
+                        self.play_row(row, true);
                     }
                 }
             }
-            EngineMsg::StartFile => {}
-            EngineMsg::PlaybackRestart | EngineMsg::Seek | EngineMsg::VideoReconfig => {}
         }
     }
 
     fn refresh_derived(&mut self) {
         self.update_buffering();
-        self.update_logo();
         self.update_play_state();
     }
 
@@ -750,72 +898,14 @@ impl Player {
                 .get("cache-buffering-state")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            self.osd.center = format!("Buffering {pct:.0}%");
+            self.osd.center = format!("{} {pct:.0}%", i18n::tr("Buffering"));
         } else if self.hovered_files.is_empty() {
             self.osd.center.clear();
         }
     }
 
-    fn update_logo(&mut self) {
-        // Handled at paint time by reading `logo_title`.
-    }
-
-    fn logo_title(&self) -> String {
-        let idle = self
-            .state
-            .get("idle-active")
-            .map(|v| v.as_bool())
-            .unwrap_or(true);
-        let audio_only = self.file_ready && !self.has_video();
-        if audio_only && !idle {
-            title_of(self.current_path.as_deref().unwrap_or(""))
-        } else {
-            String::new()
-        }
-    }
-
     fn update_play_state(&mut self) {
         self.apply_on_top();
-    }
-
-    fn update_badges(&mut self) {
-        self.badges.clear();
-        if !self.has_file() || !self.file_ready {
-            return;
-        }
-        let tracks = self.tracks().to_vec();
-        let video = tracks
-            .iter()
-            .find(|t| t.get("type").as_str() == Some("video") && t.get("selected").as_bool());
-        let audio = tracks
-            .iter()
-            .find(|t| t.get("type").as_str() == Some("audio") && t.get("selected").as_bool());
-        if let Some(video) = video {
-            if !video.get("albumart").as_bool() {
-                let hw = self
-                    .state
-                    .get("hwdec-current")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("no")
-                    != "no";
-                self.badges.push(Badge {
-                    text: if hw { "H/W" } else { "S/W" }.into(),
-                    on: hw,
-                });
-                let codec = video.get("codec").as_str().unwrap_or("").to_string();
-                self.badges.push(Badge {
-                    text: skin::codec_label(skin::VIDEO_CODECS, &codec),
-                    on: false,
-                });
-            }
-        }
-        if let Some(audio) = audio {
-            let codec = audio.get("codec").as_str().unwrap_or("").to_string();
-            self.badges.push(Badge {
-                text: skin::codec_label(skin::AUDIO_CODECS, &codec),
-                on: false,
-            });
-        }
     }
 
     fn update_title(&mut self) {
@@ -842,6 +932,9 @@ impl Player {
     }
 
     fn remember_position(&mut self) {
+        if self.resume_dialog.open {
+            return;
+        }
         let Some(path) = self.current_path.clone() else {
             return;
         };
@@ -850,6 +943,7 @@ impl Player {
         }
         let pos = self.last_pos;
         let dur = self.duration();
+        self.settings.update_history(&path, pos, dur);
         if self.settings.resume
             && pos > 5.0
             && (dur <= 0.0 || pos < dur - (10.0f64).max(dur * 0.03))
@@ -861,10 +955,17 @@ impl Player {
     }
 
     fn autosave(&mut self) {
-        if self.is_playing() {
-            self.remember_position();
-            self.settings.save();
-        }
+        self.remember_position();
+        self.sync_playlist_settings();
+        self.save_settings();
+    }
+
+    fn sync_playlist_settings(&mut self) {
+        self.settings.playlist_paths = self.playlist.paths();
+        self.settings.playlist_current = self
+            .playlist
+            .current_row()
+            .and_then(|row| self.playlist.path(row).map(str::to_string));
     }
 
     // -- opening media --------------------------------------------------------------------------------
@@ -893,9 +994,9 @@ impl Player {
             if !subs.is_empty() && self.has_file() {
                 self.add_subtitles(&subs);
             } else if !subs.is_empty() {
-                self.osd_error("Open a video first, then add the subtitle", 3000);
+                self.osd_error(i18n::tr("Open a video first, then add the subtitle"), 3000);
             } else {
-                self.osd_error("No playable files found", 3000);
+                self.osd_error(i18n::tr("No playable files found"), 3000);
             }
             return;
         }
@@ -914,8 +1015,13 @@ impl Player {
             } else {
                 let n = media.len();
                 self.osd(format!(
-                    "Added {n} file{} to the playlist",
-                    if n == 1 { "" } else { "s" }
+                    "{} {n} {}",
+                    i18n::tr("Added"),
+                    if n == 1 {
+                        i18n::tr("file to the playlist")
+                    } else {
+                        i18n::tr("files to the playlist")
+                    }
                 ));
             }
             return;
@@ -936,10 +1042,13 @@ impl Player {
     /// Open one or more paths or URLs copied as plain text without opening a
     /// second URL dialog.
     fn open_clipboard(&mut self) {
-        let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+        let text = match self.services.clipboard_text() {
             Ok(text) => text,
             Err(error) => {
-                self.osd_error(format!("Could not read the clipboard: {error}"), 3500);
+                self.osd_error(
+                    format!("{}: {error}", i18n::tr("Could not read the clipboard")),
+                    3500,
+                );
                 return;
             }
         };
@@ -950,7 +1059,10 @@ impl Player {
             .map(str::to_string)
             .collect();
         if paths.is_empty() {
-            self.osd_error("The clipboard does not contain a file or URL", 3000);
+            self.osd_error(
+                i18n::tr("The clipboard does not contain a file or URL"),
+                3000,
+            );
             return;
         }
         self.open_paths(&paths, false);
@@ -964,21 +1076,56 @@ impl Player {
             self.remember_position();
         }
         self.playlist.set_current(Some(row));
+        self.sync_playlist_settings();
+        self.playlist.reveal_current();
         self.current_path = Some(path.clone());
+        self.playlist.set_status(&path, MediaStatus::Loading);
         self.file_ready = false;
         self.last_pos = 0.0;
-        self.autofit_pending = true;
+        self.seek_target = (0.0, 0.0);
+        self.autofit_pending = !is_url(&path);
+        self.file_is_audio_only = false;
+        self.aspect_name = "Default".into();
+        self.aspect_value = "-1".into();
         self.seek.reset();
         self.resumed_at = if self.settings.resume {
             self.settings.get_position(&path)
         } else {
             None
         };
-        self.set_prop("pause", false);
+        // Load paused whenever a resume prompt is coming, so the file never
+        // audibly starts for a few frames before the dialog pauses it again.
+        self.set_prop("pause", self.resumed_at.is_none());
         if let Some(engine) = self.engine() {
-            engine.load(&path, self.resumed_at);
+            // URLs pick up the configured user-agent/headers for this load.
+            let options = if is_url(&path) {
+                self.url_load_options()
+            } else {
+                String::new()
+            };
+            engine.load_with_options(&path, None, &options);
         }
         self.update_title();
+    }
+
+    /// mpv loadfile options carrying the HTTP settings to remote streams.
+    fn url_load_options(&self) -> String {
+        let mut options: Vec<String> = Vec::new();
+        if !self.settings.http_user_agent.is_empty() {
+            options.push(format!("user-agent={}", self.settings.http_user_agent));
+        }
+        let headers = self
+            .settings
+            .http_headers
+            .split(['\n', ','])
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && line.contains(':'))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !headers.is_empty() {
+            options.push(format!("http-header-fields={headers}"));
+        }
+        options.join(",")
     }
 
     fn add_subtitles(&mut self, paths: &[String]) {
@@ -996,7 +1143,7 @@ impl Player {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let title = title_of(last);
-            self.osd(format!("Subtitle: {title}"));
+            self.osd(format!("{}: {title}", i18n::tr("Subtitle")));
         }
     }
 
@@ -1006,7 +1153,7 @@ impl Player {
         }
         self.file_ready = false;
         self.cmd(&["stop"]);
-        self.settings.save();
+        self.save_settings();
     }
 
     fn step_file(&mut self, direction: i32) {
@@ -1018,9 +1165,9 @@ impl Player {
         match self.playlist.step(direction, &repeat, shuffle) {
             Some(row) => self.play_row(row, true),
             None => self.osd(if direction > 0 {
-                "Last file"
+                i18n::tr("Last file")
             } else {
-                "First file"
+                i18n::tr("First file")
             }),
         }
     }
@@ -1031,7 +1178,9 @@ impl Player {
         if !self.has_file() {
             if self.playlist.count() > 0 {
                 let row = self.playlist.current_row().unwrap_or(0);
-                self.play_row(row.max(0), true);
+                self.play_row(row, true);
+            } else {
+                self.pending.push(Action::OpenFiles { append: false });
             }
             return;
         }
@@ -1042,7 +1191,15 @@ impl Player {
         }
         let paused = !self.get_bool("pause");
         self.set_prop("pause", paused);
-        self.osd(if paused { "Pause" } else { "Play" });
+        self.osd(if paused {
+            i18n::tr("Pause")
+        } else {
+            i18n::tr("Play")
+        });
+        // The property cache lags behind the set above; derive the flash from the
+        // state we just applied (playing after the toggle means !paused).
+        self.flash_glyph = if paused { "pause" } else { "play" }.to_string();
+        self.flash_until = self.now + FLASH_SECS;
     }
 
     fn seek_osd(&mut self, target: f64) {
@@ -1106,18 +1263,19 @@ impl Player {
         }]);
         self.osd_ms(
             if direction > 0 {
-                "Next frame"
+                i18n::tr("Next frame")
             } else {
-                "Previous frame"
+                i18n::tr("Previous frame")
             },
             900,
         );
     }
 
     fn set_speed(&mut self, value: f64) {
-        let value = value.clamp(0.2, 12.0).round() * 100.0 / 100.0;
+        let value = normalize_speed(value);
         self.set_prop("speed", value);
-        self.osd(format!("Speed: {value:.1}x"));
+        self.remember_media_preference();
+        self.osd(format!("{}: {value:.2}x", i18n::tr("Speed")));
     }
 
     fn change_speed(&mut self, delta: f64) {
@@ -1134,8 +1292,13 @@ impl Player {
         let prop = format!("ab-loop-{which}");
         self.set_prop(&prop, pos);
         self.osd(format!(
-            "A-B repeat: {} point {}",
-            if which == 'a' { "start" } else { "end" },
+            "{}: {} {}",
+            i18n::tr("A-B repeat"),
+            if which == 'a' {
+                i18n::tr("start point")
+            } else {
+                i18n::tr("end point")
+            },
             fmt_time(pos)
         ));
     }
@@ -1143,7 +1306,7 @@ impl Player {
     fn ab_clear(&mut self) {
         self.set_prop("ab-loop-a", "no");
         self.set_prop("ab-loop-b", "no");
-        self.osd("A-B repeat: off");
+        self.osd(i18n::tr("A-B repeat: off"));
     }
 
     fn chapter_step(&mut self, direction: i32) {
@@ -1154,14 +1317,14 @@ impl Player {
             .unwrap_or(true)
             || !self.has_file()
         {
-            self.osd("No chapters");
+            self.osd(i18n::tr("No chapters"));
             return;
         }
         self.cmd(&["add", "chapter", &direction.to_string()]);
         self.osd(if direction > 0 {
-            "Next chapter"
+            i18n::tr("Next chapter")
         } else {
-            "Previous chapter"
+            i18n::tr("Previous chapter")
         });
     }
 
@@ -1175,10 +1338,11 @@ impl Player {
         let shuffle = self.settings.shuffle;
         self.playlist.shuffle = shuffle;
         self.osd(match mode {
-            "off" => "Repeat: off",
-            "one" => "Repeat: current file",
-            _ => "Repeat: playlist",
+            "off" => i18n::tr("Repeat: off"),
+            "one" => i18n::tr("Repeat: current file"),
+            _ => i18n::tr("Repeat: playlist"),
         });
+        self.save_settings();
     }
 
     fn cycle_repeat(&mut self) {
@@ -1194,18 +1358,22 @@ impl Player {
     fn toggle_shuffle(&mut self) {
         self.settings.shuffle = !self.settings.shuffle;
         self.playlist.shuffle = self.settings.shuffle;
-        self.osd(format!(
-            "Shuffle: {}",
-            if self.settings.shuffle { "on" } else { "off" }
-        ));
+        self.osd(if self.settings.shuffle {
+            i18n::tr("Shuffle: on")
+        } else {
+            i18n::tr("Shuffle: off")
+        });
+        self.save_settings();
     }
 
     fn toggle_resume(&mut self) {
         self.settings.resume = !self.settings.resume;
-        self.osd(format!(
-            "Remember playback position: {}",
-            if self.settings.resume { "on" } else { "off" }
-        ));
+        self.osd(if self.settings.resume {
+            i18n::tr("Remember playback position: on")
+        } else {
+            i18n::tr("Remember playback position: off")
+        });
+        self.save_settings();
     }
 
     fn add_bookmark(&mut self) {
@@ -1218,8 +1386,12 @@ impl Player {
         let time = self.position();
         let title = title_of(&path);
         if self.settings.add_bookmark(&path, time, &title) {
-            self.settings.save();
-            self.osd(format!("Bookmark added at {}", fmt_time(time)));
+            self.save_settings();
+            self.osd(format!(
+                "{}: {}",
+                i18n::tr("Bookmark saved"),
+                fmt_time(time)
+            ));
         }
     }
 
@@ -1242,17 +1414,18 @@ impl Player {
         let visible = !current;
         self.set_prop("sub-visibility", visible);
         self.settings.sub_visible = visible;
-        self.osd(format!(
-            "Subtitles: {}",
-            if visible { "show" } else { "hide" }
-        ));
+        self.osd(if visible {
+            i18n::tr("Subtitles: show")
+        } else {
+            i18n::tr("Subtitles: hide")
+        });
     }
 
     fn set_track(&mut self, kind: TrackKind, sel: TrackSel) {
         self.set_prop(kind.prop(), sel.as_str());
-        let label = kind.label();
+        let label = i18n::tr(kind.label());
         if matches!(sel, TrackSel::No) {
-            self.osd(format!("{label}: off"));
+            self.osd(format!("{label}: {}", i18n::tr("Off")));
             return;
         }
         if kind == TrackKind::Sub {
@@ -1290,7 +1463,11 @@ impl Player {
             .filter_map(|t| t.get("id").as_i64())
             .collect();
         if ids.is_empty() {
-            self.osd(format!("No {} tracks", kind.plural()));
+            self.osd(match kind {
+                TrackKind::Sub => i18n::tr("No subtitle tracks"),
+                TrackKind::Audio => i18n::tr("No audio tracks"),
+                TrackKind::Video => i18n::tr("No video tracks"),
+            });
             return;
         }
         let mut choices: Vec<TrackSel> = ids.into_iter().map(TrackSel::Id).collect();
@@ -1317,10 +1494,16 @@ impl Player {
     fn sub_delay(&mut self, delta: Option<f64>) {
         let value = match delta {
             None => 0.0,
-            Some(d) => (self.get_f64("sub-delay") + d).round() * 1000.0 / 1000.0,
+            // Round at millisecond precision; rounding the sum itself would
+            // snap every 0.5s step to a whole second.
+            Some(d) => ((self.get_f64("sub-delay") + d) * 1000.0).round() / 1000.0,
         };
         self.set_prop("sub-delay", value);
-        self.osd(format!("Subtitle sync: {value:+.1} sec"));
+        self.osd(format!(
+            "{}: {value:+.1} {}",
+            i18n::tr("Subtitle sync"),
+            i18n::tr("sec")
+        ));
     }
 
     fn set_sub_delay(&mut self, value: f64) {
@@ -1330,7 +1513,11 @@ impl Player {
             0.0
         };
         self.set_prop("sub-delay", value);
-        self.osd(format!("Subtitle sync: {value:+.1} sec"));
+        self.osd(format!(
+            "{}: {value:+.1} {}",
+            i18n::tr("Subtitle sync"),
+            i18n::tr("sec")
+        ));
     }
 
     fn sub_scale(&mut self, delta: f64) {
@@ -1349,23 +1536,27 @@ impl Player {
             1.0
         };
         self.set_prop("sub-scale", value);
-        self.osd(format!("Subtitle size: {:.0}%", value * 100.0));
+        self.osd(format!(
+            "{}: {:.0}%",
+            i18n::tr("Subtitle size"),
+            value * 100.0
+        ));
     }
 
     fn sub_move(&mut self, direction: i32) {
         let value = if let Some(engine) = self.engine() {
-            engine.add("sub-pos", (direction * 2) as f64, Some(0.0), Some(150.0))
+            engine.add("sub-pos", (direction * 2) as f64, Some(0.0), Some(100.0))
         } else {
             100.0
         };
-        self.osd(format!("Subtitle position: {value:.0}"));
+        self.osd(format!("{}: {value:.0}", i18n::tr("Subtitle position")));
     }
 
     fn sub_reset(&mut self) {
         self.set_prop("sub-scale", 1.0);
         self.set_prop("sub-pos", self.settings.sub_pos as f64);
         self.set_prop("sub-delay", 0.0);
-        self.osd("Subtitle size and position reset");
+        self.osd(i18n::tr("Subtitle size and position reset"));
     }
 
     fn set_sub_codepage(&mut self, codepage: &str) {
@@ -1374,15 +1565,17 @@ impl Player {
         if self.has_file() {
             self.cmd(&["sub-reload"]);
         }
-        self.osd(format!("Subtitle encoding: {codepage}"));
+        self.osd(format!("{}: {codepage}", i18n::tr("Subtitle encoding")));
     }
 
     // -- video -----------------------------------------------------------------------------------------
 
     fn set_aspect(&mut self, label: &str, value: &str) {
         self.aspect_name = label.to_string();
+        self.aspect_value = value.to_string();
         self.set_prop("video-aspect-override", value);
-        self.osd(format!("Aspect ratio: {label}"));
+        self.remember_media_preference();
+        self.osd(format!("{}: {label}", i18n::tr("Aspect Ratio")));
     }
 
     fn set_display_mode(&mut self, mode: &str) {
@@ -1391,10 +1584,10 @@ impl Player {
         self.set_prop("panscan", if mode == "fill" { 1.0 } else { 0.0 });
         self.set_prop("video-unscaled", mode == "original");
         self.osd(match mode {
-            "fit" => "Keep aspect ratio",
-            "fill" => "Fill window (crop)",
-            "stretch" => "Stretch to window",
-            _ => "Original size",
+            "fit" => i18n::tr("Keep aspect ratio"),
+            "fill" => i18n::tr("Fill window (crop)"),
+            "stretch" => i18n::tr("Stretch to window"),
+            _ => i18n::tr("Original size"),
         });
     }
 
@@ -1404,7 +1597,11 @@ impl Player {
         } else {
             0.0
         };
-        self.osd(format!("Zoom: {:.0}%", 2f64.powf(value) * 100.0));
+        self.osd(format!(
+            "{}: {:.0}%",
+            i18n::tr("Zoom"),
+            2f64.powf(value) * 100.0
+        ));
     }
 
     fn pan(&mut self, dx: f64, dy: f64) {
@@ -1424,7 +1621,7 @@ impl Player {
         }
         self.set_aspect("Default", "-1");
         self.set_display_mode("fit");
-        self.osd("Pan & Scan reset");
+        self.osd(i18n::tr("Pan & Scan reset"));
     }
 
     fn rotate(&mut self, degrees: Option<i64>) {
@@ -1433,7 +1630,7 @@ impl Player {
             None => ((self.get_f64("video-rotate") as i64).rem_euclid(360) + 90).rem_euclid(360),
         };
         self.set_prop("video-rotate", degrees);
-        self.osd(format!("Rotation: {degrees}°"));
+        self.osd(format!("{}: {degrees}°", i18n::tr("Rotation")));
     }
 
     fn toggle_flip(&mut self, name: &'static str) {
@@ -1451,12 +1648,23 @@ impl Player {
         self.osd(format!(
             "{}: {}",
             if name == "hflip" {
-                "Flip horizontally"
+                i18n::tr("Flip Horizontally")
             } else {
-                "Flip vertically"
+                i18n::tr("Flip Vertically")
             },
-            if on { "on" } else { "off" }
+            if on { i18n::tr("On") } else { i18n::tr("Off") }
         ));
+    }
+
+    /// Display name of an image-adjustment property, translated for the OSD.
+    fn adjust_label(prop: &str) -> &'static str {
+        match prop {
+            "brightness" => i18n::tr("Brightness"),
+            "contrast" => i18n::tr("Contrast"),
+            "saturation" => i18n::tr("Saturation"),
+            "hue" => i18n::tr("Hue"),
+            _ => i18n::tr("Gamma"),
+        }
     }
 
     fn image_adjust(&mut self, prop: &str, direction: i32) {
@@ -1465,13 +1673,7 @@ impl Player {
         } else {
             0.0
         };
-        let name = prop
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_default();
-        let rest: String = prop.chars().skip(1).collect();
-        self.osd(format!("{name}{rest}: {value:+.0}"));
+        self.osd(format!("{}: {value:+.0}", Self::adjust_label(prop)));
     }
 
     fn set_image_adjust(&mut self, prop: &str, value: f64) {
@@ -1481,41 +1683,55 @@ impl Player {
             0.0
         };
         self.set_prop(prop, value);
-        self.osd(format!("{prop}: {value:+.0}"));
+        self.osd(format!("{}: {value:+.0}", Self::adjust_label(prop)));
     }
 
     fn image_reset(&mut self) {
         for prop in ["brightness", "contrast", "saturation", "hue", "gamma"] {
             self.set_prop(prop, 0.0);
         }
-        self.osd("Image adjustments reset");
+        self.osd(i18n::tr("Image adjustments reset"));
     }
 
     fn toggle_deinterlace(&mut self) {
         let value = !self.get_bool("deinterlace");
         self.set_prop("deinterlace", value);
-        self.osd(format!("Deinterlace: {}", if value { "on" } else { "off" }));
+        self.osd(format!(
+            "{}: {}",
+            i18n::tr("Deinterlace"),
+            if value {
+                i18n::tr("On")
+            } else {
+                i18n::tr("Off")
+            }
+        ));
     }
 
     fn set_hwdec(&mut self, enabled: bool) {
         self.settings.hwdec = enabled;
         self.set_prop("hwdec", Engine::hwdec_value(enabled));
+        self.save_settings();
         self.osd(format!(
-            "Hardware decoding: {}",
-            if enabled { "on" } else { "off" }
+            "{}: {}",
+            i18n::tr("Hardware decoding"),
+            if enabled {
+                i18n::tr("On")
+            } else {
+                i18n::tr("Off")
+            }
         ));
     }
 
     // -- audio -----------------------------------------------------------------------------------------
 
     fn set_volume(&mut self, value: i64) {
-        let value = value.clamp(0, 100);
+        let value = value.clamp(0, self.settings.volume_max.max(100));
         self.set_prop("volume", value);
         if value > 0 && self.state.get("mute").map(|v| v.as_bool()).unwrap_or(false) {
             self.set_prop("mute", false);
         }
         self.volume.volume = value;
-        self.osd(format!("Volume: {value}%"));
+        self.osd(format!("{}: {value}%", i18n::tr("Volume")));
     }
 
     fn volume_step(&mut self, direction: i32) {
@@ -1527,16 +1743,30 @@ impl Player {
     fn toggle_mute(&mut self) {
         let muted = !self.get_bool("mute");
         self.set_prop("mute", muted);
-        self.osd(format!("Mute: {}", if muted { "on" } else { "off" }));
+        self.osd(format!(
+            "{}: {}",
+            i18n::tr("Mute"),
+            if muted {
+                i18n::tr("On")
+            } else {
+                i18n::tr("Off")
+            }
+        ));
     }
 
     fn audio_delay(&mut self, delta: Option<f64>) {
         let value = match delta {
             None => 0.0,
-            Some(d) => (self.get_f64("audio-delay") + d).round() * 1000.0 / 1000.0,
+            // Millisecond precision: rounding the sum would swallow the
+            // 0.05s steps entirely while the delay is still near zero.
+            Some(d) => ((self.get_f64("audio-delay") + d) * 1000.0).round() / 1000.0,
         };
         self.set_prop("audio-delay", value);
-        self.osd(format!("Audio sync: {value:+.2} sec"));
+        self.osd(format!(
+            "{}: {value:+.2} {}",
+            i18n::tr("Audio sync"),
+            i18n::tr("sec")
+        ));
     }
 
     fn set_audio_delay(&mut self, value: f64) {
@@ -1546,7 +1776,11 @@ impl Player {
             0.0
         };
         self.set_prop("audio-delay", value);
-        self.osd(format!("Audio sync: {value:+.2} sec"));
+        self.osd(format!(
+            "{}: {value:+.2} {}",
+            i18n::tr("Audio sync"),
+            i18n::tr("sec")
+        ));
     }
 
     fn set_normalize(&mut self, enabled: bool) {
@@ -1564,8 +1798,13 @@ impl Player {
         }
         self.normalize = enabled;
         self.osd(format!(
-            "Normalize volume: {}",
-            if enabled { "on" } else { "off" }
+            "{}: {}",
+            i18n::tr("Normalize volume"),
+            if enabled {
+                i18n::tr("On")
+            } else {
+                i18n::tr("Off")
+            }
         ));
     }
 
@@ -1616,7 +1855,7 @@ impl Player {
                 .and_then(|engine| engine.cmd_sync(&["screenshot-to-file", &path_text, mode]))
                 .is_some();
             if !captured {
-                self.osd_error("Could not capture the current frame", 3000);
+                self.osd_error(i18n::tr("Could not capture the current frame"), 3000);
                 return;
             }
             let result = std::fs::read(&path)
@@ -1625,24 +1864,29 @@ impl Player {
                 .map(|image| image.to_rgba8());
             let _ = std::fs::remove_file(&path);
             let Some(image) = result else {
-                self.osd_error("Could not read the captured frame", 3000);
+                self.osd_error(i18n::tr("Could not read the captured frame"), 3000);
                 return;
             };
             let (width, height) = image.dimensions();
-            let data = arboard::ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: Cow::Owned(image.into_raw()),
-            };
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_image(data)) {
-                Ok(()) => self.osd_ms("Frame copied to clipboard", 2200),
-                Err(error) => self.osd_error(format!("Could not copy frame: {error}"), 3000),
+            match self.services.clipboard_put_image(
+                width as usize,
+                height as usize,
+                image.into_raw(),
+            ) {
+                Ok(()) => self.osd_ms(i18n::tr("Frame copied to clipboard"), 2200),
+                Err(error) => self.osd_error(
+                    format!("{}: {error}", i18n::tr("Could not copy frame")),
+                    3000,
+                ),
             }
             return;
         }
         let folder = self.screenshot_dir();
         if std::fs::create_dir_all(&folder).is_err() {
-            self.osd_error(format!("Cannot create folder: {folder}"), 3500);
+            self.osd_error(
+                format!("{}: {folder}", i18n::tr("Cannot create folder")),
+                3500,
+            );
             return;
         }
         let stem = title_of(self.current_path.as_deref().unwrap_or("frame"));
@@ -1666,48 +1910,26 @@ impl Player {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        self.osd_ms(format!("Saved: {name}"), 2500);
+        self.osd_ms(format!("{}: {name}", i18n::tr("Saved")), 2500);
     }
 
     fn open_screenshot_folder(&mut self) {
         let folder = self.screenshot_dir();
         let _ = std::fs::create_dir_all(&folder);
-        open_folder(&folder);
+        self.services.reveal_path(&folder);
     }
 
     // -- window ----------------------------------------------------------------------------------------
 
-    fn toggle_maximize(&mut self, ctx: &Context) {
-        if self.fullscreen {
-            return;
-        }
-        self.state_changed = self.now;
-        self.maximized = !self.maximized;
-        self.request_window_mode(ctx);
-    }
-
     fn toggle_fullscreen(&mut self, ctx: &Context) {
         self.state_changed = self.now;
+        self.fullscreen = !self.fullscreen;
         if self.fullscreen {
-            self.fullscreen = false;
-            self.fs_top = false;
-            self.fs_bottom = false;
-            self.fs_right = false;
-            self.fs_top_deadline = 0.0;
-            self.fs_bottom_deadline = 0.0;
-            self.maximized = self.was_maximized;
-        } else {
-            self.was_maximized = self.maximized;
-            self.fs_top = false;
-            self.fs_bottom = false;
-            self.fs_right = false;
-            self.fs_top_deadline = 0.0;
-            self.fs_bottom_deadline = 0.0;
-            self.fullscreen = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::SetMonitor(
                 self.settings.fullscreen_monitor,
             ));
         }
+        self.schedule_chrome_hide();
         self.request_window_mode(ctx);
     }
 
@@ -1734,13 +1956,18 @@ impl Player {
             return;
         }
         if self.fullscreen || self.maximized {
-            self.osd("Window size is not available in full screen");
+            self.osd(i18n::tr("Window size is not available in full screen"));
             return;
         }
         let limited = self.fit_window(Some(percent as f64 / 100.0), ctx);
         self.osd(format!(
-            "Window size: {percent}%{}",
-            if limited { " (limited by screen)" } else { "" }
+            "{}: {percent}%{}",
+            i18n::tr("Window size"),
+            if limited {
+                format!(" ({})", i18n::tr("limited by screen"))
+            } else {
+                String::new()
+            }
         ));
     }
 
@@ -1766,7 +1993,8 @@ impl Player {
         let extra_rot = self.get_f64("video-rotate") as i64;
         let rotation = (rotate + extra_rot).rem_euclid(180);
         let (dw, dh) = if rotation == 90 { (dh, dw) } else { (dw, dh) };
-        let extra = self.chrome_extra();
+        // Floating chrome overlays the video, so it consumes no layout space.
+        let extra = Vec2::ZERO;
         let (screen_w, screen_h) = screen_size(ctx);
         let mut limited = false;
         let (w, h, factor) = match scale {
@@ -1804,38 +2032,22 @@ impl Player {
 
     fn toggle_autofit(&mut self) {
         self.settings.autofit = !self.settings.autofit;
+        self.save_settings();
     }
 
     fn toggle_playlist(&mut self, ctx: &Context) {
-        if self.fullscreen {
-            self.fs_pin = !self.fs_pin;
-            self.update_sub_margin();
-            ctx.request_repaint();
-            return;
-        }
-        // Use the width egui actually allocated to the panel when closing.  The
-        // layout clamps an oversized playlist to preserve the minimum player
-        // width, so subtracting the configured width could leave the window
-        // offset from the geometry it had before the panel was opened.
-        let allocated_playlist_width = self
-            .layout(ctx.content_rect())
-            .playlist
-            .map(|rect| rect.width());
         self.playlist_visible = !self.playlist_visible;
-        self.settings.playlist_visible = self.playlist_visible;
-        let delta = playlist_resize_delta(
-            allocated_playlist_width,
-            self.settings.playlist_width as f32,
-        );
-        if !self.maximized {
-            let (w, h) = window_size(ctx);
-            let new_w = w + if self.playlist_visible { delta } else { -delta };
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(new_w.max(320.0), h)));
+        // A hidden drawer can no longer own the keyboard: release list focus so the
+        // navigation keys fall back to the player keymap instead of vanishing.
+        if !self.playlist_visible {
+            self.playlist.has_focus = false;
+        } else {
+            // Opening the drawer brings the playing row into view.
+            self.playlist.reveal_current();
         }
+        self.settings.playlist_visible = self.playlist_visible;
+        self.schedule_chrome_hide();
         self.update_sub_margin();
-        // Viewport commands are applied after the current frame.  Ensure egui
-        // renders a frame with the new visibility state immediately instead of
-        // relying on the regular playback repaint timer.
         ctx.request_repaint();
     }
 
@@ -1843,10 +2055,11 @@ impl Player {
         self.settings.on_top = mode.to_string();
         self.on_top = mode != "never";
         self.osd(match mode {
-            "never" => "On top: never",
-            "always" => "On top: always",
-            _ => "On top: while playing",
+            "never" => i18n::tr("On top: never"),
+            "always" => i18n::tr("On top: always"),
+            _ => i18n::tr("On top: while playing"),
         });
+        self.save_settings();
     }
 
     fn cycle_on_top(&mut self) {
@@ -1870,6 +2083,7 @@ impl Player {
     fn toggle_remaining(&mut self) {
         self.show_remaining = !self.show_remaining;
         self.settings.show_remaining = self.show_remaining;
+        self.save_settings();
     }
 
     fn toggle_info(&mut self) {
@@ -1884,14 +2098,15 @@ impl Player {
     fn info_text(&mut self, brief: bool) -> String {
         let engine = match &self.engine {
             Some(engine) => engine,
-            None => return "No file is open.".into(),
+            None => return format!("{}\n", i18n::tr("No file is open.")),
         };
         if !self.has_file() {
-            return "No file is open.".into();
+            return format!("{}\n", i18n::tr("No file is open."));
         }
         let path = self.current_path.clone().unwrap_or_default();
         let mut lines = vec![format!(
-            "File      {}",
+            "{:<9}{}",
+            i18n::tr("File"),
             if brief { title_of(&path) } else { path.clone() }
         )];
         let details: Vec<String> = [
@@ -1930,23 +2145,24 @@ impl Player {
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| "no".into());
             lines.push(format!(
-                "Video     {}  {}x{}  {:.3} fps  {}  {}",
+                "{:<9}{}  {}x{}  {:.3} fps  {}  {}",
+                i18n::tr("Video"),
                 video.get("codec").as_str().unwrap_or("").to_uppercase(),
                 params.get("w").as_f64().unwrap_or(0.0) as i64,
                 params.get("h").as_f64().unwrap_or(0.0) as i64,
                 fps,
                 params.get("pixelformat").as_str().unwrap_or(""),
                 if hw != "no" {
-                    format!("hardware ({hw})")
+                    format!("{} ({hw})", i18n::tr("hardware"))
                 } else {
-                    "software".into()
+                    i18n::tr("software").to_string()
                 },
             ));
             let bitrate = engine.get("video-bitrate").and_then(|v| v.as_f64());
-            if let Some(bitrate) = bitrate {
-                if !brief {
-                    lines.push(format!("          {:.0} kb/s", bitrate / 1000.0));
-                }
+            if let Some(bitrate) = bitrate
+                && !brief
+            {
+                lines.push(format!("          {:.0} kb/s", bitrate / 1000.0));
             }
         }
         let audio = tracks
@@ -1960,7 +2176,8 @@ impl Player {
                 .unwrap_or(lang.as_str())
                 .to_string();
             lines.push(format!(
-                "Audio     {}  {} Hz  {} ch  {}",
+                "{:<9}{}  {} Hz  {} ch  {}",
+                i18n::tr("Audio"),
                 audio.get("codec").as_str().unwrap_or("").to_uppercase(),
                 ap.as_ref()
                     .map(|a| a.get("samplerate").as_f64().unwrap_or(0.0) as i64)
@@ -1976,23 +2193,28 @@ impl Player {
             .find(|t| t.get("type").as_str() == Some("sub") && t.get("selected").as_bool());
         if let Some(sub) = sub {
             lines.push(format!(
-                "Subtitle  {}  sync {:+.1} sec",
+                "{:<9}{}  {} {:+.1} {}",
+                i18n::tr("Subtitle"),
                 skin::track_label(sub).replace("&&", "&"),
+                i18n::tr("Subtitle sync"),
                 engine.get_f64("sub-delay"),
+                i18n::tr("sec"),
             ));
         }
         lines.push(format!(
-            "Playback  {} / {}  {:.2}x  A/V {:+.3}  dropped {}",
+            "{:<9}{} / {}  {:.2}x  A/V {:+.3}  {} {}",
+            i18n::tr("Playback"),
             fmt_time(self.position()),
             fmt_time(self.duration()),
             engine.get_f64("speed"),
             engine.get_f64("avsync"),
+            i18n::tr("dropped"),
             (engine.get_f64("frame-drop-count") + engine.get_f64("decoder-frame-drop-count"))
                 as i64,
         ));
         if !brief {
             lines.push(String::new());
-            lines.push("Tracks".into());
+            lines.push(i18n::tr("Tracks").into());
             for track in &tracks {
                 lines.push(format!(
                     "  {:<6} {}{}",
@@ -2009,7 +2231,7 @@ impl Player {
                 let arr = chapters.as_array();
                 if !arr.is_empty() {
                     lines.push(String::new());
-                    lines.push("Chapters".into());
+                    lines.push(i18n::tr("Chapters").into());
                     for (i, chapter) in arr.iter().enumerate() {
                         lines.push(format!(
                             "  {:>2}. {}  {}",
@@ -2021,7 +2243,7 @@ impl Player {
                 }
             }
             lines.push(String::new());
-            lines.push("System".into());
+            lines.push(i18n::tr("System").into());
             let mpv_version = engine
                 .get("mpv-version")
                 .and_then(|v| v.as_str().map(str::to_string))
@@ -2035,7 +2257,7 @@ impl Player {
             let logs = engine.log_lines();
             if !logs.is_empty() {
                 lines.push(String::new());
-                lines.push("Recent engine messages".into());
+                lines.push(i18n::tr("Recent engine messages").into());
                 let start = logs.len().saturating_sub(15);
                 for line in &logs[start..] {
                     lines.push(format!("  {line}"));
@@ -2043,6 +2265,16 @@ impl Player {
             }
         }
         lines.join("\n")
+    }
+
+    /// Re-apply the appearance globals (theme, accent, language) after preferences change.
+    fn apply_appearance(&mut self, ctx: &Context) {
+        skin::set_theme(Theme::from_str(&self.settings.theme));
+        skin::set_accent(Accent::from_str(&self.settings.accent));
+        i18n::set_lang(Lang::from_str(&self.settings.language));
+        skin::apply(ctx);
+        skin::apply_fonts(ctx, i18n::rtl());
+        ctx.request_repaint();
     }
 
     fn apply_settings(&mut self, hwdec_changed: bool) {
@@ -2082,7 +2314,11 @@ impl Player {
             "target-prim",
             if s.hdr_tone_mapping { "bt.709" } else { "auto" },
         );
-        self.set_prop("target-peak", if s.hdr_tone_mapping { 203.0 } else { 0.0 });
+        // mpv rejects a numeric 0 peak; "auto" is its off value.
+        self.set_prop(
+            "target-peak",
+            if s.hdr_tone_mapping { "203" } else { "auto" },
+        );
         self.set_prop(
             "tone-mapping",
             if s.hdr_tone_mapping {
@@ -2092,13 +2328,402 @@ impl Player {
             },
         );
         self.set_prop("hdr-compute-peak", s.hdr_tone_mapping);
+
+        // -- engine-backed feature settings ---------------------------------------------------
+        self.set_prop("volume-max", s.volume_max);
+        if s.volume_max >= 100 {
+            self.volume.max = s.volume_max;
+        }
+        self.set_prop(
+            "loop-file",
+            match s.loop_mode.as_str() {
+                "file" => "inf",
+                _ => "no",
+            },
+        );
+        self.set_prop(
+            "loop-playlist",
+            match s.loop_mode.as_str() {
+                "playlist" => "inf",
+                _ => "no",
+            },
+        );
+        self.set_prop("audio-pitch-correction", s.audio_pitch_correction);
+        self.set_prop("audio-channels", s.audio_channels.as_str());
+        self.set_prop(
+            "video-sync",
+            Engine::video_sync_value(s.video_sync.as_str()),
+        );
+        self.set_prop("interpolation", s.interpolation);
+        if s.interpolation {
+            self.set_prop("tscale", "oversample");
+        }
+        self.set_prop("scale", s.scale_profile.as_str());
+        self.set_prop("ytdl-format", Engine::ytdl_format(&s.ytdl_quality));
+        // Subtitle styling.
+        self.set_prop("sub-color", format!("#FF{}", &s.sub_color[1..]));
+        self.set_prop("sub-border-size", s.sub_border_size);
+        self.set_prop(
+            "sub-border-color",
+            format!("#FF{}", &s.sub_border_color[1..]),
+        );
+        self.set_prop("sub-shadow-offset", s.sub_shadow_offset);
+        let back = if s.sub_back_enable {
+            format!("#C8{}", &s.sub_back_color[1..])
+        } else {
+            "#00000000".to_string()
+        };
+        self.set_prop("sub-back-color", back);
+    }
+
+    // -- new feature helpers -----------------------------------------------------------------
+
+    /// mpv loop options from the "none" | "file" | "playlist" setting.
+    fn set_loop_mode(&mut self, mode: &str) {
+        self.settings.loop_mode = mode.to_string();
+        match mode {
+            "file" => {
+                self.set_prop("loop-file", "inf");
+                self.set_prop("loop-playlist", "no");
+            }
+            "playlist" => {
+                self.set_prop("loop-file", "no");
+                self.set_prop("loop-playlist", "inf");
+            }
+            _ => {
+                self.set_prop("loop-file", "no");
+                self.set_prop("loop-playlist", "no");
+            }
+        }
+        self.save_settings();
+        self.osd(match mode {
+            "file" => i18n::tr("Loop: current file"),
+            "playlist" => i18n::tr("Loop: playlist"),
+            _ => i18n::tr("Loop: off"),
+        });
+    }
+
+    /// 0 = off, -1 = after playlist, otherwise minutes.
+    fn set_sleep_timer(&mut self, minutes: i32) {
+        match minutes {
+            0 => {
+                self.sleep_deadline = None;
+                self.sleep_after_playlist = false;
+                self.osd(i18n::tr("Sleep timer off"));
+            }
+            -1 => {
+                self.sleep_deadline = None;
+                self.sleep_after_playlist = true;
+                self.osd(i18n::tr("Sleep after playlist"));
+            }
+            mins => {
+                self.sleep_after_playlist = false;
+                self.sleep_deadline = Some(self.now + f64::from(mins) * 60.0);
+                self.osd(format!(
+                    "{}: {mins} {}",
+                    i18n::tr("Sleep timer"),
+                    i18n::tr("min")
+                ));
+            }
+        }
+    }
+
+    fn sleep_timer_tick(&mut self) {
+        if let Some(deadline) = self.sleep_deadline
+            && self.now >= deadline
+        {
+            self.sleep_deadline = None;
+            if self.has_file() {
+                self.set_prop("pause", true);
+            }
+            self.osd_ms(i18n::tr("Paused by the sleep timer"), 3500);
+        }
+    }
+
+    /// Toggle one of the preset lavfi video filters.
+    fn set_video_filter(&mut self, filter: &'static str, on: bool) {
+        let spec = match filter {
+            "deband" => "@fpdeband:lavfi=[gradfun=1.2]",
+            "denoise" => "@fpdenoise:lavfi=[hqdn3d=1.5:1.5:6:6]",
+            _ => "@fpsharpen:lavfi=[unsharp=5:5:0.8]",
+        };
+        let name = match filter {
+            "deband" => "@fpdeband",
+            "denoise" => "@fpdenoise",
+            _ => "@fpsharpen",
+        };
+        if on {
+            self.cmd(&["vf", "add", spec]);
+        } else {
+            self.cmd(&["vf", "remove", name]);
+        }
+        match filter {
+            "deband" => self.video_filters.0 = on,
+            "denoise" => self.video_filters.1 = on,
+            _ => self.video_filters.2 = on,
+        }
+        self.osd(format!(
+            "{}: {}",
+            match filter {
+                "deband" => i18n::tr("Deband"),
+                "denoise" => i18n::tr("Denoise"),
+                _ => i18n::tr("Sharpen"),
+            },
+            if on { i18n::tr("On") } else { i18n::tr("Off") }
+        ));
+    }
+
+    /// Install/remove the lavfi audio visualizer (a synthesized video track).
+    fn set_visualizer(&mut self, mode: &str) {
+        let spec = match mode {
+            "wave" => "@fpviz:lavfi=[showwaves=s=854x480:rate=30:mode=cline]",
+            "spectrum" => "@fpviz:lavfi=[showspectrum=s=854x480:mode=combined:slide=scroll]",
+            _ => "",
+        };
+        if self.viz_active {
+            self.cmd(&["af", "remove", "@fpviz"]);
+            self.viz_active = false;
+        }
+        if !spec.is_empty() {
+            self.cmd(&["af", "add", spec]);
+            self.viz_active = true;
+        }
+        self.settings.visualizer = mode.to_string();
+        self.save_settings();
+        self.osd(format!(
+            "{}: {}",
+            i18n::tr("Audio Visualizer"),
+            match mode {
+                "wave" => i18n::tr("Wave"),
+                "spectrum" => i18n::tr("Spectrum"),
+                _ => i18n::tr("Off"),
+            }
+        ));
+    }
+
+    /// Borderless, always-on-top small window (PiP-style mini player).
+    fn toggle_mini_player(&mut self, ctx: &Context) {
+        self.mini_player = !self.mini_player;
+        if self.mini_player {
+            let size = ctx.content_rect().size();
+            self.mini_prev_size = Some(size);
+            if self.playlist_visible {
+                self.toggle_playlist(ctx);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(480.0, 300.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            self.applied_on_top = Some(true);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            if let Some(size) = self.mini_prev_size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            // Re-sync the level with the on-top preference.
+            self.applied_on_top = None;
+        }
+        self.schedule_chrome_hide();
+        ctx.request_repaint();
+    }
+
+    /// Open a DVD (VIDEO_TS) or Blu-ray (BDMV) folder through mpv's disc support.
+    fn open_disc_dialog(&mut self) {
+        let Some(folder) = self.services.pick_folder(&self.settings.last_dir) else {
+            return;
+        };
+        let is_dvd = Path::new(&folder).join("VIDEO_TS").is_dir();
+        let is_bd = Path::new(&folder).join("BDMV").is_dir();
+        if !is_dvd && !is_bd {
+            self.osd_error(i18n::tr("Not a disc folder (VIDEO_TS / BDMV)"), 3500);
+            return;
+        }
+        let (url, options) = if is_dvd {
+            ("dvd://".to_string(), format!("dvd-device={folder}"))
+        } else {
+            ("bluray://".to_string(), format!("bluray-device={folder}"))
+        };
+        self.settings.last_dir = folder;
+        // Disc titles are not regular files; hand them straight to mpv.
+        self.current_path = Some(url.clone());
+        self.playlist.set_items(std::slice::from_ref(&url));
+        self.playlist.set_current(Some(0));
+        self.file_ready = false;
+        self.last_pos = 0.0;
+        self.autofit_pending = false;
+        self.file_is_audio_only = false;
+        self.seek.reset();
+        self.set_prop("pause", false);
+        if let Some(engine) = self.engine() {
+            engine.load_with_options(&url, None, &options);
+        }
+        self.update_title();
+    }
+
+    /// Save the current playlist as an extended .m3u8 file.
+    fn export_playlist(&mut self) {
+        if self.playlist.count() == 0 {
+            return;
+        }
+        let Some(path) = self.services.pick_save_file("playlist.m3u8") else {
+            return;
+        };
+        let items: Vec<(String, String, Option<f64>)> = self
+            .playlist
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.title.clone(), item.duration))
+            .collect();
+        match write_m3u(&path, &items) {
+            Ok(_) => {
+                self.osd(format!("{}: {path}", i18n::tr("Playlist exported")));
+            }
+            Err(error) => {
+                self.osd_error(
+                    format!("{}: {error}", i18n::tr("Could not export playlist")),
+                    3500,
+                );
+            }
+        }
+    }
+
+    /// Trackpad pinch → fullscreen; two-finger horizontal scroll over the video → seek.
+    fn handle_gestures(&mut self, ctx: &Context, video: Rect) {
+        let over_video = ctx
+            .pointer_hover_pos()
+            .is_some_and(|pos| video.contains(pos));
+
+        // Pinch-to-fullscreen reads only `Zoom` events (trackpad pinch). The
+        // ctrl+scroll wheel path below means video zoom instead — `zoom_delta()`
+        // would conflate the two. Per-frame scale deltas accumulate into
+        // `pinch_scale` for the whole gesture; crossing a threshold toggles once,
+        // and the gesture resets after a short quiet period.
+        let mut magnify = 0.0f32;
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Zoom(delta) = event {
+                    magnify += *delta;
+                }
+            }
+        });
+        if over_video && magnify != 0.0 {
+            self.pinch_scale = (self.pinch_scale * (1.0 + magnify)).clamp(0.2, 5.0);
+            self.pinch_last_at = self.now;
+            if !self.pinch_latched && !(0.78..=1.28).contains(&self.pinch_scale) {
+                self.pinch_latched = true;
+                self.pending.push(Action::ToggleFullscreen);
+            }
+        } else if self.now - self.pinch_last_at > 0.3 {
+            // Gesture ended: re-arm and recenter the accumulated scale.
+            self.pinch_latched = false;
+            self.pinch_scale = 1.0;
+        }
+
+        if !over_video {
+            return;
+        }
+        // Wheel handling over the video: two-finger scroll seeks, ctrl/cmd+scroll
+        // zooms the video itself (browser convention), plain wheels just seek.
+        let mut steps = 0i32;
+        let mut zoom_steps = 0i32;
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    let (x, y) = match unit {
+                        egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                            (delta.x, delta.y)
+                        }
+                        egui::MouseWheelUnit::Point => (delta.x / 10.0, delta.y / 10.0),
+                    };
+                    if modifiers.ctrl || modifiers.command {
+                        self.zoom_scroll_acc += y;
+                    } else if !modifiers.alt {
+                        self.video_scroll_acc += x;
+                    }
+                    while self.video_scroll_acc >= 1.0 {
+                        steps += 1;
+                        self.video_scroll_acc -= 1.0;
+                    }
+                    while self.video_scroll_acc <= -1.0 {
+                        steps -= 1;
+                        self.video_scroll_acc += 1.0;
+                    }
+                    while self.zoom_scroll_acc >= 1.0 {
+                        zoom_steps += 1;
+                        self.zoom_scroll_acc -= 1.0;
+                    }
+                    while self.zoom_scroll_acc <= -1.0 {
+                        zoom_steps -= 1;
+                        self.zoom_scroll_acc += 1.0;
+                    }
+                }
+            }
+        });
+        if steps != 0 {
+            let amount = steps as f64 * self.settings.seek_small;
+            self.pending.push(Action::SeekRel(amount));
+        }
+        if zoom_steps != 0 {
+            self.pending.push(Action::Zoom(zoom_steps as f64 * 0.1));
+        }
     }
 
     fn quit(&mut self) {
+        if self.closing {
+            return;
+        }
         self.closing = true;
         self.remember_position();
         self.settings.first_run = false;
-        self.settings.save();
+        self.save_settings();
+    }
+
+    fn request_close(&mut self, ctx: &Context) {
+        if self.closing {
+            return;
+        }
+        self.quit();
+        if self.has_file() {
+            self.cmd(&["stop"]);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn apply_resume_choice(&mut self, choice: ResumeChoice) {
+        let Some(position) = self.resumed_at.take() else {
+            return;
+        };
+        match choice {
+            ResumeChoice::Resume => {
+                self.last_pos = position;
+                self.seek.position = position;
+                self.cmd(&["seek", &format!("{position:.3}"), "absolute"]);
+                self.set_prop("pause", false);
+                self.osd(format!(
+                    "{}: {}",
+                    i18n::tr("Resumed at"),
+                    fmt_time(position)
+                ));
+            }
+            ResumeChoice::StartOver => {
+                self.last_pos = 0.0;
+                self.seek.position = 0.0;
+                if let Some(path) = &self.current_path {
+                    self.settings.set_position(path, None);
+                }
+                self.save_settings();
+                self.cmd(&["seek", "0", "absolute"]);
+                self.set_prop("pause", false);
+                self.osd(i18n::tr("Started from the beginning"));
+            }
+        }
     }
 
     // -- dialogs ---------------------------------------------------------------------------------------
@@ -2111,16 +2736,11 @@ impl Player {
         } else {
             self.settings.last_dir.clone()
         };
-        if let Some(files) = rfd::FileDialog::new()
-            .set_directory(&start)
-            .add_filter("Media files", &media_extensions())
-            .pick_files()
-        {
-            let paths: Vec<String> = files
-                .into_iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            self.pending.open_paths(paths, append);
+        let files = self
+            .services
+            .pick_files(i18n::tr("Media files"), &media_extensions(), &start);
+        if !files.is_empty() {
+            self.pending.open_paths(files, append);
         }
     }
 
@@ -2132,15 +2752,14 @@ impl Player {
         } else {
             self.settings.last_dir.clone()
         };
-        if let Some(folder) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-            self.pending
-                .open_paths(vec![folder.to_string_lossy().to_string()], append);
+        if let Some(folder) = self.services.pick_folder(&start) {
+            self.pending.open_paths(vec![folder], append);
         }
     }
 
     fn load_subtitle_dialog(&mut self) {
         if !self.has_file() {
-            self.osd("Open a video first");
+            self.osd(i18n::tr("Open a video first"));
             return;
         }
         let mut start = if self.settings.last_sub_dir.is_empty() {
@@ -2148,24 +2767,19 @@ impl Player {
         } else {
             self.settings.last_sub_dir.clone()
         };
-        if let Some(path) = &self.current_path {
-            if !is_url(path) {
-                start = Path::new(path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-            }
-        }
-        if let Some(files) = rfd::FileDialog::new()
-            .set_directory(&start)
-            .add_filter("Subtitle files", &sub_extensions())
-            .pick_files()
+        if let Some(path) = &self.current_path
+            && !is_url(path)
         {
-            let paths: Vec<String> = files
-                .into_iter()
+            start = Path::new(path)
+                .parent()
                 .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            self.add_subtitles(&paths);
+                .unwrap_or_default();
+        }
+        let files = self
+            .services
+            .pick_files(i18n::tr("Subtitle files"), &sub_extensions(), &start);
+        if !files.is_empty() {
+            self.add_subtitles(&files);
         }
     }
 
@@ -2183,26 +2797,42 @@ impl Player {
                     .map(|d| d.to_string_lossy().to_string())
             })
             .unwrap_or_default();
-        if let Some(path) = rfd::FileDialog::new().set_directory(&start).pick_file() {
-            let path = path.to_string_lossy().to_string();
+        if let Some(path) =
+            self.services
+                .pick_file(i18n::tr("Audio files"), &media_extensions(), &start)
+        {
             self.cmd(&["audio-add", &path, "select"]);
             let title = title_of(&path);
-            self.osd_ms(format!("Audio: {title}"), 2500);
+            self.osd_ms(format!("{}: {title}", i18n::tr("Audio")), 2500);
         }
     }
 
     // -- action dispatch -------------------------------------------------------------------------------
 
     fn dispatch(&mut self, action: Action, ctx: &Context) {
+        let context = menus::CommandContext {
+            has_file: self.has_file(),
+            playlist_count: self.playlist.count(),
+            can_undo_playlist: self.playlist.can_undo(),
+            can_redo_playlist: self.playlist.can_redo(),
+        };
+        if let Some(spec) = menus::command_spec(menus::action_id(&action)) {
+            if !spec.enabled(context) {
+                return;
+            }
+            if spec.mutation {
+                self.state_changed = self.now;
+            }
+        }
         match action {
             Action::OpenFiles { append } => self.open_files_dialog(append),
             Action::OpenFolder { append } => self.open_folder_dialog(append),
-            Action::OpenUrl => self.url_dialog.open = true,
+            Action::OpenUrl => self.url_dialog.open(),
             Action::OpenClipboard => self.open_clipboard(),
             Action::OpenRecent(path) => self.pending.open_paths(vec![path], false),
             Action::ClearRecent => {
                 self.settings.recent.clear();
-                self.settings.save();
+                self.save_settings();
             }
             Action::PlayRow(row) => self.play_row(row, true),
             Action::Stop => self.stop(true),
@@ -2240,7 +2870,7 @@ impl Player {
             Action::AddBookmark => self.add_bookmark(),
             Action::RemoveBookmark { path, time } => {
                 if self.settings.remove_bookmark(&path, time) {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             Action::SeekBookmark { path, time } => self.seek_bookmark(&path, time),
@@ -2299,10 +2929,15 @@ impl Player {
                 self.settings.eq = gains;
                 self.settings.eq_enabled = enabled;
                 self.apply_eq();
+                // Persist immediately instead of waiting for the 10s autosave.
+                self.save_settings();
             }
-            Action::SetKeepAspect(keep) => self.set_prop("keepaspect", keep),
             Action::SetSubPos(value) => {
                 self.set_prop("sub-pos", value);
+                // mpv clamps sub-pos to 0..=100; keep the stored setting in
+                // range so it never disagrees with what is actually playing.
+                self.settings.sub_pos = value.round().clamp(0.0, 100.0) as i64;
+                self.save_settings();
             }
             Action::PlayUrl { url, loop_s } => {
                 if loop_s > 0 {
@@ -2334,15 +2969,31 @@ impl Player {
                 self.playlist.sort_by(key);
                 self.update_title();
             }
+            Action::UndoPlaylist => {
+                if self.playlist.undo() {
+                    self.sync_playlist_settings();
+                    self.update_title();
+                    self.save_settings();
+                    self.osd(i18n::tr("Playlist change undone"));
+                }
+            }
+            Action::RedoPlaylist => {
+                if self.playlist.redo() {
+                    self.sync_playlist_settings();
+                    self.update_title();
+                    self.save_settings();
+                    self.osd(i18n::tr("Playlist change redone"));
+                }
+            }
             Action::PlaylistCopyPath(row) => {
                 if let Some(path) = self.playlist.path(row) {
                     ctx.copy_text(path.to_string());
-                    self.osd("Path copied to the clipboard");
+                    self.osd(i18n::tr("Path copied to the clipboard"));
                 }
             }
             Action::PlaylistShowInFolder(row) => {
                 if let Some(path) = self.playlist.path(row) {
-                    open_folder(path);
+                    self.services.reveal_path(path);
                 }
             }
 
@@ -2359,12 +3010,7 @@ impl Player {
                     self.toggle_fullscreen(ctx);
                 }
             }
-            Action::ToggleMaximize => self.toggle_maximize(ctx),
-            Action::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-            Action::Close => {
-                self.closing = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            Action::Close => self.request_close(ctx),
             Action::TogglePlaylist => self.toggle_playlist(ctx),
 
             Action::ShowPreferences(tab) => {
@@ -2373,8 +3019,9 @@ impl Player {
                     self.prefs.select_tab(tab);
                 }
             }
+            Action::ShowCommandPalette => self.palette.open(),
             Action::ShowControlPanel(tab) => {
-                self.panel.open = true;
+                self.panel.open_panel();
                 if let Some(tab) = tab {
                     self.panel.select_tab(tab);
                 }
@@ -2387,7 +3034,7 @@ impl Player {
             Action::ShowMediaInfo => {
                 let text = self.info_text(false);
                 self.text_dialog
-                    .set("Playback/System Info", &text, true, false);
+                    .set(i18n::tr("Playback/System Info..."), &text, true, false);
             }
             Action::ShowAbout => {
                 let e = self.engine();
@@ -2400,9 +3047,18 @@ impl Player {
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_else(|| "?".into());
                 let text = format!(
-                    "MacPlayer\n\nA native media player built on libmpv and egui.\n\nmpv:     {mpv}\nffmpeg:  {ffmpeg}\n\nRight-click the video for the full menu.\nSettings: ~/Library/Application Support/MacPlayer/settings.json"
+                    "{}\n\n{}\n\n{}\n  mpv     {mpv}\n  ffmpeg  {ffmpeg}\n\n{}\n  {}\n  {}\n  {}",
+                    env!("CARGO_PKG_VERSION"),
+                    i18n::tr(
+                        "A fast, native media player for macOS — built with Rust, egui and libmpv."
+                    ),
+                    i18n::tr("Engine"),
+                    i18n::tr("Tips"),
+                    i18n::tr("Right-click the video for the full menu."),
+                    i18n::tr("Press ⌘K for the command palette."),
+                    i18n::tr("Settings: ~/Library/Application Support/MacPlayer/settings.json")
                 );
-                self.text_dialog.set("About", &text, false, false);
+                self.text_dialog.set(i18n::tr("About"), &text, false, false);
             }
             Action::ShowTrackMenu(kind) => {
                 if self.has_file() {
@@ -2414,24 +3070,80 @@ impl Player {
                     self.menu.open_at(pos);
                 }
             }
-            Action::ShowMainMenu => {
-                let pos = ctx.input(|i| i.pointer.hover_pos()).unwrap_or_else(|| {
-                    let size = ctx.content_rect().size();
-                    pos2(size.x / 2.0, size.y / 2.0)
-                });
-                self.menu.open_at(pos);
-                self.track_menu_kind = None;
+            Action::OpenDisc => self.open_disc_dialog(),
+            Action::SetYtdlQuality(quality) => {
+                self.settings.ytdl_quality = quality.to_string();
+                let format = Engine::ytdl_format(quality);
+                self.set_prop("ytdl-format", format);
+                self.save_settings();
+                self.osd(format!("{}: {quality}", i18n::tr("Online Stream Quality")));
             }
+            Action::SetLoopMode(mode) => self.set_loop_mode(&mode),
+            Action::SetSleepTimer(minutes) => self.set_sleep_timer(minutes),
+            Action::SetVideoSync(mode) => {
+                self.settings.video_sync = mode.clone();
+                self.set_prop("video-sync", Engine::video_sync_value(&mode));
+                self.save_settings();
+                self.osd(format!("{}: {mode}", i18n::tr("Motion & Sync")));
+            }
+            Action::SetInterpolation(on) => {
+                self.settings.interpolation = on;
+                self.set_prop("interpolation", on);
+                if on {
+                    self.set_prop("tscale", "oversample");
+                }
+                self.save_settings();
+                self.osd(format!(
+                    "{}: {}",
+                    i18n::tr("Frame Interpolation"),
+                    if on { i18n::tr("On") } else { i18n::tr("Off") }
+                ));
+            }
+            Action::SetScaleProfile(profile) => {
+                self.settings.scale_profile = profile.to_string();
+                self.set_prop("scale", profile);
+                self.save_settings();
+                self.osd(format!("{}: {profile}", i18n::tr("Image Scaling")));
+            }
+            Action::SetVideoFilter { filter, on } => self.set_video_filter(filter, on),
+            Action::SetVisualizer(mode) => self.set_visualizer(mode),
+            Action::ToggleMiniPlayer => self.toggle_mini_player(ctx),
+            Action::ShowHistory => self.history_dialog.open = true,
+            Action::ClearHistory => {
+                self.settings.clear_history();
+                self.save_settings();
+            }
+            Action::PlayHistory(path) => {
+                self.pending.open_paths(vec![path], false);
+            }
+            Action::ExportPlaylist => self.export_playlist(),
             Action::ApplySettings { hwdec_changed } => {
                 if let Some((settings, changed)) = self.prefs.result.take() {
                     self.settings = settings;
+                    self.apply_appearance(ctx);
                     self.apply_settings(changed || hwdec_changed);
-                    self.settings.save();
+                    self.save_settings();
                 }
+                // Audio device options (passthrough/exclusive) and cache sizing
+                // only take effect on a fresh engine; say so instead of failing
+                // silently.
+                self.osd_ms(
+                    i18n::tr("Some audio and cache options apply after restart"),
+                    2600,
+                );
+            }
+            Action::SetThemeLive(theme) => {
+                self.settings.theme = theme;
+                self.apply_appearance(ctx);
+                self.save_settings();
+            }
+            Action::SetLanguageLive(language) => {
+                self.settings.language = language;
+                self.apply_appearance(ctx);
+                self.save_settings();
             }
             Action::Quit => {
-                self.quit();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.request_close(ctx);
             }
         }
     }
@@ -2455,7 +3167,6 @@ impl Player {
         let action = match key {
             K::Space => (Action::TogglePause, false),
             K::Enter | K::F11 => (Action::ToggleFullscreen, false),
-            K::Escape => (Action::ExitFullscreen, false),
             K::ArrowLeft if ctrl && alt => (Action::SeekRel(-seek_huge), true),
             K::ArrowRight if ctrl && alt => (Action::SeekRel(seek_huge), true),
             K::ArrowLeft if shift => (Action::SeekRel(-seek_large), true),
@@ -2486,6 +3197,7 @@ impl Player {
             K::OpenBracket => (Action::AbSet('a'), false),
             K::CloseBracket => (Action::AbSet('b'), false),
             K::Backslash => (Action::AbClear, false),
+            K::Comma if ctrl => (Action::ShowPreferences(None), false),
             K::Comma if shift => (Action::AudioDelay(Some(-0.05)), true),
             K::Period if shift => (Action::AudioDelay(Some(0.05)), true),
             K::Slash if shift => (Action::AudioDelay(None), false),
@@ -2499,6 +3211,8 @@ impl Player {
             K::A if shift => (Action::CycleTrack(TrackKind::Audio), false),
             K::A => (Action::ShowTrackMenu(TrackKind::Audio), false),
             K::O if alt => (Action::LoadSubtitleDialog, false),
+            K::K if ctrl => (Action::ShowCommandPalette, false),
+            K::P if ctrl => (Action::TogglePlaylist, false),
             K::O if ctrl => (Action::OpenFiles { append: false }, false),
             K::F3 => (Action::OpenFiles { append: false }, false),
             K::F2 => (Action::OpenFolder { append: false }, false),
@@ -2508,7 +3222,7 @@ impl Player {
             K::F4 => (Action::Stop, false),
             K::F5 => (Action::ShowPreferences(None), false),
             K::F6 => (Action::TogglePlaylist, false),
-            K::F7 => (Action::ShowControlPanel(None), false),
+            K::F7 if alt => (Action::ShowControlPanel(None), false),
             K::F1 if ctrl => (Action::ShowMediaInfo, false),
             K::F1 => (Action::ShowAbout, false),
             K::Tab => (Action::ToggleInfo, false),
@@ -2517,10 +3231,19 @@ impl Player {
             K::C if ctrl && alt => (Action::Screenshot("subtitles", true), false),
             K::C if ctrl => (Action::Screenshot("video", true), false),
             K::T if ctrl => (Action::CycleOnTop, false),
-            K::Num1 if none => (Action::SetWindowScale(50), false),
-            K::Num2 if none => (Action::SetWindowScale(100), false),
-            K::Num3 if none => (Action::SetWindowScale(150), false),
-            K::Num4 if none => (Action::SetWindowScale(200), false),
+            // Window scale moved to Alt+digits so the bare digits stay free for the
+            // pan & scan grid, matching the shortcut labels the menus advertise.
+            K::Num1 if alt => (Action::SetWindowScale(50), false),
+            K::Num2 if alt => (Action::SetWindowScale(100), false),
+            K::Num3 if alt => (Action::SetWindowScale(150), false),
+            K::Num4 if alt => (Action::SetWindowScale(200), false),
+            K::Num9 if none => (Action::Zoom(0.1), true),
+            K::Num1 if none => (Action::Zoom(-0.1), true),
+            K::Num4 if none => (Action::Pan(-0.02, 0.0), true),
+            K::Num6 if none => (Action::Pan(0.02, 0.0), true),
+            K::Num8 if none => (Action::Pan(0.0, -0.02), true),
+            K::Num2 if none => (Action::Pan(0.0, 0.02), true),
+            K::Num5 if none => (Action::ResetGeometry, false),
             K::W if ctrl => (Action::Close, false),
             K::W if none => (Action::ImageAdjust("brightness", -1), true),
             K::E if none => (Action::ImageAdjust("brightness", 1), true),
@@ -2532,9 +3255,16 @@ impl Player {
             K::O if none => (Action::ImageAdjust("hue", 1), true),
             K::Q if none => (Action::ImageReset, false),
             K::K if alt => (Action::Rotate(None), false),
+            K::Z if ctrl && alt && shift => (Action::RedoPlaylist, false),
+            K::Z if ctrl && alt => (Action::UndoPlaylist, false),
             K::Z if ctrl => (Action::ToggleFlip("hflip"), false),
             K::V if ctrl => (Action::ToggleFlip("vflip"), false),
             K::Q if ctrl => (Action::Quit, false),
+            // Hardware media keys arrive as F7/F8/F9 when "Use F1-F12 as
+            // standard function keys" is enabled (or with fn held).
+            K::F7 => (Action::PrevFile, false),
+            K::F8 => (Action::TogglePause, false),
+            K::F9 => (Action::NextFile, false),
             _ => return None,
         };
         Some(action)
@@ -2543,8 +3273,15 @@ impl Player {
     // -- main frame --------------------------------------------------------------------------------------
 
     fn frame(&mut self, ctx: &Context, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if self.closing {
+            return;
+        }
         self.now = self.started_at.elapsed().as_secs_f64();
         self.osd.tick();
+        if !self.position_checked {
+            self.position_checked = true;
+            self.recover_offscreen_window(ctx);
+        }
 
         if let Some(error) = self.startup_error.clone() {
             ui.vertical_centered(|ui| {
@@ -2554,8 +3291,7 @@ impl Player {
                 ui.label(error);
                 ui.add_space(16.0);
                 if ui.button("Exit").clicked() {
-                    self.quit();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_close(ctx);
                 }
             });
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -2567,6 +3303,33 @@ impl Player {
         for message in messages {
             self.on_engine_event(message);
         }
+
+        if self.resume_dialog.open {
+            let window = ctx.content_rect();
+            let layout = self.layout(window);
+            self.paint_video(ui, &layout);
+            self.paint_chrome(ctx, ui, &layout);
+            // Enter confirms the resume; Escape cancels it and starts over, so the
+            // dialog is fully usable from the keyboard.
+            let keyboard = ctx.input(|input| {
+                if input.key_pressed(egui::Key::Enter) {
+                    Some(ResumeChoice::Resume)
+                } else if input.key_pressed(egui::Key::Escape) {
+                    Some(ResumeChoice::StartOver)
+                } else {
+                    None
+                }
+            });
+            if let Some(choice) = keyboard.or_else(|| self.resume_dialog.show(ctx)) {
+                self.apply_resume_choice(choice);
+            }
+            self.pending = Pending::new();
+            ctx.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+
+        self.handle_escape(ctx);
+
         while let Ok(paths) = self.ipc_rx.try_recv() {
             if !paths.is_empty() {
                 self.pending.open_paths(paths, false);
@@ -2588,17 +3351,31 @@ impl Player {
             self.next_save = self.now + 10.0;
             self.autosave();
         }
+        self.sleep_timer_tick();
+        self.thumbs.drain();
+        self.viewport_h = ctx.content_rect().height().max(1.0);
         if self.info_visible && self.now >= self.next_info {
             self.next_info = self.now + 0.4;
             let text = self.info_text(true);
             self.osd.info = text;
         }
-        self.update_cursor(ctx);
+        self.update_chrome(ctx);
+        // Eased drawer slide: drives both the drawer rect and how much of the
+        // right-hand floating chrome is reserved for it (see `layout`).
+        self.drawer_slide =
+            ctx.animate_bool_with_time(Id::new("drawer-slide"), self.playlist_visible, 0.22);
+        // Live progress of the playing file for the playlist row marker.
+        let duration = self.duration();
+        self.playlist.progress = if self.file_ready && duration > 0.0 {
+            progress_fraction(self.position() / duration)
+        } else {
+            None
+        };
 
         // Deferred autofit.
         if self.next_autofit > 0.0 && self.now >= self.next_autofit {
             self.next_autofit = 0.0;
-            if self.settings.autofit {
+            if self.settings.autofit && !self.file_is_audio_only {
                 self.fit_window(None, ctx);
             }
         }
@@ -2608,12 +3385,17 @@ impl Player {
 
         let window = ctx.content_rect();
         let layout = self.layout(window);
+        self.handle_gestures(ctx, layout.video);
         self.remember_window_geometry(ctx);
 
-        self.paint_chrome(ctx, ui, &layout);
+        // The video fills the window; chrome, drawer and panels float above it.
         self.paint_video(ui, &layout);
+        if self.closing {
+            return;
+        }
+        self.paint_chrome(ctx, ui, &layout);
 
-        self.handle_menus(ctx, ui);
+        self.handle_menus(ui);
         self.handle_dialogs(ctx);
 
         // Drain the action queue built this frame.
@@ -2624,24 +3406,28 @@ impl Player {
         for action in pending.actions {
             self.dispatch(action, ctx);
         }
-        if pending.quit {
-            self.quit();
-        }
 
-        // Keep the window level in sync.
-        let want_level = if self.on_top && !self.fullscreen {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(want_level));
+        // Keep the window level in sync — but only send the viewport command when the
+        // value actually changed, so winit does not re-apply the level every frame.
+        let want_on_top = self.on_top && !self.fullscreen;
+        if self.applied_on_top != Some(want_on_top) {
+            self.applied_on_top = Some(want_on_top);
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if want_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }));
+        }
 
         let title = if self.title_text.is_empty() {
             "MacPlayer".to_string()
         } else {
             format!("{} - MacPlayer", self.title_text)
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if self.applied_title != title {
+            self.applied_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
 
         self.gl_ready = true;
         if !self.pending_open.is_empty() {
@@ -2655,35 +3441,128 @@ impl Player {
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
-    fn handle_keyboard(&mut self, ctx: &Context) {
-        if ctx.egui_wants_keyboard_input() {
+    fn any_dialog_open(&self) -> bool {
+        self.goto_dialog.open
+            || self.url_dialog.open
+            || self.text_dialog.open
+            || self.prefs.open
+            || self.panel.open
+            || self.history_dialog.open
+    }
+
+    fn close_top_dialog(&mut self) {
+        if self.text_dialog.open {
+            self.text_dialog.open = false;
+        } else if self.goto_dialog.open {
+            self.goto_dialog.open = false;
+        } else if self.url_dialog.open {
+            self.url_dialog.open = false;
+        } else if self.prefs.open {
+            self.prefs.open = false;
+        } else if self.panel.open {
+            self.panel.open = false;
+        } else if self.history_dialog.open {
+            self.history_dialog.open = false;
+        }
+    }
+
+    fn handle_escape(&mut self, ctx: &Context) {
+        if !ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             return;
         }
-        let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
-        for event in events {
-            if let egui::Event::Key {
-                key,
-                physical_key,
-                pressed,
-                repeat,
-                modifiers,
-                ..
-            } = event
-            {
+        if self.palette.open {
+            self.palette.close();
+            return;
+        }
+        if self.settings_pop.open {
+            self.settings_pop.open = false;
+            return;
+        }
+        // The drawer behaves like a lightweight panel: close it before the generic
+        // focus/fullscreen fallbacks, even when its list does not hold focus.
+        if self.playlist_visible
+            && !self.menu.is_open()
+            && !self.playlist.menu_open()
+            && !self.any_dialog_open()
+        {
+            self.toggle_playlist(ctx);
+            return;
+        }
+        match escape_target(
+            self.menu.is_open() || self.playlist.menu_open(),
+            self.any_dialog_open(),
+            self.playlist.has_focus,
+            self.fullscreen,
+        ) {
+            EscapeTarget::Menu => {
+                self.menu.close();
+                self.track_menu_kind = None;
+                self.playlist.close_menu();
+            }
+            EscapeTarget::Dialog => self.close_top_dialog(),
+            EscapeTarget::Playlist => self.playlist.clear_focus(),
+            EscapeTarget::Fullscreen => self.pending.push(Action::ExitFullscreen),
+            EscapeTarget::None => {}
+        }
+    }
+
+    fn handle_keyboard(&mut self, ctx: &Context) {
+        // Modals own the keyboard while they are visible.
+        if self.palette.open
+            || self.settings_pop.open
+            || self.menu.is_open()
+            || self.playlist.menu_open()
+            || self.any_dialog_open()
+            || ctx.egui_wants_keyboard_input()
+        {
+            return;
+        }
+        let playlist_keys = self.playlist.has_focus;
+        // Borrow the event list in place — no per-frame clone of every input event.
+        // Closure captures stay disjoint per field, so the &mut borrow is fine.
+        ctx.input(|i| {
+            for event in &i.events {
+                let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
                 if !pressed {
                     continue;
                 }
-                let mapped = self
-                    .keymap(key, modifiers)
-                    .or_else(|| physical_key.and_then(|physical| self.keymap(physical, modifiers)));
+                // The focused playlist owns list navigation keys.
+                if playlist_keys
+                    && matches!(
+                        key,
+                        egui::Key::ArrowUp
+                            | egui::Key::ArrowDown
+                            | egui::Key::Home
+                            | egui::Key::End
+                            | egui::Key::PageUp
+                            | egui::Key::PageDown
+                            | egui::Key::Enter
+                            | egui::Key::Delete
+                    )
+                {
+                    continue;
+                }
+                let mapped = self.keymap(*key, *modifiers).or_else(|| {
+                    physical_key.and_then(|physical| self.keymap(physical, *modifiers))
+                });
                 if let Some((action, allows_repeat)) = mapped {
-                    if repeat && !allows_repeat {
+                    if *repeat && !allows_repeat {
                         continue;
                     }
                     self.pending.push(action);
                 }
             }
-        }
+        });
     }
 
     fn handle_dropped_files(&mut self, ctx: &Context) {
@@ -2699,11 +3578,11 @@ impl Player {
             if self.hovered_files.is_empty() {
                 self.osd.center.clear();
             } else if self.hovered_files.iter().all(|p| is_sub(p)) {
-                self.osd.center = "Drop to load subtitle".into();
+                self.osd.center = i18n::tr("Drop to load subtitle").into();
             } else if self.drop_appends(ctx) {
-                self.osd.center = "Drop to add to playlist".into();
+                self.osd.center = i18n::tr("Drop to add to playlist").into();
             } else {
-                self.osd.center = "Drop to play".into();
+                self.osd.center = i18n::tr("Drop to play").into();
             }
         }
         let dropped: Vec<String> = ctx.input(|i| {
@@ -2733,195 +3612,396 @@ impl Player {
         on_playlist || ctx.input(|input| input.modifiers.command || input.modifiers.ctrl)
     }
 
-    fn update_cursor(&mut self, ctx: &Context) {
-        let (hover, delta, pointer_down) = ctx.input(|i| {
-            (
-                i.pointer.hover_pos(),
-                i.pointer.delta(),
-                i.pointer.any_down(),
-            )
-        });
-        let window = ctx.content_rect();
-        let previous_fs_bottom = self.fs_bottom;
-        let top_zone = Rect::from_min_max(
-            window.min,
-            pos2(
-                window.right(),
-                (window.top() + TITLE_H).min(window.bottom()),
-            ),
-        );
-        let bottom_zone = Rect::from_min_max(
-            pos2(
-                window.left(),
-                (window.bottom() - SEEK_H - CTRL_H).max(window.top()),
-            ),
-            window.max,
-        );
-        let top_hovered = self.fullscreen && hover.is_some_and(|pos| top_zone.contains(pos));
-        let bottom_hovered = self.fullscreen && hover.is_some_and(|pos| bottom_zone.contains(pos));
-        if self.fullscreen {
-            if top_hovered {
-                self.fs_top = true;
-                self.fs_top_deadline = self.now + FS_EDGE_TIMEOUT;
-            } else if self.fs_top && self.now >= self.fs_top_deadline {
-                self.fs_top = false;
+    /// Reveal the floating chrome on pointer activity; hide it (with the cursor) while
+    /// playback runs untouched. Panels pin the chrome open.
+    fn update_chrome(&mut self, ctx: &Context) {
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        if pointer != self.last_pointer {
+            self.last_pointer = pointer;
+            if pointer.is_some() {
+                self.schedule_chrome_hide();
             }
-            if bottom_hovered {
-                self.fs_bottom = true;
-                self.fs_bottom_deadline = self.now + FS_EDGE_TIMEOUT;
-            } else if self.fs_bottom && self.now >= self.fs_bottom_deadline {
-                self.fs_bottom = false;
-            }
+        }
+        let was_visible = self.chrome_visible;
+        if !self.is_playing() || self.panels_open() {
+            self.chrome_visible = true;
+            self.chrome_hide_at = f64::INFINITY;
         } else {
-            self.fs_top = false;
-            self.fs_bottom = false;
-            self.fs_top_deadline = 0.0;
-            self.fs_bottom_deadline = 0.0;
-        }
-        if previous_fs_bottom != self.fs_bottom {
-            self.update_sub_margin_for_height(window.height());
-        }
-        let video_rect = self.layout(window).video;
-        self.mouse_in_video = hover.is_some_and(|pos| video_rect.contains(pos));
-        let moved = delta != Vec2::ZERO;
-        if self.mouse_in_video {
-            if moved || self.last_pointer_move.is_none() {
-                self.cursor_hidden = false;
-                self.last_pointer_move = Some(Instant::now());
-                self.next_cursor = self.now + 1.5;
+            // Playback started without pointer activity (e.g. after resume): start the
+            // hide countdown once, so the chrome still fades away on its own.
+            if self.chrome_hide_at == f64::INFINITY {
+                self.chrome_hide_at = self.now + CHROME_HIDE_SECS;
             }
-        } else {
-            self.cursor_hidden = false;
-        }
-        if self.is_playing()
-            && self.mouse_in_video
-            && self.has_video()
-            && self.now >= self.next_cursor
-        {
-            if !pointer_down && !ctx.any_popup_open() {
-                self.cursor_hidden = true;
+            if self.now >= self.chrome_hide_at {
+                self.chrome_visible = false;
             }
         }
-        if !self.is_playing() {
-            self.cursor_hidden = false;
+        if was_visible != self.chrome_visible {
+            self.update_sub_margin();
         }
-        apply_cursor(ctx, self.cursor_hidden);
+        apply_cursor(ctx, self.chrome_hidden());
     }
 
+    /// Anything that should keep the floating chrome pinned open.
+    fn panels_open(&self) -> bool {
+        self.playlist_visible
+            || self.settings_pop.open
+            || self.menu.is_open()
+            || self.track_menu_kind.is_some()
+            || self.playlist.menu_open()
+            || self.any_dialog_open()
+            || self.palette.open
+            || self.resume_dialog.open
+            || self.mini_player
+    }
+
+    fn schedule_chrome_hide(&mut self) {
+        self.chrome_visible = true;
+        self.chrome_hide_at = if self.is_playing() && !self.panels_open() {
+            self.now + CHROME_HIDE_SECS
+        } else {
+            f64::INFINITY
+        };
+    }
+
+    fn chrome_hidden(&self) -> bool {
+        self.is_playing() && !self.panels_open() && self.now >= self.chrome_hide_at
+    }
+
+    /// Floating chrome over the video: drawer, scrims, top-right actions, control bar.
+    /// The controls and top actions fade in and out with pointer activity instead of
+    /// snapping; the drawer slides separately (see `layout`).
     fn paint_chrome(&mut self, ctx: &Context, ui: &mut Ui, layout: &Layout) {
-        let window = ctx.content_rect();
+        let colors = skin::active_colors();
+        let window = layout.video;
+        let chrome_alpha =
+            ctx.animate_bool_with_time(Id::new("chrome-fade"), self.chrome_visible, 0.18);
 
-        // Frame border.
-        let painter = ui.painter();
-        painter.rect_filled(window, 0.0, LINE);
-
-        // Title bar.
-        if let Some(rect) = layout.title {
-            let pin = self.settings.on_top != "never";
-            let icons = [
-                "close",
-                "minimize",
-                if self.maximized {
-                    "restore"
-                } else {
-                    "maximize"
-                },
-                "pin",
-                if self.fullscreen {
-                    "fullscreen_exit"
-                } else {
-                    "fullscreen"
-                },
-            ];
-            let checked = [false, false, false, pin, false];
-            let bar = title_bar(
-                ui,
-                rect,
-                &self.title_text,
-                "MacPlayer",
-                icons,
-                checked,
-                &mut self.press_origin,
+        // Bottom scrim + control bar.
+        if chrome_alpha > 0.004
+            && let Some(controls) = layout.controls
+        {
+            let scrim_top_y = (controls.top() - 80.0).max(window.top());
+            skin::v_gradient(
+                ui.painter(),
+                Rect::from_min_max(pos2(window.left(), scrim_top_y), window.max),
+                Color32::TRANSPARENT,
+                colors.scrim_bottom.gamma_multiply(chrome_alpha),
             );
-            if bar.menu_click.any() {
-                self.menu.open_at(rect.left_bottom());
-                self.track_menu_kind = None;
+            self.paint_controls(ui, controls, chrome_alpha);
+        }
+
+        // Top scrim + floating actions.
+        if chrome_alpha > 0.004
+            && let Some(actions) = layout.top_actions
+        {
+            let scrim_bottom_y = (actions.bottom() + 56.0).min(window.bottom());
+            skin::v_gradient(
+                ui.painter(),
+                Rect::from_min_max(window.min, pos2(window.right(), scrim_bottom_y)),
+                colors.scrim_top.gamma_multiply(chrome_alpha),
+                Color32::TRANSPARENT,
+            );
+            self.paint_top_actions(ui, window, actions, chrome_alpha);
+        }
+
+        // The drawer paints last, above every floating control (approved mockup
+        // z-order); it brings its own close affordances (header ✕, Escape, ⌘P).
+        if let Some(rect) = layout.playlist {
+            self.paint_drawer(ctx, ui, rect);
+        }
+    }
+
+    /// Drawer toggle + settings gear over the video's top edge; in full screen the
+    /// native title bar is gone, so the media title is shown on the left.
+    fn paint_top_actions(&mut self, ui: &mut Ui, window: Rect, rect: Rect, alpha: f32) {
+        let colors = skin::active_colors();
+        if self.fullscreen && !self.title_text.is_empty() && alpha > 0.05 {
+            let painter = ui.painter_at(window);
+            painter.text(
+                pos2(window.left() + 16.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                skin::elide_middle(&painter, &self.title_text, &skin::font(12.0, false), 340.0),
+                skin::font(12.0, false),
+                colors.text_bright.gamma_multiply(alpha),
+            );
+        }
+        let btn = 32.0;
+        let drawer_rect = Rect::from_min_size(pos2(rect.left(), rect.top()), vec2(btn, btn));
+        let gear_rect =
+            Rect::from_min_size(pos2(rect.left() + btn + 4.0, rect.top()), vec2(btn, btn));
+        let drawer = IconBtn::new("playlist")
+            .flat(true)
+            .alpha(alpha)
+            .tip(i18n::tr("Playlist"))
+            .checked(self.playlist_visible)
+            .ui(ui, ui.id().with("tb-drawer"), drawer_rect);
+        if drawer.primary {
+            self.pending.push(Action::TogglePlaylist);
+        }
+        let gear = IconBtn::new("gear")
+            .flat(true)
+            .alpha(alpha)
+            .tip(i18n::tr("Settings"))
+            .checked(self.settings_pop.open)
+            .ui(ui, ui.id().with("tb-gear"), gear_rect);
+        if gear.primary {
+            self.settings_pop.open = !self.settings_pop.open;
+            if self.settings_pop.open {
+                self.settings_pop.just_opened = true;
             }
-            if bar.buttons[0].primary {
-                self.quit();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            if bar.buttons[1].primary {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            if bar.buttons[2].primary {
-                self.pending.push(Action::ToggleMaximize);
-            }
-            if bar.buttons[3].primary {
-                let mode = if pin { "never" } else { "always" };
-                self.pending.push(Action::SetOnTop(mode.into()));
-            }
-            if bar.buttons[4].primary {
-                self.pending.push(Action::ToggleFullscreen);
-            }
-            if bar.double {
-                self.pending.push(Action::ToggleFullscreen);
-            }
-            if bar.drag_started {
-                if !self.fullscreen && !self.maximized {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            self.settings_anchor = gear_rect;
+            self.schedule_chrome_hide();
+        }
+    }
+
+    /// Floating control bar: seek row on top, transport row below. `alpha` fades the
+    /// whole bar while the chrome animates in or out.
+    fn paint_controls(&mut self, ui: &mut Ui, rect: Rect, alpha: f32) {
+        let colors = skin::active_colors();
+        let seek_rect = Rect::from_min_max(
+            pos2(rect.left() + 14.0, rect.top() + 3.0),
+            pos2(
+                (rect.right() - 14.0).max(rect.left() + 1.0),
+                rect.top() + 25.0,
+            ),
+        );
+        let row = Rect::from_min_max(
+            pos2(rect.left() + 8.0, rect.top() + 27.0),
+            pos2(rect.right() - 8.0, rect.bottom()),
+        );
+
+        // Seek bar (widget handles drag, wheel, chapters, A-B).
+        let now = Instant::now();
+        let out = seek_bar(ui, seek_rect, Id::new("seek"), &mut self.seek, now, alpha);
+        if let Some((seconds, exact)) = out.seek {
+            self.pending.push(Action::SeekBar(seconds, exact));
+        }
+        if let Some(seconds) = out.hover
+            && seconds >= 0.0
+        {
+            let mut text = fmt_time(seconds);
+            let chapters = self.state.get("chapter-list").cloned();
+            if let Some(chapters) = chapters {
+                let mut current = None;
+                for chapter in chapters.as_array() {
+                    if chapter.get("time").as_f64().unwrap_or(0.0) <= seconds {
+                        current = Some(chapter);
+                    }
                 }
+                if let Some(title) =
+                    current.and_then(|c| c.get("title").as_str().map(str::to_string))
+                {
+                    text.push_str(&format!("  {title}"));
+                }
+            }
+            let font_id = skin::font(11.0, false);
+            let painter = ui.painter();
+            let w = skin::text_width(painter, &text, &font_id) + 14.0;
+            // Hover preview thumbnail above the time bubble, when ready.
+            let duration = self.duration();
+            let ctx = ui.ctx().clone();
+            let thumb = self
+                .current_path
+                .as_deref()
+                .filter(|path| !is_url(path))
+                .and_then(|path| self.thumbs.texture(&ctx, path, seconds, duration))
+                .map(|handle| {
+                    let size = handle.size_vec2();
+                    let scale = 128.0 / size.x.max(1.0);
+                    (handle.id(), vec2(size.x * scale, size.y * scale))
+                });
+            let bubble = Rect::from_min_size(
+                pos2(
+                    (seek_rect.center().x - w / 2.0)
+                        .clamp(rect.left() + 2.0, rect.right() - w - 2.0),
+                    seek_rect.top() - 22.0 - thumb.as_ref().map_or(0.0, |(_, size)| size.y + 4.0),
+                ),
+                vec2(w, 20.0),
+            );
+            if let Some((tex, size)) = thumb {
+                let thumb_rect = Rect::from_min_size(
+                    pos2(
+                        bubble.center().x - size.x / 2.0,
+                        bubble.top() - size.y - 4.0,
+                    ),
+                    size,
+                );
+                let tp = ui.painter_at(thumb_rect.expand(1.0));
+                let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                tp.image(
+                    tex,
+                    thumb_rect,
+                    uv,
+                    colors.text_bright.gamma_multiply(alpha),
+                );
+                tp.rect_stroke(
+                    thumb_rect,
+                    4.0,
+                    Stroke::new(1.0, colors.dialog_line.gamma_multiply(alpha)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            let bp = ui.painter_at(bubble);
+            bp.rect_filled(bubble, 6.0, colors.dialog_bg.gamma_multiply(alpha));
+            bp.rect_stroke(
+                bubble,
+                6.0,
+                Stroke::new(1.0, colors.dialog_line.gamma_multiply(alpha)),
+                egui::StrokeKind::Outside,
+            );
+            bp.text(
+                bubble.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font_id,
+                colors.text_bright.gamma_multiply(alpha),
+            );
+        }
+        if out.wheel != 0 {
+            let step = self.settings.seek_small;
+            self.pending.push(Action::SeekRel(out.wheel as f64 * step));
+        }
+
+        // Transport row: back / play / forward / time … subs, audio, volume, fullscreen.
+        let bw = 36.0;
+        let back_r = Rect::from_min_size(pos2(row.left(), row.top()), vec2(bw, row.height()));
+        let play_r = Rect::from_min_size(
+            pos2(back_r.right() + 2.0, row.top()),
+            vec2(bw + 8.0, row.height()),
+        );
+        let fwd_r = Rect::from_min_size(
+            pos2(play_r.right() + 2.0, row.top()),
+            vec2(bw, row.height()),
+        );
+        let playing = self.is_playing();
+        let back = IconBtn::new("seek_back")
+            .flat(true)
+            .alpha(alpha)
+            .tip(i18n::tr("Seek back"))
+            .ui(ui, ui.id().with("ctl-back"), back_r);
+        if back.primary {
+            self.pending
+                .push(Action::SeekRel(-self.settings.seek_small));
+        }
+        let play = IconBtn::new(if playing { "pause" } else { "play" })
+            .flat(true)
+            .alpha(alpha)
+            .tip(if playing {
+                i18n::tr("Pause")
+            } else {
+                i18n::tr("Play")
+            })
+            .ui(ui, ui.id().with("ctl-play"), play_r);
+        if play.primary {
+            self.pending.push(Action::TogglePause);
+        }
+        let fwd = IconBtn::new("seek_fwd")
+            .flat(true)
+            .alpha(alpha)
+            .tip(i18n::tr("Seek forward"))
+            .ui(ui, ui.id().with("ctl-fwd"), fwd_r);
+        if fwd.primary {
+            self.pending.push(Action::SeekRel(self.settings.seek_small));
+        }
+
+        // Right cluster, anchored to the row's right edge. The cluster compacts in
+        // narrow windows (drawer open, small window): the volume slider narrows,
+        // then the track buttons drop out, then the whole slider goes away — the
+        // time labels degrade against whatever is leftmost so nothing ever overlaps.
+        let row_w = row.width();
+        let cluster = control_cluster(row_w);
+        let vol_w = if cluster.show_volume {
+            cluster.vol_w
+        } else {
+            0.0
+        };
+        let fs_r = Rect::from_min_size(pos2(row.right() - bw, row.top()), vec2(bw, row.height()));
+        let vol_r = Rect::from_min_size(
+            pos2(fs_r.left() - vol_w, row.top()),
+            vec2(vol_w, row.height()),
+        );
+        let audio_r =
+            Rect::from_min_size(pos2(vol_r.left() - bw, row.top()), vec2(bw, row.height()));
+        let subs_r =
+            Rect::from_min_size(pos2(audio_r.left() - bw, row.top()), vec2(bw, row.height()));
+        let cluster_left = if !cluster.show_volume {
+            fs_r.left()
+        } else if cluster.show_track_buttons {
+            subs_r.left()
+        } else {
+            vol_r.left()
+        };
+
+        // Elapsed / total time: both values, then elapsed only, then nothing.
+        // Clicking switches to remaining time.
+        let painter = ui.painter_at(row);
+        let (elapsed, total) = self.time_parts();
+        let mono = skin::mono(10.0);
+        let elapsed_w = skin::text_width(&painter, &elapsed, &mono);
+        let total_text = format!("/ {total}");
+        let total_w = skin::text_width(&painter, &total_text, &mono);
+        let time_x = fwd_r.right() + 12.0;
+        let gap = 10.0;
+        let show_total = time_x + elapsed_w + 6.0 + total_w + gap <= cluster_left;
+        let show_elapsed = time_x + elapsed_w + gap <= cluster_left;
+        if show_elapsed {
+            painter.text(
+                pos2(time_x, row.center().y),
+                Align2::LEFT_CENTER,
+                elapsed,
+                mono.clone(),
+                colors.text_bright.gamma_multiply(alpha),
+            );
+            if show_total {
+                painter.text(
+                    pos2(time_x + elapsed_w + 6.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    total_text,
+                    mono,
+                    colors.text_dim.gamma_multiply(alpha),
+                );
+            }
+            let time_w = if show_total {
+                elapsed_w + 6.0 + total_w
+            } else {
+                elapsed_w
+            };
+            let time_rect =
+                Rect::from_min_size(pos2(time_x, row.top()), vec2(time_w, row.height()));
+            if ui
+                .interact(time_rect, ui.id().with("ctl-time"), Sense::click())
+                .on_hover_text(i18n::tr(
+                    "Click to switch between elapsed and remaining time",
+                ))
+                .clicked()
+            {
+                self.pending.push(Action::ToggleRemaining);
             }
         }
 
-        // Seek bar + volume.
-        if let (Some(seek_rect), Some(vol_rect)) = (layout.seek, layout.volume) {
-            let now = Instant::now();
-            let out = seek_bar(ui, seek_rect, Id::new("seek"), &mut self.seek, now);
-            if let Some((seconds, exact)) = out.seek {
-                self.pending.push(Action::SeekBar(seconds, exact));
+        if cluster.show_track_buttons {
+            let subs = IconBtn::new("subs")
+                .flat(true)
+                .alpha(alpha)
+                .tip(i18n::tr("Subtitles"))
+                .enabled(self.has_file())
+                .ui(ui, ui.id().with("ctl-subs"), subs_r);
+            if subs.primary {
+                self.pending.push(Action::ShowTrackMenu(TrackKind::Sub));
             }
-            if let Some(seconds) = out.hover {
-                if seconds >= 0.0 {
-                    let mut text = fmt_time(seconds);
-                    let chapters = self.state.get("chapter-list").cloned();
-                    if let Some(chapters) = chapters {
-                        let mut current = None;
-                        for chapter in chapters.as_array() {
-                            if chapter.get("time").as_f64().unwrap_or(0.0) <= seconds {
-                                current = Some(chapter);
-                            }
-                        }
-                        if let Some(title) =
-                            current.and_then(|c| c.get("title").as_str().map(str::to_string))
-                        {
-                            text.push_str(&format!("  {title}"));
-                        }
-                    }
-                    let font_id = skin::font(11.0, false);
-                    let painter = ui.painter();
-                    let w = skin::text_width(painter, &text, &font_id) + 14.0;
-                    let h = 20.0;
-                    let x = (seek_rect.center().x - w / 2.0)
-                        .clamp(window.left() + 2.0, window.right() - w - 2.0);
-                    let bubble = Rect::from_min_size(pos2(x, seek_rect.top() - h), vec2(w, h));
-                    let bp = ui.painter_at(bubble);
-                    bp.rect_filled(bubble, 0.0, Color32::BLACK);
-                    bp.rect_filled(bubble.shrink(1.0), 0.0, DIALOG_BG);
-                    bp.text(
-                        bubble.center(),
-                        egui::Align2::CENTER_CENTER,
-                        text,
-                        font_id,
-                        TEXT_BRIGHT,
-                    );
-                }
+            let audio = IconBtn::new("note")
+                .flat(true)
+                .alpha(alpha)
+                .tip(i18n::tr("Audio"))
+                .enabled(self.has_file())
+                .ui(ui, ui.id().with("ctl-audio"), audio_r);
+            if audio.primary {
+                self.pending.push(Action::ShowTrackMenu(TrackKind::Audio));
             }
-            if out.wheel != 0 {
-                let step = self.settings.seek_small;
-                self.pending.push(Action::SeekRel(out.wheel as f64 * step));
-            }
-            let vol_out = volume_bar(ui, vol_rect, Id::new("volume"), &mut self.volume);
+        }
+        if cluster.show_volume {
+            let vol_out = volume_bar(ui, vol_r, Id::new("volume"), &mut self.volume, alpha);
             if let Some(value) = vol_out.volume {
                 self.pending.push(Action::SetVolume(value));
             }
@@ -2933,184 +4013,17 @@ impl Player {
                 self.pending.push(Action::VolumeStep(vol_out.wheel * step));
             }
         }
-
-        // Control bar.
-        if let Some(rect) = layout.ctrl {
-            self.paint_control_bar(ui, rect);
-        }
-
-        // Playlist.
-        if let Some(rect) = layout.playlist {
-            self.paint_playlist_splitter(ui, window, rect);
-            let ctx2 = ctx.clone();
-            let out = self.playlist.ui(ui, rect, &ctx2);
-            self.apply_playlist_out(out, ctx);
-        }
-    }
-
-    fn paint_playlist_splitter(&mut self, ui: &mut Ui, window: Rect, playlist: Rect) {
-        let colors = skin::active_colors();
-        let splitter_x = playlist.left() - 1.0;
-        let splitter = Rect::from_min_max(
-            pos2(splitter_x - 4.0, playlist.top()),
-            pos2(splitter_x + 4.0, playlist.bottom()),
-        );
-        let response = ui.interact(
-            splitter,
-            Id::new("playlist-splitter"),
-            Sense::click_and_drag(),
-        );
-        if response.hovered() || self.playlist_resize_dragging {
-            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeHorizontal);
-        }
-        let line_color = if response.hovered() || self.playlist_resize_dragging {
-            colors.accent
+        let fs = IconBtn::new(if self.fullscreen {
+            "fullscreen_exit"
         } else {
-            colors.line
-        };
-        ui.painter().line_segment(
-            [
-                pos2(splitter_x, playlist.top()),
-                pos2(splitter_x, playlist.bottom()),
-            ],
-            egui::Stroke::new(
-                if response.hovered() || self.playlist_resize_dragging {
-                    2.0
-                } else {
-                    1.0
-                },
-                line_color,
-            ),
-        );
-
-        if response.drag_started_by(egui::PointerButton::Primary) {
-            self.playlist_resize_dragging = true;
-        }
-        if self.playlist_resize_dragging {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                let edge_inset = if self.fullscreen { 0.0 } else { FRAME };
-                let available = (window.width() - 2.0 * edge_inset).max(0.0);
-                let max_width = (available - MIN_MAIN_W - 1.0).max(MIN_PLAYLIST_W);
-                let width = (window.right() - edge_inset - pointer.x - 1.0)
-                    .clamp(MIN_PLAYLIST_W, max_width);
-                self.settings.playlist_width = width as f64;
-                ui.ctx().request_repaint();
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                self.playlist_resize_dragging = false;
-                self.settings.playlist_width = self
-                    .settings
-                    .playlist_width
-                    .clamp(MIN_PLAYLIST_W as f64, 1000.0);
-                self.settings.save();
-            }
-        }
-    }
-
-    fn paint_control_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, BG);
-
-        let playing = self.is_playing();
-        // Keep the playlist toggle separate from the primary transport controls so it can
-        // sit at the right edge of the control bar. The seventh slot is still reserved for
-        // it when sizing the controls, which keeps the layout stable at narrow widths.
-        let button_w = (rect.width() / 7.0).min(BTN_W).max(0.0);
-        let left_button_area = button_w * 6.0;
-
-        // Left-side buttons: menu, prev, play, next, open, gear.
-        let buttons: [(&str, f32); 6] = [
-            ("menu", 0.0),
-            ("prev", BTN_W as f32),
-            ("play", BTN_W as f32 * 2.0),
-            ("next", BTN_W as f32 * 3.0),
-            ("eject", BTN_W as f32 * 4.0),
-            ("gear", BTN_W as f32 * 5.0),
-        ];
-        let mut clicks = [Click::default(); 7];
-        for (index, (glyph, x)) in buttons.iter().enumerate() {
-            let r = Rect::from_min_size(
-                pos2(rect.left() + *x / BTN_W * button_w, rect.top()),
-                vec2(button_w, rect.height()),
-            );
-            let mut btn = IconBtn::new(glyph, button_w, rect.height()).flat(true);
-            if index == 0 {
-                btn = btn.tip("Menu");
-            }
-            if index == 2 {
-                btn = btn.tip(if playing { "Pause" } else { "Play" });
-            }
-            if index == 5 {
-                btn = btn.tip("Control Panel");
-            }
-            let clicked = btn.ui(ui, ui.id().with(("ctrl-btn", index)), r);
-            clicks[index] = clicked;
-            if index == 2 {
-                skin::draw_icon(
-                    &painter,
-                    if playing { "pause" } else { "play" },
-                    r.center().x.round(),
-                    r.center().y.round(),
-                    if clicked.hovered { ICON_HOVER } else { ICON },
-                    BG,
-                );
-            }
-        }
-        let playlist_rect = Rect::from_min_size(
-            pos2(rect.right() - button_w, rect.top()),
-            vec2(button_w, rect.height()),
-        );
-        clicks[6] = IconBtn::new("playlist", button_w, rect.height())
-            .tip("Playlist")
-            .flat(true)
-            .checked(self.playlist_visible)
-            .ui(ui, ui.id().with(("ctrl-btn", 6)), playlist_rect);
-        if clicks[0].any() {
-            self.menu.open_at(rect.left_top());
-            self.track_menu_kind = None;
-        }
-        if clicks[1].primary {
-            self.pending.push(Action::PrevFile);
-        }
-        if clicks[2].primary {
-            self.pending.push(Action::TogglePause);
-        }
-        if clicks[3].primary {
-            self.pending.push(Action::NextFile);
-        }
-        if clicks[4].primary {
-            self.pending.push(Action::OpenFiles { append: false });
-        }
-        if clicks[4].secondary {
-            self.pending.push(Action::OpenFolder { append: false });
-        }
-        if clicks[5].primary {
-            self.pending.push(Action::ShowControlPanel(None));
-        }
-        if clicks[6].primary {
-            self.pending.push(Action::TogglePlaylist);
-        }
-
-        // Time label on the right of the buttons.
-        let (left, right) = self.time_parts();
-        let right_content_edge = rect.right() - button_w;
-        let remaining = (right_content_edge - rect.left() - left_button_area).max(0.0);
-        let time_w = remaining.min(150.0);
-        let badge_w = (remaining - time_w).min(180.0);
-        let time_x = right_content_edge - badge_w - time_w;
-        if time_w > 0.0 {
-            let time_rect =
-                Rect::from_min_size(pos2(time_x, rect.top()), vec2(time_w, rect.height()));
-            if time_label(ui, time_rect, Id::new("time"), &left, &right) {
-                self.pending.push(Action::ToggleRemaining);
-            }
-        }
-        if badge_w > 0.0 {
-            let badge_rect = Rect::from_min_size(
-                pos2(right_content_edge - badge_w, rect.top()),
-                vec2(badge_w, rect.height()),
-            );
-            info_badges(ui, badge_rect, &self.badges);
+            "fullscreen"
+        })
+        .flat(true)
+        .alpha(alpha)
+        .tip(i18n::tr("Fullscreen"))
+        .ui(ui, ui.id().with("ctl-fs"), fs_r);
+        if fs.primary {
+            self.pending.push(Action::ToggleFullscreen);
         }
     }
 
@@ -3126,6 +4039,44 @@ impl Player {
         }
     }
 
+    /// Translucent playlist drawer sliding over the video from the right.
+    fn paint_drawer(&mut self, ctx: &Context, ui: &mut Ui, rect: Rect) {
+        let colors = skin::active_colors();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, colors.drawer_fill);
+        painter.line_segment(
+            [
+                pos2(rect.left() + 0.5, rect.top()),
+                pos2(rect.left() + 0.5, rect.bottom()),
+            ],
+            Stroke::new(1.0, colors.dialog_line),
+        );
+        // Drag the drawer's left edge to widen/narrow it.
+        let handle = Rect::from_min_max(
+            pos2(rect.left() - 4.0, rect.top()),
+            pos2(rect.left() + 4.0, rect.bottom()),
+        );
+        let resize = ui.interact(handle, Id::new("drawer-resize"), Sense::click_and_drag());
+        if resize.dragged()
+            && let Some(pos) = resize.interact_pointer_pos()
+        {
+            let window = ctx.content_rect();
+            let width = (window.right() - pos.x).clamp(MIN_PLAYLIST_W, DRAWER_MAX_W);
+            self.settings.playlist_width = width as f64;
+        }
+        if resize.hovered() || resize.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if resize.drag_stopped() {
+            self.save_settings();
+        }
+        let ctx2 = ctx.clone();
+        let out = self.playlist.ui(ui, rect, &ctx2);
+        self.apply_playlist_out(out, ctx);
+    }
+
+    // Calls into the unsafe render API at the mpv/GL boundary.
+    #[allow(unsafe_code)]
     fn paint_video(&mut self, ui: &mut Ui, layout: &Layout) {
         let rect = layout.video;
         let idle = self
@@ -3134,7 +4085,6 @@ impl Player {
             .map(|v| v.as_bool())
             .unwrap_or(true);
         let audio_only = self.file_ready && !self.has_video();
-        let show_logo = idle || audio_only;
 
         let renderer = self.renderer.clone();
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
@@ -3151,11 +4101,18 @@ impl Player {
                 return;
             };
             if let Err(error) = unsafe { renderer.ensure_context(gl) } {
-                eprintln!("render context: {error}");
+                if renderer.error_changed(&format!("render context: {error}")) {
+                    eprintln!("render context: {error}");
+                }
                 return;
             }
-            if let Err(error) = unsafe { renderer.render(gl, rect_px) } {
-                eprintln!("render: {error}");
+            match unsafe { renderer.render(gl, rect_px) } {
+                Ok(()) => renderer.note_ok(),
+                Err(error) => {
+                    if renderer.error_changed(&format!("render: {error}")) {
+                        eprintln!("render: {error}");
+                    }
+                }
             }
         });
         ui.painter().add(egui::epaint::PaintCallback {
@@ -3163,35 +4120,199 @@ impl Player {
             callback: Arc::new(callback),
         });
 
-        if show_logo {
-            let title = self.logo_title();
-            widgets::paint_logo(ui, rect, &title);
-        }
+        let colors = skin::active_colors();
+        let painter = ui.painter_at(rect);
 
-        // OSD on top of the video.
-        self.osd.paint(ui, rect);
+        if idle && !self.file_ready {
+            // Idle backdrop: a soft four-corner gradient with a faint dot grid —
+            // the palette for both ships in the skin (`logo_grad_*`, `logo_dot`).
+            let mut backdrop = egui::Mesh::default();
+            backdrop.colored_vertex(rect.left_top(), colors.logo_grad_tl);
+            backdrop.colored_vertex(rect.right_top(), colors.logo_grad_tr);
+            backdrop.colored_vertex(rect.right_bottom(), colors.logo_grad_br);
+            backdrop.colored_vertex(rect.left_bottom(), colors.logo_grad_bl);
+            backdrop.colored_vertex(rect.center(), colors.logo_grad_center);
+            backdrop.add_triangle(0, 4, 3);
+            backdrop.add_triangle(3, 4, 2);
+            backdrop.add_triangle(2, 4, 1);
+            backdrop.add_triangle(1, 4, 0);
+            painter.add(egui::Shape::Mesh(Arc::new(backdrop)));
+            let spacing = 30.0;
+            let offset_x = (rect.center().x - rect.left()) % spacing;
+            let offset_y = (rect.center().y - rect.top()) % spacing;
+            let mut dot_y = rect.top() + offset_y;
+            while dot_y <= rect.bottom() {
+                let mut dot_x = rect.left() + offset_x;
+                while dot_x <= rect.right() {
+                    painter.circle_filled(pos2(dot_x, dot_y), 1.0, colors.logo_dot);
+                    dot_x += spacing;
+                }
+                dot_y += spacing;
+            }
 
-        // Click / double-click on the video area.
-        let response = ui.interact(rect, Id::new("video"), Sense::click());
-        if response.double_clicked() {
-            if self.has_file() {
-                self.pending.push(Action::ToggleFullscreen);
-            } else {
+            // Centered composition: wordmark, play affordance, two hint lines.
+            let center = rect.center();
+            painter.text(
+                pos2(center.x, center.y - 80.0),
+                egui::Align2::CENTER_TOP,
+                "M A C P L A Y E R",
+                skin::font(11.0, false),
+                colors.text_dim,
+            );
+
+            // The play affordance: fixed hit area, gently growing circle on hover.
+            let hit = Rect::from_center_size(pos2(center.x, center.y - 14.0), vec2(96.0, 96.0));
+            let response = ui
+                .interact(hit, Id::new("idle-play"), Sense::click())
+                .on_hover_text(i18n::tr("Play"));
+            let hover = ui.ctx().animate_bool_with_time(
+                Id::new("idle-play-hover"),
+                response.hovered(),
+                0.16,
+            );
+            let circle_center = pos2(center.x, center.y - 14.0);
+            let radius = 42.0 + hover * 5.0;
+            let fill_alpha = 12.0 + hover * 16.0;
+            let fill = Color32::from_rgba_unmultiplied(255, 255, 255, fill_alpha as u8);
+            painter.circle_filled(circle_center, radius, fill);
+            painter.circle_stroke(
+                circle_center,
+                radius,
+                Stroke::new(1.0 + hover, colors.logo.gamma_multiply(0.35 + 0.65 * hover)),
+            );
+            // Big play triangle, optically centred (mass sits slightly left).
+            let w = radius * 0.42;
+            let h = radius * 0.56;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pos2(circle_center.x - w * 0.55, circle_center.y - h),
+                    pos2(circle_center.x - w * 0.55, circle_center.y + h),
+                    pos2(circle_center.x + w * 0.9, circle_center.y),
+                ],
+                colors.text_bright,
+                Stroke::NONE,
+            ));
+            if response.clicked() {
                 self.pending.push(Action::OpenFiles { append: false });
             }
-        } else if response.clicked() {
+            painter.text(
+                pos2(center.x, center.y + 44.0),
+                egui::Align2::CENTER_TOP,
+                i18n::tr("Open a video"),
+                skin::font(16.0, false),
+                colors.text_bright,
+            );
+            painter.text(
+                pos2(center.x, center.y + 72.0),
+                egui::Align2::CENTER_TOP,
+                i18n::tr("Drop a file here · ⌘O · or press play"),
+                skin::font(12.0, false),
+                colors.text_dim,
+            );
+        } else if audio_only {
+            // Audio-only media: a quiet disc mark, the title and the elapsed time.
+            let center = rect.center();
+            let disc = pos2(center.x, center.y - 54.0);
+            painter.circle_filled(disc, 34.0, colors.panel);
+            painter.circle_stroke(disc, 34.0, Stroke::new(1.0, colors.line));
+            painter.circle_stroke(disc, 9.0, Stroke::new(1.0, colors.line));
+            skin::draw_icon(&painter, "note", disc.x, disc.y, colors.logo, colors.panel);
+            let font_id = skin::font(15.0, false);
+            let text = skin::elide(
+                &painter,
+                &self.title_text,
+                &font_id,
+                (rect.width() * 0.7).max(0.0),
+            );
+            painter.text(
+                pos2(center.x, center.y + 16.0),
+                egui::Align2::CENTER_TOP,
+                text,
+                font_id,
+                colors.text_bright,
+            );
+            let dur = self.duration();
+            if dur > 0.0 {
+                painter.text(
+                    pos2(center.x, center.y + 42.0),
+                    egui::Align2::CENTER_TOP,
+                    format!("{} / {}", fmt_time(self.position()), fmt_time(dur)),
+                    skin::mono(11.0),
+                    colors.text_dim,
+                );
+            }
+        } else if self.now < self.flash_until {
+            // Big play/pause flash, fading out.
+            let t = ((self.flash_until - self.now) / FLASH_SECS).clamp(0.0, 1.0) as f32;
+            let alpha = (t * 200.0) as u8;
+            let radius = 34.0 + (1.0 - t) * 12.0;
+            painter.circle_filled(
+                rect.center(),
+                radius,
+                Color32::from_rgba_unmultiplied(12, 15, 22, (alpha / 2).min(120)),
+            );
+            skin::draw_icon(
+                &painter,
+                &self.flash_glyph,
+                rect.center().x,
+                rect.center().y,
+                Color32::from_rgba_unmultiplied(255, 255, 255, alpha.max(40)),
+                Color32::TRANSPARENT,
+            );
+        }
+
+        // Right-click anywhere on the video opens the main context menu — after the
+        // redesign this is the mouse entry point to the full feature set.
+        let response = ui.interact(rect, Id::new("video"), Sense::click());
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            self.video_click_at = None;
+            self.menu.open_at(pos);
+            self.track_menu_kind = None;
+        }
+
+        // Video surface: a plain click toggles pause (or opens media when empty), a
+        // double-click toggles full screen. The single click is deferred briefly so the
+        // first press of a double-click never pauses the video.
+        if let Some(first) = self.video_click_at
+            && self.now - first > VIDEO_DOUBLE_CLICK_SECS
+        {
+            self.video_click_at = None;
             if self.has_file() {
                 self.pending.push(Action::TogglePause);
             } else {
                 self.pending.push(Action::OpenFiles { append: false });
             }
         }
-        if response.hovered() {
-            self.mouse_in_video = true;
+        if response.double_clicked() {
+            self.video_click_at = None;
+            if self.has_file() {
+                self.pending.push(Action::ToggleFullscreen);
+            } else {
+                self.pending.push(Action::OpenFiles { append: false });
+            }
+        } else if response.clicked() {
+            self.video_click_at = Some(self.now);
         }
+
+        // Drag-and-drop affordance: a faint wash plus an accent ring while files
+        // hover over the window (the "Drop to play" OSD explains the action).
+        if !self.hovered_files.is_empty() {
+            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 6));
+            painter.rect_stroke(
+                rect.shrink(6.0),
+                12.0,
+                Stroke::new(2.0, colors.accent.gamma_multiply(0.85)),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        // OSD on top of the video.
+        self.osd.paint(ui, rect);
     }
 
-    fn handle_menus(&mut self, ctx: &Context, ui: &mut Ui) {
+    fn handle_menus(&mut self, ui: &mut Ui) {
         if !self.menu.is_open() {
             return;
         }
@@ -3201,74 +4322,12 @@ impl Player {
                 menus::track_menu(kind, &tracks, self.has_file())
             }
             None => {
-                let engine = self.engine();
-                let state = &self.state;
-                let tracks: Vec<Value> = engine
-                    .and_then(|e| e.get("track-list"))
-                    .map(|v| v.as_array().to_vec())
-                    .unwrap_or_default();
-                let chapters: Vec<Value> = state
-                    .get("chapter-list")
-                    .map(|v| v.as_array().to_vec())
-                    .unwrap_or_default();
-                let audio_devices: Vec<Value> = engine
-                    .and_then(|e| e.get("audio-device-list"))
-                    .map(|v| v.as_array().to_vec())
-                    .unwrap_or_default();
-                let c = MenuCtx {
-                    has_file: self.has_file(),
-                    playlist_count: self.playlist.count(),
-                    playlist_current: self.playlist.current_row(),
-                    recent: &self.settings.recent,
-                    bookmarks: &self.settings.bookmarks,
-                    repeat: &self.settings.repeat_mode,
-                    shuffle: self.settings.shuffle,
-                    resume: self.settings.resume,
-                    autofit: self.settings.autofit,
-                    on_top: &self.settings.on_top,
-                    hwdec: self.settings.hwdec,
-                    sub_codepage: &self.settings.sub_codepage,
-                    sub_visible: self.settings.sub_visible,
-                    info_visible: self.info_visible,
-                    fullscreen: self.fullscreen,
-                    aspect_name: &self.aspect_name,
-                    display_mode: &self.display_mode,
-                    flips: self.flips,
-                    normalize: self.normalize,
-                    speed: state.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0),
-                    mute: state.get("mute").map(|v| v.as_bool()).unwrap_or(false),
-                    tracks: &tracks,
-                    secondary_sid: state.get("secondary-sid").and_then(|v| v.as_i64()),
-                    chapters: &chapters,
-                    current_chapter: state.get("chapter").and_then(|v| v.as_i64()).unwrap_or(-1),
-                    ab: (self.seek.ab.0, self.seek.ab.1),
-                    audio_devices: &audio_devices,
-                    audio_device: state
-                        .get("audio-device")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(""),
-                    hwdec_current: state
-                        .get("hwdec-current")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("no"),
-                    seek_small: self.settings.seek_small,
-                    seek_medium: self.settings.seek_medium,
-                    seek_large: self.settings.seek_large,
-                    seek_huge: self.settings.seek_huge,
-                    deinterlace: state
-                        .get("deinterlace")
-                        .map(|v| v.as_bool())
-                        .unwrap_or(false),
-                    rotation: state
-                        .get("video-rotate")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                };
-                menus::main_menu(&c)
+                let snapshot = self.menu_snapshot();
+                menus::main_menu(&self.menu_context(&snapshot))
             }
         };
         let mut menu = std::mem::take(&mut self.menu);
-        let action = menus::show(ui, &mut menu, "main-menu", &entries);
+        let action = menus::show(ui.ctx(), &mut menu, "main-menu", &entries);
         self.menu = menu;
         if let Some(action) = action {
             self.menu.close();
@@ -3276,13 +4335,272 @@ impl Player {
             self.pending.push(action);
         } else if !self.menu.is_open() {
             self.track_menu_kind = None;
-        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.menu.close();
-            self.track_menu_kind = None;
+        }
+    }
+
+    /// mpv state arrays the menu model needs; kept beside the borrowed [`MenuCtx`].
+    fn menu_snapshot(&self) -> MenuSnapshot {
+        let engine = self.engine();
+        let state = &self.state;
+        MenuSnapshot {
+            tracks: engine
+                .and_then(|e| e.get("track-list"))
+                .map(|v| v.as_array().to_vec())
+                .unwrap_or_default(),
+            chapters: state
+                .get("chapter-list")
+                .map(|v| v.as_array().to_vec())
+                .unwrap_or_default(),
+            audio_devices: engine
+                .and_then(|e| e.get("audio-device-list"))
+                .map(|v| v.as_array().to_vec())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Live menu model snapshot, shared by the right-click menu and the command palette.
+    fn menu_context<'a>(&'a self, snapshot: &'a MenuSnapshot) -> MenuCtx<'a> {
+        let state = &self.state;
+        MenuCtx {
+            has_file: self.has_file(),
+            playlist_count: self.playlist.count(),
+            recent: &self.settings.recent,
+            bookmarks: &self.settings.bookmarks,
+            repeat: &self.settings.repeat_mode,
+            loop_mode: &self.settings.loop_mode,
+            sleep_minutes: match (self.sleep_deadline, self.sleep_after_playlist) {
+                (_, true) => -1,
+                (Some(deadline), _) => ((deadline - self.now) / 60.0).ceil() as i32,
+                (None, false) => 0,
+            },
+            ytdl_quality: &self.settings.ytdl_quality,
+            video_sync: &self.settings.video_sync,
+            interpolation: self.settings.interpolation,
+            scale_profile: &self.settings.scale_profile,
+            filters: self.video_filters,
+            visualizer: &self.settings.visualizer,
+            mini_player: self.mini_player,
+            shuffle: self.settings.shuffle,
+            resume: self.settings.resume,
+            autofit: self.settings.autofit,
+            on_top: &self.settings.on_top,
+            hwdec: self.settings.hwdec,
+            sub_codepage: &self.settings.sub_codepage,
+            sub_visible: self.settings.sub_visible,
+            info_visible: self.info_visible,
+            fullscreen: self.fullscreen,
+            aspect_name: &self.aspect_name,
+            display_mode: &self.display_mode,
+            flips: self.flips,
+            normalize: self.normalize,
+            speed: state.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            mute: state.get("mute").map(|v| v.as_bool()).unwrap_or(false),
+            tracks: &snapshot.tracks,
+            secondary_sid: state.get("secondary-sid").and_then(|v| v.as_i64()),
+            chapters: &snapshot.chapters,
+            current_chapter: state.get("chapter").and_then(|v| v.as_i64()).unwrap_or(-1),
+            ab: (self.seek.ab.0, self.seek.ab.1),
+            audio_devices: &snapshot.audio_devices,
+            audio_device: state
+                .get("audio-device")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            hwdec_current: state
+                .get("hwdec-current")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no"),
+            seek_small: self.settings.seek_small,
+            seek_medium: self.settings.seek_medium,
+            seek_large: self.settings.seek_large,
+            seek_huge: self.settings.seek_huge,
+            deinterlace: state
+                .get("deinterlace")
+                .map(|v| v.as_bool())
+                .unwrap_or(false),
+            rotation: state
+                .get("video-rotate")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            can_undo_playlist: self.playlist.can_undo(),
+            can_redo_playlist: self.playlist.can_redo(),
+        }
+    }
+
+    /// The Ctrl+K command palette: a filterable, flat view over the menu tree.
+    fn show_command_palette(&mut self, ctx: &Context) {
+        if !self.palette.open {
+            return;
+        }
+        let snapshot = self.menu_snapshot();
+        let entries = menus::main_menu(&self.menu_context(&snapshot));
+        let mut flat: Vec<(String, String, Action)> = Vec::new();
+        menus::flatten_entries(&entries, "", &mut flat);
+
+        let query = self.palette.query.trim().to_lowercase();
+        let visible: Vec<(String, String, Action)> = flat
+            .into_iter()
+            .filter(|(path, _, _)| {
+                query
+                    .split_whitespace()
+                    .all(|token| path.to_lowercase().contains(token))
+            })
+            .take(PALETTE_MAX_RESULTS)
+            .collect();
+        if self.palette.selected >= visible.len() {
+            self.palette.selected = visible.len().saturating_sub(1);
+        }
+
+        let mut accept = false;
+        ctx.input(|input| {
+            if input.key_pressed(egui::Key::ArrowDown) {
+                self.palette.selected =
+                    (self.palette.selected + 1).min(visible.len().saturating_sub(1));
+            }
+            if input.key_pressed(egui::Key::ArrowUp) {
+                self.palette.selected = self.palette.selected.saturating_sub(1);
+            }
+            accept = !visible.is_empty() && input.key_pressed(egui::Key::Enter);
+        });
+
+        let colors = active_colors();
+        egui::Area::new(Id::new("command-palette"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_TOP, [0.0, 72.0])
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(colors.dialog_bg)
+                    .stroke(Stroke::new(1.0, colors.dialog_line))
+                    .corner_radius(10.0)
+                    .outer_margin(6.0)
+                    .inner_margin(8.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 2,
+                        color: colors.shadow,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(460.0);
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette.query)
+                                .hint_text(
+                                    egui::RichText::new(format!(
+                                        "{}  (Ctrl+K)",
+                                        i18n::tr("Search commands…")
+                                    ))
+                                    .color(colors.text_9a),
+                                )
+                                .desired_width(440.0)
+                                .frame(egui::Frame::NONE),
+                        );
+                        if self.palette.focused {
+                            response.request_focus();
+                            self.palette.focused = false;
+                        }
+                        ui.add_space(4.0);
+                        if visible.is_empty() {
+                            ui.label(
+                                egui::RichText::new(i18n::tr("No matching commands"))
+                                    .size(12.0)
+                                    .color(colors.text_dim),
+                            );
+                        }
+                        for (index, (path, shortcut, _)) in visible.iter().enumerate() {
+                            let selected = index == self.palette.selected;
+                            // Full-width command row: breadcrumb left, shortcut hint right.
+                            let row_w = (ui.available_width()).max(120.0);
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(row_w, 22.0), Sense::click());
+                            let resp = ui.interact(
+                                rect,
+                                Id::new("palette-row").with(index),
+                                Sense::click(),
+                            );
+                            let p = ui.painter_at(rect);
+                            if selected {
+                                p.rect_filled(
+                                    rect,
+                                    5.0,
+                                    Color32::from_rgba_unmultiplied(
+                                        colors.accent.r(),
+                                        colors.accent.g(),
+                                        colors.accent.b(),
+                                        28,
+                                    ),
+                                );
+                                // Accent marker on the active row.
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        pos2(rect.left(), rect.center().y - 7.0),
+                                        vec2(2.5, 14.0),
+                                    ),
+                                    1.0,
+                                    colors.accent,
+                                );
+                            } else if resp.hovered() {
+                                p.rect_filled(rect, 5.0, colors.menu_sel);
+                            }
+                            let path_font = skin::font(13.0, false);
+                            let short_font = skin::mono(10.0);
+                            let shortcut_w = if shortcut.is_empty() {
+                                0.0
+                            } else {
+                                skin::text_width(&p, shortcut, &short_font) + 14.0
+                            };
+                            let path_w = (rect.width() - shortcut_w - 18.0).max(40.0);
+                            let label = skin::elide(&p, path, &path_font, path_w);
+                            p.text(
+                                pos2(rect.left() + 12.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                path_font,
+                                if selected {
+                                    colors.text_bright
+                                } else {
+                                    colors.text
+                                },
+                            );
+                            if !shortcut.is_empty() {
+                                p.text(
+                                    pos2(rect.right() - 12.0, rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    shortcut,
+                                    short_font,
+                                    colors.text_dim,
+                                );
+                            }
+                            if resp.hovered() && !selected {
+                                self.palette.selected = index;
+                            }
+                            if resp.clicked() {
+                                self.palette.selected = index;
+                                accept = true;
+                            }
+                        }
+                        ui.add_space(2.0);
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(i18n::tr("↑↓ navigate · ↵ run · esc close"))
+                                .size(10.0)
+                                .color(colors.text_dim),
+                        );
+                    });
+            });
+
+        if accept && let Some((_, _, action)) = visible.get(self.palette.selected) {
+            self.pending.push(action.clone());
+            self.palette.close();
         }
     }
 
     fn handle_dialogs(&mut self, ctx: &Context) {
+        self.show_command_palette(ctx);
+        let mut actions = Vec::new();
+        self.settings_pop
+            .show(ctx, self.settings_anchor, &mut self.settings, &mut actions);
+        for action in actions {
+            self.pending.push(action);
+        }
         let duration = self.duration();
         let mut actions = Vec::new();
         self.goto_dialog.show(ctx, duration, &mut actions);
@@ -3293,6 +4611,13 @@ impl Player {
             let settings = &mut self.settings;
             self.panel.show(ctx, settings, &mut panel_actions);
             actions.extend(panel_actions);
+        }
+        {
+            let mut history_actions = Vec::new();
+            let history = self.settings.history.clone();
+            self.history_dialog
+                .show(ctx, &history, &mut history_actions);
+            actions.extend(history_actions);
         }
         self.text_dialog.show(ctx);
         for action in actions {
@@ -3319,11 +4644,16 @@ impl Player {
         if out.repeat {
             self.cycle_repeat();
         }
+        if let Some(row) = out.show_in_folder {
+            self.pending.push(Action::PlaylistShowInFolder(row));
+        }
         if out.shuffle {
             self.pending.push(Action::ToggleShuffle);
         }
         if out.changed {
+            self.sync_playlist_settings();
             self.update_title();
+            self.save_settings();
         }
     }
 }
@@ -3334,17 +4664,19 @@ impl eframe::App for Player {
         self.frame(&ctx, ui, frame);
     }
 
+    // Tears down the GL-side renderer while the context is still current.
+    #[allow(unsafe_code)]
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         self.closing = true;
         self.remember_position();
+        self.sync_playlist_settings();
         self.settings.first_run = false;
-        self.settings.save();
-        if let Some(renderer) = self.renderer.take() {
-            if let Ok(mut renderer) = renderer.lock() {
-                if let Some(gl) = gl {
-                    unsafe { renderer.shutdown(gl) };
-                }
-            }
+        self.save_settings();
+        if let Some(renderer) = self.renderer.take()
+            && let Ok(mut renderer) = renderer.lock()
+            && let Some(gl) = gl
+        {
+            unsafe { renderer.shutdown(gl) };
         }
         if let Some(mut engine) = self.engine.take() {
             engine.shutdown();
@@ -3354,30 +4686,25 @@ impl eframe::App for Player {
 
 // -- layout -------------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct Layout {
+    /// The video surface — the whole window.
     video: Rect,
-    title: Option<Rect>,
-    seek: Option<Rect>,
-    volume: Option<Rect>,
-    ctrl: Option<Rect>,
+    /// Floating bottom control bar (seek row + transport row).
+    controls: Option<Rect>,
+    /// Floating top-right actions (drawer + settings).
+    top_actions: Option<Rect>,
+    /// Playlist drawer overlay.
     playlist: Option<Rect>,
-    playlist_right: bool,
-    has_top: bool,
-    has_bottom: bool,
 }
 
 impl Default for Layout {
     fn default() -> Self {
         Self {
             video: Rect::NOTHING,
-            title: None,
-            seek: None,
-            volume: None,
-            ctrl: None,
+            controls: None,
+            top_actions: None,
             playlist: None,
-            playlist_right: false,
-            has_top: false,
-            has_bottom: false,
         }
     }
 }
@@ -3397,13 +4724,36 @@ fn screen_size(ctx: &Context) -> (f64, f64) {
     })
 }
 
-fn window_size(ctx: &Context) -> (f32, f32) {
-    let size = ctx.content_rect().size();
-    (size.x, size.y)
+/// Clamp a playback rate into the supported range and snap it to two decimals, so
+/// accumulated float noise from repeated +/- steps can never drift the displayed
+/// speed away from what mpv actually plays.
+fn normalize_speed(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 1.0;
+    }
+    (value.clamp(0.2, 12.0) * 100.0).round() / 100.0
 }
 
-fn playlist_resize_delta(allocated_width: Option<f32>, configured_width: f32) -> f32 {
-    allocated_width.unwrap_or(configured_width) + 1.0
+/// Right-cluster compaction of the transport row for a given row width.
+#[derive(Debug, Clone, Copy)]
+struct ControlCluster {
+    /// Volume slider visible at all.
+    show_volume: bool,
+    /// Width of the volume slider when visible.
+    vol_w: f32,
+    /// Subtitle/audio track buttons visible.
+    show_track_buttons: bool,
+}
+
+/// Transport geometry degrades in three steps: the volume slider narrows below
+/// 500px, the track buttons drop out below 430px, and the slider disappears
+/// below 360px — so back/play/forward/fullscreen never overlap anything.
+fn control_cluster(row_w: f32) -> ControlCluster {
+    ControlCluster {
+        show_volume: row_w >= 360.0,
+        vol_w: if row_w < 500.0 { 60.0 } else { 104.0 },
+        show_track_buttons: row_w >= 430.0,
+    }
 }
 
 fn home_dir() -> Option<String> {
@@ -3411,23 +4761,12 @@ fn home_dir() -> Option<String> {
 }
 
 fn shellexpand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return format!("{home}/{rest}");
     }
     path.to_string()
-}
-
-fn open_folder(path: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(path).spawn();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    }
 }
 
 fn media_extensions() -> Vec<String> {
@@ -3446,13 +4785,117 @@ fn sub_extensions() -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscapeTarget {
+    Menu,
+    Dialog,
+    Playlist,
+    Fullscreen,
+    None,
+}
+
+/// Escape unwinds transient UI in a fixed order: menu, dialog, list focus, fullscreen.
+fn escape_target(
+    menu_open: bool,
+    dialog_open: bool,
+    playlist_focused: bool,
+    fullscreen: bool,
+) -> EscapeTarget {
+    if menu_open {
+        EscapeTarget::Menu
+    } else if dialog_open {
+        EscapeTarget::Dialog
+    } else if playlist_focused {
+        EscapeTarget::Playlist
+    } else if fullscreen {
+        EscapeTarget::Fullscreen
+    } else {
+        EscapeTarget::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::playlist_resize_delta;
+    use super::{ControlCluster, EscapeTarget, control_cluster, escape_target, normalize_speed};
 
     #[test]
-    fn playlist_resize_uses_allocated_width_when_panel_was_clamped() {
-        assert_eq!(playlist_resize_delta(Some(325.0), 400.0), 326.0);
-        assert_eq!(playlist_resize_delta(None, 280.0), 281.0);
+    fn transport_cluster_never_overflows_narrow_rows() {
+        // back(36) + 2 + play(44) + 2 + fwd(36) on the left, then the right cluster.
+        let left = 36.0 + 2.0 + 44.0 + 2.0 + 36.0;
+        for row_w in [
+            172.0, // narrowest case: 480px window with the 292px drawer open
+            220.0, 300.0, 359.0, 360.0, 430.0, 500.0, 700.0,
+        ] {
+            let ControlCluster {
+                show_volume,
+                vol_w,
+                show_track_buttons,
+            } = control_cluster(row_w);
+            let right = 36.0 // fullscreen toggle
+                + if show_volume { vol_w } else { 0.0 }
+                + if show_track_buttons { 36.0 + 36.0 } else { 0.0 };
+            assert!(
+                left + right <= row_w,
+                "row_w={row_w}: left={left} right={right}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_only_the_topmost_transient_layer() {
+        assert_eq!(escape_target(true, true, true, true), EscapeTarget::Menu);
+        assert_eq!(escape_target(false, true, true, true), EscapeTarget::Dialog);
+        assert_eq!(
+            escape_target(false, false, true, true),
+            EscapeTarget::Playlist
+        );
+        assert_eq!(
+            escape_target(false, false, false, true),
+            EscapeTarget::Fullscreen
+        );
+        assert_eq!(
+            escape_target(false, false, false, false),
+            EscapeTarget::None
+        );
+    }
+
+    #[test]
+    fn chrome_hides_only_while_playing_without_panels() {
+        use super::CHROME_HIDE_SECS;
+        // Pure deadline arithmetic behind update_chrome()/chrome_hidden().
+        let deadline = |playing: bool, panels_open: bool, now: f64| {
+            if playing && !panels_open {
+                now + CHROME_HIDE_SECS
+            } else {
+                f64::INFINITY
+            }
+        };
+        let hidden = |now: f64, deadline: f64, playing: bool, panels_open: bool| {
+            playing && !panels_open && now >= deadline
+        };
+
+        let d = deadline(true, false, 10.0);
+        assert!(!hidden(10.5, d, true, false));
+        assert!(hidden(10.0 + CHROME_HIDE_SECS, d, true, false));
+
+        // Paused: never hides.
+        let d = deadline(false, false, 10.0);
+        assert!(!hidden(100.0, d, false, false));
+
+        // An open panel pins the chrome.
+        let d = deadline(true, true, 10.0);
+        assert!(!hidden(100.0, d, true, true));
+    }
+
+    #[test]
+    fn speed_steps_reach_fractional_rates() {
+        assert_eq!(normalize_speed(1.0), 1.0);
+        assert_eq!(normalize_speed(1.0 + 0.1), 1.1);
+        assert_eq!(normalize_speed(0.95 + 0.05), 1.0);
+        assert_eq!(normalize_speed(4.0), 4.0);
+        assert_eq!(normalize_speed(0.05), 0.2);
+        assert_eq!(normalize_speed(50.0), 12.0);
+        assert_eq!(normalize_speed(f64::NAN), 1.0);
+        assert_eq!(normalize_speed(f64::INFINITY), 1.0);
     }
 }

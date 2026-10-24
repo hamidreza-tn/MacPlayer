@@ -3,7 +3,10 @@
 //! Every constant and struct layout mirrors the mpv 0.41 headers that Homebrew ships in
 //! `/opt/homebrew/include/mpv/*.h`, which is the ABI we bind to at run time.
 
-#![allow(non_camel_case_types, non_snake_case)]
+// The module deliberately mirrors the complete mpv ABI, including entry points and
+// event constants the player does not call yet, so layout drift is caught by the
+// ABI tests instead of by a crash.
+#![allow(non_camel_case_types, non_snake_case, dead_code, unsafe_code)]
 
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 
@@ -213,10 +216,10 @@ pub struct Api {
 /// Candidate locations of `libmpv`, most preferred first.
 pub fn candidate_paths() -> Vec<String> {
     let mut paths = Vec::new();
-    if let Ok(custom) = std::env::var("MACPLAYER_LIBMPV") {
-        if !custom.is_empty() {
-            paths.push(custom);
-        }
+    if let Ok(custom) = std::env::var("MACPLAYER_LIBMPV")
+        && !custom.is_empty()
+    {
+        paths.push(custom);
     }
     // A packaged `.app` keeps its private runtime libraries in Contents/Frameworks.
     // Resolve this from the executable instead of embedding a machine-specific path.

@@ -3,14 +3,11 @@
 //! Custom MacPlayer widgets: each widget paints into a fixed rect and reports pointer
 //! interaction without relying on stock media-player controls.
 
-use std::collections::VecDeque;
 use std::time::Instant;
 
-use egui::{
-    Color32, ColorImage, CursorIcon, Id, Painter, Pos2, Rect, Sense, Stroke, TextureOptions, Ui,
-    Vec2, Widget, pos2, vec2,
-};
+use egui::{Color32, CursorIcon, Id, Painter, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 
+use crate::i18n;
 use crate::skin;
 use crate::util::fmt_time;
 
@@ -18,196 +15,39 @@ use crate::util::fmt_time;
 #[derive(Default, Clone, Copy)]
 pub struct Click {
     pub primary: bool,
-    pub secondary: bool,
-    pub double: bool,
-    pub hovered: bool,
 }
 
-impl Click {
-    pub fn any(&self) -> bool {
-        self.primary || self.secondary || self.double
-    }
-}
-
-pub const MAX_THUMBNAILS: usize = 24;
-pub const MAX_THUMBNAIL_EDGE: usize = 640;
-pub const MAX_THUMBNAIL_PIXELS: usize = 640 * 360;
-
-#[derive(Clone)]
-pub struct Thumbnail {
-    pub time: f64,
-    pub image: ColorImage,
-}
-
-impl Thumbnail {
-    pub fn new(time: f64, image: ColorImage) -> Option<Self> {
-        let pixels = image.size[0].checked_mul(image.size[1])?;
-        (time.is_finite()
-            && time >= 0.0
-            && image.size[0] > 0
-            && image.size[1] > 0
-            && image.size[0] <= MAX_THUMBNAIL_EDGE
-            && image.size[1] <= MAX_THUMBNAIL_EDGE
-            && pixels <= MAX_THUMBNAIL_PIXELS
-            && image.pixels.len() == pixels)
-            .then_some(Self { time, image })
-    }
-}
-
-pub struct ThumbnailCache {
-    entries: VecDeque<Thumbnail>,
-    capacity: usize,
-}
-
-impl Default for ThumbnailCache {
-    fn default() -> Self {
-        Self::new(MAX_THUMBNAILS)
-    }
-}
-
-impl ThumbnailCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            capacity: capacity.min(MAX_THUMBNAILS),
-        }
-    }
-
-    pub fn insert(&mut self, thumbnail: Thumbnail) -> bool {
-        let Some(pixels) = thumbnail.image.size[0].checked_mul(thumbnail.image.size[1]) else {
-            return false;
-        };
-        if thumbnail.image.size[0] == 0
-            || thumbnail.image.size[1] == 0
-            || thumbnail.image.size[0] > MAX_THUMBNAIL_EDGE
-            || thumbnail.image.size[1] > MAX_THUMBNAIL_EDGE
-            || thumbnail.image.pixels.len() > MAX_THUMBNAIL_PIXELS
-            || thumbnail.image.pixels.len() != pixels
-            || !thumbnail.time.is_finite()
-            || thumbnail.time < 0.0
-            || self.capacity == 0
-        {
-            return false;
-        }
-        self.entries.retain(|item| item.time != thumbnail.time);
-        self.entries.push_back(thumbnail);
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-        true
-    }
-
-    pub fn insert_image(&mut self, time: f64, image: ColorImage) -> bool {
-        let Some(thumbnail) = Thumbnail::new(time, image) else {
-            return false;
-        };
-        self.insert(thumbnail)
-    }
-
-    pub fn get(&self, time: f64) -> Option<&Thumbnail> {
-        self.entries.iter().find(|item| item.time == time)
-    }
-
-    pub fn nearest(&self, time: f64) -> Option<&Thumbnail> {
-        if !time.is_finite() {
-            return None;
-        }
-        self.entries.iter().min_by(|left, right| {
-            (left.time - time)
-                .abs()
-                .total_cmp(&(right.time - time).abs())
-        })
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
-
-pub struct ThumbnailPreview<'a> {
-    cache: &'a ThumbnailCache,
-    time: f64,
-    size: Vec2,
-}
-
-impl<'a> ThumbnailPreview<'a> {
-    pub fn new(cache: &'a ThumbnailCache, time: f64, size: Vec2) -> Self {
-        Self { cache, time, size }
-    }
-}
-
-impl Widget for ThumbnailPreview<'_> {
-    fn ui(self, ui: &mut Ui) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(self.size, Sense::hover());
-        paint_thumbnail_preview(ui, rect, self.cache, self.time);
-        response
-    }
-}
-
-pub fn thumbnail_preview(ui: &mut Ui, rect: Rect, cache: &ThumbnailCache, time: f64) -> bool {
-    paint_thumbnail_preview(ui, rect, cache, time)
-}
-
-fn paint_thumbnail_preview(ui: &mut Ui, rect: Rect, cache: &ThumbnailCache, time: f64) -> bool {
-    let colors = skin::active_colors();
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.video_bg);
-    let Some(thumbnail) = cache.nearest(time) else {
-        return false;
-    };
-    let texture = ui.ctx().load_texture(
-        "macplayer-thumbnail-preview",
-        thumbnail.image.clone(),
-        TextureOptions::LINEAR,
-    );
-    painter.image(
-        texture.id(),
-        rect,
-        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-    true
-}
-
-/// Icon button: a fixed-size rect with a hand-drawn glyph, hover/press background and tooltip.
+/// Icon button: a fixed rect with a hand-drawn glyph, hover/press background and tooltip.
+/// The rect is supplied per call so the same button can be laid out at any size.
 pub struct IconBtn<'a> {
     pub icon: &'a str,
-    pub w: f32,
-    pub h: f32,
     pub tip: Option<&'a str>,
     pub color: Color32,
-    pub hover_color: Color32,
     pub flat: bool,
     pub checked: bool,
     pub enabled: bool,
+    /// Extra alpha multiplier for fading floating chrome in and out.
+    pub alpha: f32,
 }
 
 impl<'a> IconBtn<'a> {
-    pub fn new(icon: &'a str, w: f32, h: f32) -> Self {
+    pub fn new(icon: &'a str) -> Self {
         let colors = skin::active_colors();
         Self {
             icon,
-            w,
-            h,
             tip: None,
             color: colors.icon,
-            hover_color: colors.icon_hover,
             flat: false,
             checked: false,
             enabled: true,
+            alpha: 1.0,
         }
+    }
+
+    /// Fade the whole button by `alpha` (0..1), for animated chrome.
+    pub fn alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha;
+        self
     }
 
     pub fn tip(mut self, tip: &'a str) -> Self {
@@ -217,11 +57,6 @@ impl<'a> IconBtn<'a> {
 
     pub fn color(mut self, color: Color32) -> Self {
         self.color = color;
-        self
-    }
-
-    pub fn hover_color(mut self, color: Color32) -> Self {
-        self.hover_color = color;
         self
     }
 
@@ -242,6 +77,8 @@ impl<'a> IconBtn<'a> {
 
     pub fn ui(self, ui: &mut Ui, id_salt: Id, rect: Rect) -> Click {
         let colors = skin::active_colors();
+        // Faded chrome: one multiplier applied to every painted color.
+        let fade = |color: Color32| color.gamma_multiply(self.alpha);
         let sense = if self.enabled {
             Sense::click()
         } else {
@@ -257,20 +94,49 @@ impl<'a> IconBtn<'a> {
         let down = response.is_pointer_button_down_on();
 
         let painter = ui.painter_at(rect);
-        let corner_radius = ui.style().visuals.widgets.inactive.corner_radius;
-        let mut bg = colors.bg;
-        if !self.flat && self.enabled {
+        let corner_radius = if self.flat { 7.0 } else { 6.0 };
+        let mut bg = if self.flat {
+            Color32::TRANSPARENT
+        } else if self.enabled {
+            colors.bg
+        } else {
+            // A different fill is the only disabled cue beyond the dimmed icon.
+            colors.base
+        };
+        if self.flat && self.checked {
+            bg = Color32::from_rgba_unmultiplied(
+                colors.accent.r(),
+                colors.accent.g(),
+                colors.accent.b(),
+                24,
+            );
+        } else if !self.flat && self.enabled {
             if down {
                 bg = colors.bg_press;
             } else if hovered {
                 bg = colors.bg_hover;
             }
         }
-        painter.rect_filled(rect, corner_radius, bg);
+        painter.rect_filled(rect, corner_radius, fade(bg));
         painter.rect_stroke(
             rect,
             corner_radius,
-            Stroke::new(1.0, colors.line),
+            Stroke::new(
+                if response.has_focus() {
+                    2.0
+                } else if self.flat {
+                    0.0
+                } else {
+                    1.0
+                },
+                fade(if response.has_focus() {
+                    colors.accent.gamma_multiply(0.85)
+                } else if self.checked {
+                    colors.accent
+                } else {
+                    colors.line
+                }),
+            ),
             egui::StrokeKind::Outside,
         );
         let color = if !self.enabled {
@@ -278,7 +144,7 @@ impl<'a> IconBtn<'a> {
         } else if self.checked {
             colors.accent
         } else if hovered {
-            self.hover_color
+            colors.icon_hover
         } else {
             self.color
         };
@@ -288,15 +154,12 @@ impl<'a> IconBtn<'a> {
             self.icon,
             center.x.round(),
             center.y.round(),
-            color,
-            bg,
+            fade(color),
+            fade(bg),
         );
 
         Click {
             primary: response.clicked(),
-            secondary: response.secondary_clicked(),
-            double: response.double_clicked(),
-            hovered,
         }
     }
 }
@@ -336,185 +199,6 @@ pub fn text_button(ui: &mut Ui, id_salt: Id, rect: Rect, text: &str) -> bool {
     response.clicked()
 }
 
-// -- title bar -----------------------------------------------------------------------------------
-
-pub struct TitleBar {
-    pub menu_hover: bool,
-    pub menu_click: Click,
-    pub buttons: [Click; 5],
-    pub drag_started: bool,
-    pub double: bool,
-}
-
-impl Default for TitleBar {
-    fn default() -> Self {
-        Self {
-            menu_hover: false,
-            menu_click: Click::default(),
-            buttons: [Click::default(); 5],
-            drag_started: false,
-            double: false,
-        }
-    }
-}
-
-/// Draw the title bar into `rect`. `press_origin` is the drag anchor from the previous frame.
-pub fn title_bar(
-    ui: &mut Ui,
-    rect: Rect,
-    title: &str,
-    app_name: &str,
-    icons: [&str; 5],
-    checked: [bool; 5],
-    press_origin: &mut Option<Pos2>,
-) -> TitleBar {
-    let colors = skin::active_colors();
-    let mut out = TitleBar::default();
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.bg);
-
-    // Keep the application controls on the left. The native window decorations
-    // are disabled, so these are the only window controls rendered by the app.
-    let controls_w = (rect.width().max(0.0)).min(skin::TITLE_BTN_W * icons.len() as f32);
-    let controls_left = rect.left();
-    let controls_right = controls_left + controls_w;
-    let button_w = if icons.is_empty() {
-        0.0
-    } else {
-        controls_w / icons.len() as f32
-    };
-    let mut x = controls_left;
-    for (index, icon) in icons.iter().enumerate() {
-        let btn_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(button_w, rect.height()));
-        let hover_color = if *icon == "close" {
-            colors.close_hover
-        } else {
-            colors.icon_hover
-        };
-        let click = IconBtn::new(icon, button_w, rect.height())
-            .color(colors.icon_dim)
-            .hover_color(hover_color)
-            .flat(true)
-            .checked(checked[index])
-            .ui(ui, ui.id().with(format!("title-btn-{index}")), btn_rect);
-        out.buttons[index] = click;
-        x += button_w;
-    }
-    if controls_w > 0.0 {
-        painter.line_segment(
-            [
-                pos2(controls_right + 5.0, rect.top()),
-                pos2(controls_right + 5.0, rect.bottom()),
-            ],
-            Stroke::new(1.0, colors.line),
-        );
-    }
-
-    // Menu button follows the window controls on the left.
-    let menu_w = {
-        let text_w = skin::text_width(&painter, app_name, &skin::font(12.0, false));
-        let preferred = skin::MENU_BTN_W.max(11.0 + text_w + 11.0 + 14.0);
-        preferred.min((rect.right() - controls_right - 1.0).max(0.0))
-    };
-    let menu_rect = Rect::from_min_size(
-        pos2(controls_right + 6.0, rect.top()),
-        vec2(menu_w, rect.height()),
-    );
-    let menu = ui.interact(menu_rect, ui.id().with("title-menu"), Sense::click());
-    let menu = menu.on_hover_text("Menu");
-    out.menu_hover = menu.hovered();
-    if menu.hovered() {
-        painter.rect_filled(menu_rect, 0.0, colors.bg_hover);
-    }
-    if menu_w > 0.0 {
-        let app_name = skin::elide(
-            &painter,
-            app_name,
-            &skin::font(12.0, false),
-            (menu_w - 25.0).max(0.0),
-        );
-        painter.text(
-            pos2(menu_rect.min.x + 11.0, rect.min.y + 15.5),
-            egui::Align2::LEFT_CENTER,
-            app_name,
-            skin::font(12.0, false),
-            if menu.hovered() {
-                colors.text_bright
-            } else {
-                colors.text
-            },
-        );
-        if menu_w >= 14.0 {
-            skin::draw_icon(
-                &painter,
-                "chevron",
-                menu_rect.right() - 14.0,
-                rect.min.y + 13.0,
-                colors.text_bright,
-                if menu.hovered() {
-                    colors.bg_hover
-                } else {
-                    colors.bg
-                },
-            );
-        }
-    }
-    out.menu_click = Click {
-        primary: menu.clicked(),
-        secondary: menu.secondary_clicked(),
-        double: false,
-        hovered: menu.hovered(),
-    };
-    painter.line_segment(
-        [
-            pos2(menu_rect.right(), rect.top()),
-            pos2(menu_rect.right(), rect.bottom()),
-        ],
-        Stroke::new(1.0, colors.line),
-    );
-
-    // Title text, elided in the middle.
-    if !title.is_empty() {
-        let title_left = menu_rect.right() + 11.0;
-        let room = rect.right() - title_left - 11.0;
-        let font_id = skin::font(12.0, false);
-        let text = skin::elide_middle(&painter, title, &font_id, room.max(0.0));
-        painter.text(
-            pos2(title_left, rect.min.y + 15.5),
-            egui::Align2::LEFT_CENTER,
-            text,
-            font_id,
-            colors.text,
-        );
-    }
-
-    // Drag / double-click on the bar itself.
-    let bar = ui.interact(
-        Rect::from_min_max(
-            pos2((menu_rect.right() + 1.0).min(rect.right()), rect.top()),
-            pos2(rect.right(), rect.bottom()),
-        ),
-        ui.id().with("title-drag"),
-        Sense::click_and_drag(),
-    );
-    if bar.drag_started_by(egui::PointerButton::Primary) {
-        *press_origin = Some(bar.interact_pointer_pos().unwrap_or(rect.center()));
-    }
-    if let Some(origin) = *press_origin {
-        if bar.dragged_by(egui::PointerButton::Primary) {
-            let delta = bar.interact_pointer_pos().unwrap_or(origin) - origin;
-            if delta.length() > 4.0 {
-                *press_origin = None;
-                out.drag_started = true;
-            }
-        } else {
-            *press_origin = None;
-        }
-    }
-    out.double = bar.double_clicked_by(egui::PointerButton::Primary);
-    out
-}
-
 // -- seek bar ------------------------------------------------------------------------------------
 
 pub struct SeekUi {
@@ -527,6 +211,8 @@ pub struct SeekUi {
     pub drag_time: f64,
     pub last_emit: Instant,
     pub hover: bool,
+    /// Leftover raw wheel distance below one step.
+    pub scroll_acc: f32,
 }
 
 impl Default for SeekUi {
@@ -541,6 +227,7 @@ impl Default for SeekUi {
             drag_time: 0.0,
             last_emit: Instant::now(),
             hover: false,
+            scroll_acc: 0.0,
         }
     }
 }
@@ -559,6 +246,7 @@ impl SeekUi {
         self.chapters.clear();
         self.ab = (None, None);
         self.dragging = false;
+        self.scroll_acc = 0.0;
     }
 
     fn span(&self, width: f32) -> (f32, f32) {
@@ -583,48 +271,93 @@ impl SeekUi {
     }
 }
 
+/// Accumulate raw `MouseWheel` events into discrete steps for stepping
+/// controls (volume, seek).
+///
+/// `smooth_scroll_delta` must not be used here: it is a low-pass filter that
+/// stays nonzero for dozens of frames after a single wheel notch, and on macOS
+/// trackpads scroll events keep arriving for the whole momentum phase after the
+/// fingers lift — so reading its sign per frame would fire a full step every
+/// frame for seconds. Raw events quantized to notches give one step per wheel
+/// notch and distance-proportional steps on a trackpad.
+fn wheel_steps(ui: &Ui, acc: &mut f32) -> i32 {
+    /// Trackpad points that add up to one step (one wheel notch).
+    const POINTS_PER_STEP: f32 = 10.0;
+    ui.input(|i| {
+        for event in &i.events {
+            if let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } = event
+            {
+                // Zoom/alt gestures belong to egui, not to stepping.
+                if modifiers.ctrl || modifiers.command || modifiers.alt {
+                    continue;
+                }
+                match unit {
+                    egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                        *acc += delta.y;
+                    }
+                    egui::MouseWheelUnit::Point => *acc += delta.y / POINTS_PER_STEP,
+                }
+            }
+        }
+    });
+    let mut steps = 0;
+    while *acc >= 1.0 {
+        steps += 1;
+        *acc -= 1.0;
+    }
+    while *acc <= -1.0 {
+        steps -= 1;
+        *acc += 1.0;
+    }
+    steps
+}
+
 pub fn seek_bar(
     ui: &mut Ui,
     rect: Rect,
     id_salt: Id,
     state: &mut SeekUi,
     now: Instant,
+    alpha: f32,
 ) -> SeekBarOut {
     let colors = skin::active_colors();
+    // Faded chrome: one multiplier applied to every painted color.
+    let fade = |color: Color32| color.gamma_multiply(alpha);
     let mut out = SeekBarOut {
         seek: None,
         hover: None,
         wheel: 0,
     };
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.bg);
+    // No opaque base fill: the bar floats over the video scrim (quiet-player chrome).
 
     let response = ui.interact(rect, id_salt, Sense::click_and_drag());
     let was_hovered = state.hover;
     state.hover = response.hovered();
     let y = (rect.height() / 2.0 - 2.0).round();
     let (left, span) = state.span(rect.width());
-    let track_rect = Rect::from_min_size(pos2(rect.left() + left, rect.top() + y), vec2(span, 4.0));
+    let track_rect = Rect::from_min_size(pos2(rect.left() + left, rect.top() + y), vec2(span, 5.0));
     if response.hovered() || response.has_focus() {
         painter.rect_filled(
             track_rect.expand(3.0),
             3.0,
-            Color32::from_rgba_unmultiplied(
+            fade(Color32::from_rgba_unmultiplied(
                 colors.focus.r(),
                 colors.focus.g(),
                 colors.focus.b(),
                 34,
-            ),
+            )),
         );
     }
-    painter.rect_filled(track_rect, 2.0, colors.line);
+    painter.rect_filled(track_rect, 3.0, fade(colors.line));
 
-    if response.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0) {
-        out.wheel = if ui.input(|i| i.smooth_scroll_delta.y) > 0.0 {
-            1
-        } else {
-            -1
-        };
+    if response.hovered() {
+        out.wheel = wheel_steps(ui, &mut state.scroll_acc);
     }
     if response.hovered() {
         if let Some(pos) = response.hover_pos() {
@@ -671,33 +404,33 @@ pub fn seek_bar(
         if let Some(cache_end) = state.cache_end.filter(|end| *end > current) {
             let x_end = state.x_of(cache_end, rect.width());
             painter.rect_filled(
-                Rect::from_min_size(pos2(rect.left() + x, rect.top() + y), vec2(x_end - x, 4.0)),
-                2.0,
-                colors.buffer,
+                Rect::from_min_size(pos2(rect.left() + x, rect.top() + y), vec2(x_end - x, 5.0)),
+                3.0,
+                fade(colors.buffer),
             );
         }
         let (a, b) = state.ab;
-        if let (Some(a), Some(b)) = (a, b) {
-            if b > a {
-                let xa = state.x_of(a, rect.width());
-                let xb = state.x_of(b, rect.width());
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        pos2(rect.left() + xa, rect.top() + y - 2.0),
-                        vec2(xb - xa, 2.0),
-                    ),
-                    0.0,
-                    colors.accent,
-                );
-            }
+        if let (Some(a), Some(b)) = (a, b)
+            && b > a
+        {
+            let xa = state.x_of(a, rect.width());
+            let xb = state.x_of(b, rect.width());
+            painter.rect_filled(
+                Rect::from_min_size(
+                    pos2(rect.left() + xa, rect.top() + y - 2.0),
+                    vec2(xb - xa, 3.0),
+                ),
+                0.0,
+                fade(colors.accent),
+            );
         }
         painter.rect_filled(
             Rect::from_min_size(
                 pos2(rect.left() + left, rect.top() + y),
-                vec2((x - left).max(0.0), 4.0),
+                vec2((x - left).max(0.0), 5.0),
             ),
-            2.0,
-            colors.accent,
+            3.0,
+            fade(colors.accent),
         );
         for chapter in &state.chapters {
             if *chapter > 0.0 && *chapter < state.duration {
@@ -705,10 +438,10 @@ pub fn seek_bar(
                 painter.rect_filled(
                     Rect::from_min_size(
                         pos2(rect.left() + cx, rect.top() + y - 2.0),
-                        vec2(2.0, 8.0),
+                        vec2(2.0, 9.0),
                     ),
                     0.0,
-                    colors.text_dim,
+                    fade(colors.text_dim),
                 );
             }
         }
@@ -717,7 +450,7 @@ pub fn seek_bar(
             painter.rect_filled(
                 Rect::from_min_size(pos2(rect.left() + px, rect.top() + y - 5.0), vec2(2.0, 6.0)),
                 0.0,
-                colors.accent,
+                fade(colors.accent),
             );
         }
         let radius = if state.hover || state.dragging {
@@ -731,7 +464,7 @@ pub fn seek_bar(
                 rect.top() + y + 1.0,
             ),
             radius,
-            colors.knob,
+            fade(colors.knob),
         );
     }
 
@@ -740,12 +473,28 @@ pub fn seek_bar(
 
 // -- volume bar ----------------------------------------------------------------------------------
 
-#[derive(Default)]
 pub struct VolumeUi {
     pub volume: i64,
+    /// Upper end of the slider (the volume-boost ceiling), percent.
+    pub max: i64,
     pub muted: bool,
     pub dragging: bool,
     pub hover_icon: bool,
+    /// Leftover raw wheel distance below one step.
+    pub scroll_acc: f32,
+}
+
+impl Default for VolumeUi {
+    fn default() -> Self {
+        Self {
+            volume: 100,
+            max: 100,
+            muted: false,
+            dragging: false,
+            hover_icon: false,
+            scroll_acc: 0.0,
+        }
+    }
 }
 
 pub struct VolumeOut {
@@ -754,15 +503,23 @@ pub struct VolumeOut {
     pub wheel: i32,
 }
 
-pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) -> VolumeOut {
+pub fn volume_bar(
+    ui: &mut Ui,
+    rect: Rect,
+    id_salt: Id,
+    state: &mut VolumeUi,
+    alpha: f32,
+) -> VolumeOut {
     let colors = skin::active_colors();
+    // Faded chrome: one multiplier applied to every painted color.
+    let fade = |color: Color32| color.gamma_multiply(alpha);
     let mut out = VolumeOut {
         volume: None,
         mute: false,
         wheel: 0,
     };
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.bg);
+    // No opaque base fill: the bar floats over the video scrim (quiet-player chrome).
     let response = ui.interact(rect, id_salt, Sense::click_and_drag());
 
     let width = rect.width().max(0.0);
@@ -776,7 +533,7 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     if hover_icon != state.hover_icon {
         state.hover_icon = hover_icon;
     }
-    let response = response.on_hover_text(format!("Volume: {}%", state.volume));
+    let response = response.on_hover_text(format!("{}: {}%", i18n::tr("Volume"), state.volume));
 
     let y = (rect.height() / 2.0 - 2.0).round();
     let icon = if state.muted || state.volume == 0 {
@@ -786,36 +543,37 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     } else {
         "volume"
     };
+    let max = state.max.max(1) as f32;
     skin::draw_icon(
         &painter,
         icon,
         rect.left() + (width * 0.11).min(11.0),
         rect.center().y,
-        if state.hover_icon {
+        fade(if state.hover_icon {
             colors.icon_hover
         } else {
             colors.icon_dim
-        },
-        colors.bg,
+        }),
+        fade(colors.panel),
     );
-    let knob_x = knob_x0 + (knob_x1 - knob_x0) * state.volume as f32 / 100.0;
+    let knob_x = knob_x0 + (knob_x1 - knob_x0) * state.volume as f32 / max;
     let track_rect = Rect::from_min_size(
         pos2(rect.left() + line_x0, rect.top() + y),
-        vec2((line_x1 - line_x0).max(0.0), 4.0),
+        vec2((line_x1 - line_x0).max(0.0), 5.0),
     );
     if response.hovered() || response.has_focus() {
         painter.rect_filled(
             track_rect.expand(3.0),
             3.0,
-            Color32::from_rgba_unmultiplied(
+            fade(Color32::from_rgba_unmultiplied(
                 colors.focus.r(),
                 colors.focus.g(),
                 colors.focus.b(),
                 30,
-            ),
+            )),
         );
     }
-    painter.rect_filled(track_rect, 2.0, colors.line);
+    painter.rect_filled(track_rect, 3.0, fade(colors.line));
     let fill = if state.muted {
         colors.text_dim
     } else {
@@ -824,10 +582,10 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     painter.rect_filled(
         Rect::from_min_size(
             pos2(rect.left() + line_x0, rect.top() + y),
-            vec2((knob_x - line_x0).max(0.0), 4.0),
+            vec2((knob_x - line_x0).max(0.0), 5.0),
         ),
-        2.0,
-        fill,
+        3.0,
+        fade(fill),
     );
     painter.circle_filled(
         pos2(rect.left() + knob_x, rect.top() + y + 1.0),
@@ -836,15 +594,11 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
         } else {
             4.5
         },
-        colors.knob,
+        fade(colors.knob),
     );
 
-    if response.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0) {
-        out.wheel = if ui.input(|i| i.smooth_scroll_delta.y) > 0.0 {
-            1
-        } else {
-            -1
-        };
+    if response.hovered() {
+        out.wheel = wheel_steps(ui, &mut state.scroll_acc);
     }
     if !state.dragging && ui.input(|i| i.pointer.primary_pressed()) && response.hovered() {
         let pos = response.interact_pointer_pos().unwrap_or(rect.center());
@@ -852,13 +606,13 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
             out.mute = true;
         } else {
             state.dragging = true;
-            out.volume = Some(volume_at(pos.x - rect.left(), knob_x0, knob_x1));
+            out.volume = Some(volume_at(pos.x - rect.left(), knob_x0, knob_x1, state.max));
         }
     }
     if state.dragging {
         if let Some(pos) = response.interact_pointer_pos() {
             if ui.input(|i| i.pointer.primary_down()) {
-                out.volume = Some(volume_at(pos.x - rect.left(), knob_x0, knob_x1));
+                out.volume = Some(volume_at(pos.x - rect.left(), knob_x0, knob_x1, state.max));
             } else {
                 state.dragging = false;
             }
@@ -869,146 +623,37 @@ pub fn volume_bar(ui: &mut Ui, rect: Rect, id_salt: Id, state: &mut VolumeUi) ->
     out
 }
 
-fn volume_at(x: f32, knob_x0: f32, knob_x1: f32) -> i64 {
+fn volume_at(x: f32, knob_x0: f32, knob_x1: f32, max: i64) -> i64 {
     if knob_x1 <= knob_x0 {
-        return if x >= knob_x1 { 100 } else { 0 };
+        return if x >= knob_x1 { max } else { 0 };
     }
     let frac = (x - knob_x0) / (knob_x1 - knob_x0);
-    ((frac.clamp(0.0, 1.0) * 100.0).round()) as i64
-}
-
-// -- time label ----------------------------------------------------------------------------------
-
-/// Width the time label wants for the given text parts.
-pub fn time_label_width(painter: &Painter, left: &str, right: &str) -> f32 {
-    skin::text_width(painter, left, &skin::font(11.0, false))
-        + skin::text_width(painter, right, &skin::font(11.0, false))
-        + 3.0
-}
-
-pub fn time_label(ui: &mut Ui, rect: Rect, id_salt: Id, left: &str, right: &str) -> bool {
-    let colors = skin::active_colors();
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.bg);
-    let mut font_id = skin::font(11.0, false);
-    let available = rect.width().max(0.0);
-    let mut left_text = left.to_string();
-    let mut right_text = right.to_string();
-    for size in [10.0, 9.0] {
-        let total = skin::text_width(&painter, &left_text, &font_id)
-            + skin::text_width(&painter, &right_text, &font_id)
-            + 3.0;
-        if total <= available {
-            break;
-        }
-        font_id = skin::font(size, false);
-    }
-    let left_width = skin::text_width(&painter, &left_text, &font_id);
-    let right_width = skin::text_width(&painter, &right_text, &font_id);
-    if left_width + right_width + 3.0 > available {
-        let left_room = (available - 3.0).max(0.0);
-        left_text = skin::elide(&painter, &left_text, &font_id, left_room);
-        right_text.clear();
-    }
-    let center_y = rect.center().y + 1.0;
-    let painter = painter.with_clip_rect(rect);
-    painter.text(
-        pos2(rect.left(), center_y),
-        egui::Align2::LEFT_CENTER,
-        left_text.as_str(),
-        font_id.clone(),
-        colors.text_bright,
-    );
-    if !right_text.is_empty() {
-        let offset = skin::text_width(&painter, left_text.as_str(), &font_id) + 3.0;
-        painter.text(
-            pos2(rect.left() + offset, center_y),
-            egui::Align2::LEFT_CENTER,
-            right_text.as_str(),
-            font_id,
-            colors.text_dim,
-        );
-    }
-    let response = ui.interact(rect, id_salt, Sense::click());
-    let response = response.on_hover_text("Click to switch between elapsed and remaining time");
-    response.clicked()
-}
-
-// -- info badges ---------------------------------------------------------------------------------
-
-pub struct Badge {
-    pub text: String,
-    pub on: bool,
-}
-
-pub fn info_badges(ui: &mut Ui, rect: Rect, badges: &[Badge]) {
-    if badges.is_empty() {
-        return;
-    }
-    let colors = skin::active_colors();
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.bg);
-    let font_id = skin::font(10.0, false);
-    let mut x = rect.left();
-    for badge in badges {
-        let w = skin::text_width(&painter, &badge.text, &font_id);
-        if x + w > rect.right() {
-            break;
-        }
-        painter.text(
-            pos2(x, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            badge.text.clone(),
-            font_id.clone(),
-            if badge.on {
-                colors.accent
-            } else {
-                colors.text_dim
-            },
-        );
-        x += w + 12.0;
-    }
-}
-
-// -- seek bubble ---------------------------------------------------------------------------------
-
-pub fn seek_bubble(ui: &mut Ui, area: Rect, text: &str) {
-    let colors = skin::active_colors();
-    let font_id = skin::font(11.0, false);
-    let painter = ui.painter();
-    let w = skin::text_width(painter, text, &font_id) + 14.0;
-    let h = 20.0;
-    let pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(area.center());
-    let x = (pos.x - w / 2.0).clamp(area.left() + 2.0, area.right() - w - 2.0);
-    let rect = Rect::from_min_size(pos2(x, area.top() - h), vec2(w, h));
-    let painter = ui.painter_at(rect);
-    let corner_radius = ui.style().visuals.menu_corner_radius;
-    painter.rect_filled(rect, corner_radius, colors.dialog_line);
-    painter.rect_filled(rect.shrink(1.0), corner_radius, colors.dialog_bg);
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        font_id,
-        colors.text_bright,
-    );
+    ((frac.clamp(0.0, 1.0) * max as f32).round()) as i64
 }
 
 // -- on-screen display ----------------------------------------------------------------------------
 
+/// Semantic color of an OSD message; resolved against the active theme at paint time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OsdTone {
+    #[default]
+    Normal,
+    Danger,
+}
+
 #[derive(Default)]
 pub struct Osd {
     pub message: String,
-    pub message_color: Color32,
+    pub message_tone: OsdTone,
     pub message_until: Option<Instant>,
     pub info: String,
     pub center: String,
 }
 
 impl Osd {
-    pub fn show_message(&mut self, text: impl Into<String>, ms: u64, color: Color32) {
+    pub fn show_message(&mut self, text: impl Into<String>, ms: u64, tone: OsdTone) {
         self.message = text.into();
-        self.message_color = color;
+        self.message_tone = tone;
         self.message_until = Some(Instant::now() + std::time::Duration::from_millis(ms));
     }
 
@@ -1018,10 +663,10 @@ impl Osd {
     }
 
     pub fn tick(&mut self) {
-        if let Some(until) = self.message_until {
-            if Instant::now() >= until {
-                self.clear_message();
-            }
+        if let Some(until) = self.message_until
+            && Instant::now() >= until
+        {
+            self.clear_message();
         }
     }
 
@@ -1032,31 +677,70 @@ impl Osd {
         let colors = skin::active_colors();
         let painter = ui.painter_at(rect);
         let size = (15.0f32).max((30.0f32).min(rect.height() / 22.0));
+        // The message box fades out over its last 300 ms instead of vanishing.
+        let message_alpha = self
+            .message_until
+            .map(|until| {
+                let remaining = until
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f32();
+                (remaining / 0.3).clamp(0.0, 1.0)
+            })
+            .unwrap_or(1.0);
         let mut y = rect.top() + 8.0;
         if !self.message.is_empty() {
+            let fade = |color: Color32| color.gamma_multiply(message_alpha);
             let font_id = skin::font(size, true);
-            let classic = skin::ThemeColors::classic();
-            let message_color = if self.message_color == classic.danger {
-                colors.danger
-            } else if self.message_color == classic.text_e4 {
-                colors.text_e4
-            } else {
-                self.message_color
+            let message_color = match self.message_tone {
+                OsdTone::Normal => colors.text_e4,
+                OsdTone::Danger => colors.danger,
             };
-            outlined_text(
-                &painter,
-                pos2(rect.left() + 12.0, y),
-                &self.message,
-                &font_id,
-                message_color,
-            );
             let line = size * 1.35;
-            y += line * (self.message.matches('\n').count() as f32 + 1.0) + 6.0;
+            // Long error messages must not overflow the window; elide to the
+            // available width instead of growing the box past the video.
+            let max_line_width = (rect.width() - 40.0).max(60.0);
+            let lines: Vec<String> = self
+                .message
+                .split('\n')
+                .map(|l| skin::elide(&painter, l, &font_id, max_line_width))
+                .collect();
+            let w = lines
+                .iter()
+                .map(|l| skin::text_width(&painter, l, &font_id))
+                .fold(0.0f32, f32::max)
+                + 20.0;
+            let h = line * lines.len() as f32 + 12.0;
+            let box_rect = Rect::from_min_size(pos2(rect.left() + 10.0, y), vec2(w, h));
+            painter.rect_filled(box_rect, 8.0, fade(colors.panel));
+            painter.rect_stroke(
+                box_rect,
+                8.0,
+                Stroke::new(1.0, fade(colors.dialog_line)),
+                egui::StrokeKind::Outside,
+            );
+            for (index, text) in lines.iter().enumerate() {
+                painter.text(
+                    pos2(
+                        box_rect.left() + 10.0,
+                        box_rect.top() + 6.0 + line * index as f32,
+                    ),
+                    egui::Align2::LEFT_TOP,
+                    text.as_str(),
+                    font_id.clone(),
+                    fade(message_color),
+                );
+            }
+            y += h + 6.0;
         }
         if !self.info.is_empty() {
             let font_id = skin::mono((size * 0.62).max(11.0));
             let line = font_id.size * 1.35;
-            let lines: Vec<&str> = self.info.split('\n').collect();
+            let max_line_width = (rect.width() - 40.0).max(60.0);
+            let lines: Vec<String> = self
+                .info
+                .split('\n')
+                .map(|l| skin::elide(&painter, l, &font_id, max_line_width))
+                .collect();
             let w = lines
                 .iter()
                 .map(|l| skin::text_width(&painter, l, &font_id))
@@ -1082,7 +766,7 @@ impl Osd {
                         box_rect.top() + 7.0 + line * index as f32,
                     ),
                     egui::Align2::LEFT_TOP,
-                    *text,
+                    text.as_str(),
                     font_id.clone(),
                     colors.text_e4,
                 );
@@ -1129,55 +813,6 @@ pub fn outlined_text(
     painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), color);
 }
 
-// -- idle logo -----------------------------------------------------------------------------------
-
-pub fn paint_logo(ui: &mut Ui, rect: Rect, audio_title: &str) {
-    let colors = skin::active_colors();
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.video_bg);
-    let scale = 0.35f32.max(1.0f32.min((rect.width() / 400.0).min(rect.height() / 150.0)));
-    skin::draw_logo(
-        &painter,
-        rect.center().x,
-        rect.center().y,
-        scale,
-        "MacPlayer",
-    );
-    let hint = if audio_title.is_empty() {
-        Some("Drop a media file here  •  Click to open  •  Ctrl+O")
-    } else {
-        None
-    };
-    if let Some(hint) = hint {
-        let font_id = skin::font(12.0, false);
-        painter.text(
-            pos2(rect.center().x, rect.bottom() - 24.0),
-            egui::Align2::CENTER_CENTER,
-            hint,
-            font_id,
-            colors.text_dim,
-        );
-    } else if !audio_title.is_empty() {
-        let font_id = skin::font(13.0, false);
-        let text = skin::elide(
-            &painter,
-            audio_title,
-            &font_id,
-            (rect.width() - 20.0).max(0.0),
-        );
-        painter.text(
-            pos2(
-                rect.center().x,
-                rect.top() + rect.height() / 2.0 + 44.0 * scale,
-            ),
-            egui::Align2::CENTER_TOP,
-            text,
-            font_id,
-            colors.text_dim,
-        );
-    }
-}
-
 /// Hide the cursor while the pointer sits still over a playing video.
 pub fn apply_cursor(ctx: &egui::Context, hidden: bool) {
     ctx.set_cursor_icon(if hidden {
@@ -1185,10 +820,6 @@ pub fn apply_cursor(ctx: &egui::Context, hidden: bool) {
     } else {
         CursorIcon::Default
     });
-}
-
-pub fn vec_to_pos(v: Vec2) -> Pos2 {
-    pos2(v.x, v.y)
 }
 
 pub fn fmt_pair(position: f64, duration: f64) -> (String, String) {
@@ -1199,39 +830,12 @@ pub fn fmt_pair(position: f64, duration: f64) -> (String, String) {
 mod tests {
     use super::*;
 
-    fn image(width: usize, height: usize) -> ColorImage {
-        ColorImage::filled([width, height], Color32::WHITE)
-    }
-
-    #[test]
-    fn thumbnail_cache_is_bounded_and_replaces_same_time() {
-        let mut cache = ThumbnailCache::new(2);
-        assert!(cache.insert_image(1.0, image(2, 2)));
-        assert!(cache.insert_image(1.0, image(3, 2)));
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get(1.0).unwrap().image.size, [3, 2]);
-        assert!(cache.insert_image(2.0, image(2, 2)));
-        assert!(cache.insert_image(3.0, image(2, 2)));
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(1.0).is_none());
-        assert_eq!(cache.nearest(2.2).unwrap().time, 2.0);
-    }
-
-    #[test]
-    fn thumbnail_cache_rejects_oversized_images_and_invalid_times() {
-        let mut cache = ThumbnailCache::default();
-        assert!(!cache.insert_image(f64::NAN, image(2, 2)));
-        assert!(!cache.insert_image(
-            1.0,
-            ColorImage::filled([MAX_THUMBNAIL_EDGE, MAX_THUMBNAIL_EDGE], Color32::WHITE),
-        ));
-        assert!(cache.is_empty());
-    }
-
     #[test]
     fn seek_geometry_handles_empty_or_invalid_ranges() {
-        let mut seek = SeekUi::default();
-        seek.duration = 120.0;
+        let mut seek = SeekUi {
+            duration: 120.0,
+            ..Default::default()
+        };
         assert_eq!(seek.time_at(10.0, 0.0), 0.0);
         assert_eq!(seek.x_of(30.0, 0.0), 0.0);
 

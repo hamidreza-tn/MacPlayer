@@ -5,7 +5,7 @@
 //! onto the framebuffer egui is drawing into. egui does not restore framebuffer bindings
 //! or the viewport after a paint callback, so both are saved and restored here.
 
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, unsafe_code)]
 
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -137,6 +137,8 @@ pub struct Renderer {
     frame_available: Arc<AtomicBool>,
     /// Kept alive because the update callback holds a raw pointer to it.
     _repaint_hook: Box<RepaintHook>,
+    /// Last reported GL error; a persistent failure only logs once.
+    last_error: String,
     gl_ptr: usize,
 }
 
@@ -176,13 +178,38 @@ impl Renderer {
             fbo_height: 0,
             frame_available,
             _repaint_hook: hook,
+            last_error: String::new(),
             gl_ptr: 0,
         }
+    }
+
+    /// `true` when `message` differs from the previously reported error, so a
+    /// persistent GL failure does not flood the log once per frame. A successful
+    /// render clears the memory, letting a recurring failure log again.
+    pub fn error_changed(&mut self, message: &str) -> bool {
+        if self.last_error == message {
+            false
+        } else {
+            self.last_error = message.to_string();
+            true
+        }
+    }
+
+    /// Forget the last error after a successful frame.
+    pub fn note_ok(&mut self) {
+        self.last_error.clear();
     }
 
     /// `true` when mpv signalled that a new frame (or a reconfiguration) is ready.
     pub fn take_frame_available(&self) -> bool {
         self.frame_available.swap(false, Ordering::AcqRel)
+    }
+
+    /// Ask for one more render pass even without an mpv update signal. Used when the
+    /// player goes idle: without it the last decoded frame stays visible in the FBO
+    /// forever, bleeding under the idle screen.
+    pub fn request_render(&self) {
+        self.frame_available.store(true, Ordering::Release);
     }
 
     /// Create the render context. Must run on the thread that owns the GL context.
@@ -202,12 +229,12 @@ impl Renderer {
         self.gl_ptr = gl_ptr;
 
         let mut init = mpv_opengl_init_params {
-            get_proc_address: get_proc_address,
+            get_proc_address,
             get_proc_address_ctx: std::ptr::null_mut(),
         };
         // The constant is a pre-terminated byte string ("opengl\0"), so CStr is the right tool.
-        let api_type =
-            CStr::from_bytes_with_nul(MPV_RENDER_API_TYPE_OPENGL).expect("static NUL-terminated");
+        let api_type = CStr::from_bytes_with_nul(MPV_RENDER_API_TYPE_OPENGL)
+            .map_err(|_| "invalid mpv OpenGL API name".to_string())?;
         let params = [
             mpv_render_param {
                 type_: MPV_RENDER_PARAM_API_TYPE,

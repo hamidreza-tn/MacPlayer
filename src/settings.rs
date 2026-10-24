@@ -13,6 +13,13 @@ use serde_json::Value as Json;
 pub const MAX_BOOKMARKS: usize = 100;
 pub const MAX_BOOKMARK_PATH_LEN: usize = 4096;
 pub const MAX_BOOKMARK_TITLE_LEN: usize = 512;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+/// Upper bound for a stored fullscreen monitor index; the UI offers 0..=8.
+const MAX_FULLSCREEN_MONITOR: usize = 64;
+
+fn default_schema_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bookmark {
     pub path: String,
@@ -26,7 +33,36 @@ pub struct TrackPreference {
     pub audio: i64,
     pub subtitle: i64,
     pub secondary_subtitle: i64,
+    /// Last manually chosen aspect ratio (label + mpv value); restored on load.
+    #[serde(default = "default_aspect_label")]
+    pub aspect_label: String,
+    #[serde(default = "default_aspect_value")]
+    pub aspect_value: String,
+    /// Last playback speed; `0.0` means "never set, do not restore".
+    #[serde(default)]
+    pub speed: f64,
 }
+
+fn default_aspect_label() -> String {
+    "Default".into()
+}
+
+fn default_aspect_value() -> String {
+    "-1".into()
+}
+
+/// One watched-file entry, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub path: String,
+    pub title: String,
+    pub position: f64,
+    pub duration: f64,
+    /// Unix seconds of when the file was (last) opened.
+    pub played_at: i64,
+}
+
+pub const MAX_HISTORY: usize = 500;
 
 impl Bookmark {
     pub fn new(path: impl Into<String>, time: f64, title: impl Into<String>) -> Option<Self> {
@@ -46,6 +82,9 @@ impl Bookmark {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Version of the persisted settings schema. Older files are migrated on load.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub volume: i64,
     pub mute: bool,
     pub window_w: f64,
@@ -84,6 +123,8 @@ pub struct Settings {
     pub last_dir: String,
     pub last_sub_dir: String,
     pub recent: Vec<String>,
+    pub playlist_paths: Vec<String>,
+    pub playlist_current: Option<String>,
     pub bookmarks: Vec<Bookmark>,
     pub track_preferences: Vec<TrackPreference>,
     /// Resume positions, kept in insertion order so eviction drops the oldest entry
@@ -96,11 +137,65 @@ pub struct Settings {
     pub hdr_tone_mapping: bool,
     pub hdr_tone_mapping_mode: String,
     pub fullscreen_monitor: usize,
+    /// UI appearance: "dark" or "light".
+    pub theme: String,
+    /// Accent color id: "gold", "blue", "green", "rose" or "graphite".
+    pub accent: String,
+    /// UI language: "en" or "fa".
+    pub language: String,
+    /// Upper bound of the volume slider, percent (100 = no boost, up to 200).
+    pub volume_max: i64,
+    /// "none" | "file" | "playlist" — mpv loop-file / loop-playlist.
+    pub loop_mode: String,
+    /// Keep the audio pitch when changing playback speed (mpv scaletempo).
+    pub audio_pitch_correction: bool,
+    /// Comma list of bitstream formats passed to the output device
+    /// (ac3,dts,eac3,truehd); empty = no passthrough.
+    pub audio_spdif: String,
+    /// Hold the audio device exclusively while playing.
+    pub audio_exclusive: bool,
+    /// "auto" | "stereo" | "reverse" | "5.1" | "7.1".
+    pub audio_channels: String,
+    /// "auto" | "audio" | "display-resync" | "display-desync".
+    pub video_sync: String,
+    /// Interpolate frames when resyncing to the display.
+    pub interpolation: bool,
+    /// "bilinear" | "bicubic" | "spline36" | "lanczos" | "ewa_lanczossharp".
+    pub scale_profile: String,
+    /// Stream cache seconds; 0 keeps mpv's automatic sizing.
+    pub cache_secs: i64,
+    /// Demuxer cache in MiB; 0 keeps mpv's automatic sizing.
+    pub demuxer_max_mb: i64,
+    /// User-Agent for HTTP(S) streams.
+    pub http_user_agent: String,
+    /// Extra HTTP headers, one `Key: Value` per line.
+    pub http_headers: String,
+    /// Preferred yt-dlp quality: best|2160|1440|1080|720|480|360|audio.
+    pub ytdl_quality: String,
+    /// Subtitle text color, "#RRGGBB".
+    pub sub_color: String,
+    /// Subtitle border width in pixels.
+    pub sub_border_size: f64,
+    /// Subtitle border color, "#RRGGBB".
+    pub sub_border_color: String,
+    /// Subtitle shadow offset; 0 disables the shadow.
+    pub sub_shadow_offset: f64,
+    /// Draw a box behind subtitles.
+    pub sub_back_enable: bool,
+    /// Subtitle background color, "#RRGGBB".
+    pub sub_back_color: String,
+    /// Audio visualizer for music files: "off" | "wave" | "spectrum".
+    pub visualizer: String,
+    /// Start the visualizer automatically for audio-only files.
+    pub auto_visualizer: bool,
+    /// Watched-file history, newest first.
+    pub history: Vec<HistoryEntry>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
             volume: 100,
             mute: false,
             window_w: 1100.0,
@@ -135,6 +230,8 @@ impl Default for Settings {
             last_dir: String::new(),
             last_sub_dir: String::new(),
             recent: Vec::new(),
+            playlist_paths: Vec::new(),
+            playlist_current: None,
             bookmarks: Vec::new(),
             track_preferences: Vec::new(),
             positions: Vec::new(),
@@ -144,6 +241,32 @@ impl Default for Settings {
             hdr_tone_mapping: false,
             hdr_tone_mapping_mode: "bt.2390".into(),
             fullscreen_monitor: 0,
+            theme: "dark".into(),
+            accent: "gold".into(),
+            language: "en".into(),
+            volume_max: 100,
+            loop_mode: "none".into(),
+            audio_pitch_correction: true,
+            audio_spdif: String::new(),
+            audio_exclusive: false,
+            audio_channels: "auto".into(),
+            video_sync: "auto".into(),
+            interpolation: false,
+            scale_profile: "bilinear".into(),
+            cache_secs: 0,
+            demuxer_max_mb: 0,
+            http_user_agent: String::new(),
+            http_headers: String::new(),
+            ytdl_quality: "best".into(),
+            sub_color: "#ffffff".into(),
+            sub_border_size: 3.0,
+            sub_border_color: "#000000".into(),
+            sub_shadow_offset: 0.0,
+            sub_back_enable: false,
+            sub_back_color: "#000000".into(),
+            visualizer: "off".into(),
+            auto_visualizer: true,
+            history: Vec::new(),
         }
     }
 }
@@ -208,45 +331,61 @@ impl Settings {
         {
             map.insert("repeat".into(), value);
         }
-        let Ok(mut current) = serde_json::to_value(Self::default()) else {
+        // Fast path: overlay everything at once. Only a file that fails to
+        // deserialize as a whole pays for the per-key pass below.
+        if let Some(merged) = Self::try_merge(&map) {
+            *self = merged;
+            self.normalize();
             return;
+        }
+        let mut current = match serde_json::to_value(Self::default()) {
+            Ok(Json::Object(existing)) => existing,
+            _ => return,
         };
-        if let Json::Object(existing) = &mut current {
-            for (key, value) in map {
-                let previous = existing.insert(key.clone(), value);
-                if serde_json::from_value::<Settings>(Json::Object(existing.clone())).is_err() {
-                    if let Some(previous) = previous {
-                        existing.insert(key, previous);
-                    } else {
-                        existing.remove(&key);
-                    }
+        for (key, value) in map {
+            let previous = current.insert(key.clone(), value);
+            if serde_json::from_value::<Settings>(Json::Object(current.clone())).is_err() {
+                if let Some(previous) = previous {
+                    current.insert(key, previous);
+                } else {
+                    current.remove(&key);
                 }
             }
         }
-        if let Ok(loaded) = serde_json::from_value::<Settings>(current) {
+        if let Ok(loaded) = serde_json::from_value::<Settings>(Json::Object(current)) {
             *self = loaded;
         }
         self.normalize();
     }
 
-    pub fn save(&self) {
-        self.save_to(&config_file());
+    /// One-shot overlay of `map` on the defaults; `None` when the result does
+    /// not deserialize (the caller then falls back to per-key reconciliation).
+    fn try_merge(map: &serde_json::Map<String, Json>) -> Option<Settings> {
+        let mut current = serde_json::to_value(Self::default()).ok()?;
+        if let Json::Object(existing) = &mut current {
+            for (key, value) in map {
+                existing.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::from_value::<Settings>(current).ok()
     }
 
-    pub fn save_to(&self, path: &Path) {
+    pub fn try_save(&self) -> Result<(), String> {
+        self.try_save_to(&config_file())
+    }
+
+    pub fn try_save_to(&self, path: &Path) -> Result<(), String> {
         let mut saved = self.clone();
         saved.normalize();
-        let Ok(text) = serde_json::to_string_pretty(&saved) else {
-            return;
-        };
+        let text = serde_json::to_string_pretty(&saved)
+            .map_err(|error| format!("could not encode settings: {error}"))?;
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let dir = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        if fs::create_dir_all(dir).is_err() {
-            return;
-        }
+        fs::create_dir_all(dir)
+            .map_err(|error| format!("could not create settings directory: {error}"))?;
         let (tmp, mut file) = loop {
             let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let candidate = dir.join(format!(".settings-{}-{id}.tmp", std::process::id()));
@@ -257,17 +396,29 @@ impl Settings {
             {
                 Ok(file) => break (candidate, file),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return,
+                Err(error) => {
+                    return Err(format!("could not create temporary settings file: {error}"));
+                }
             }
         };
-        if file.write_all(text.as_bytes()).is_err() || file.sync_all().is_err() {
+        if let Err(error) = file
+            .write_all(text.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
             let _ = fs::remove_file(&tmp);
-            return;
+            return Err(format!("could not write settings: {error}"));
         }
         drop(file);
-        if fs::rename(&tmp, path).is_err() {
+        if let Err(error) = fs::rename(&tmp, path) {
             let _ = fs::remove_file(&tmp);
+            return Err(format!("could not replace settings file: {error}"));
         }
+        // Sync the directory entry too, so a crash right after the rename cannot
+        // leave the new settings file unrecorded on disk.
+        if let Ok(dir_file) = fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
     }
 
     // -- recent files and resume positions ------------------------------------------------------
@@ -316,12 +467,80 @@ impl Settings {
         before != self.bookmarks.len()
     }
 
-    pub fn bookmarks_for(&self, path: &str) -> impl Iterator<Item = &Bookmark> {
-        self.bookmarks.iter().filter(move |item| item.path == path)
+    pub fn add_history(&mut self, path: &str, title: &str) {
+        if path.is_empty() {
+            return;
+        }
+        self.history.retain(|entry| entry.path != path);
+        self.history.insert(
+            0,
+            HistoryEntry {
+                path: path.to_string(),
+                title: title_of_file(title),
+                position: 0.0,
+                duration: 0.0,
+                played_at: unix_now(),
+            },
+        );
+        self.history.truncate(MAX_HISTORY);
+    }
+
+    /// Refresh the position/duration of the newest entry for `path`.
+    pub fn update_history(&mut self, path: &str, position: f64, duration: f64) {
+        if let Some(entry) = self.history.iter_mut().find(|entry| entry.path == path) {
+            if position.is_finite() {
+                entry.position = position.max(0.0);
+            }
+            if duration.is_finite() && duration > 0.0 {
+                entry.duration = duration;
+            }
+        }
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
     }
 
     pub fn track_preference(&self, path: &str) -> Option<&TrackPreference> {
         self.track_preferences.iter().find(|item| item.path == path)
+    }
+
+    /// Patch the aspect/speed part of a file's preference, creating the entry
+    /// (with neutral track codes) when it does not exist yet.
+    pub fn set_media_preference(
+        &mut self,
+        path: &str,
+        aspect_label: &str,
+        aspect_value: &str,
+        speed: f64,
+    ) {
+        if path.is_empty() {
+            return;
+        }
+        let mut entry = self
+            .track_preferences
+            .iter()
+            .find(|item| item.path == path)
+            .cloned()
+            .unwrap_or(TrackPreference {
+                path: path.to_string(),
+                audio: -2,
+                subtitle: -2,
+                secondary_subtitle: -1,
+                aspect_label: default_aspect_label(),
+                aspect_value: default_aspect_value(),
+                speed: 0.0,
+            });
+        entry.aspect_label = aspect_label.to_string();
+        entry.aspect_value = aspect_value.to_string();
+        if speed.is_finite() && speed > 0.0 {
+            entry.speed = speed;
+        }
+        self.track_preferences.retain(|item| item.path != path);
+        self.track_preferences.push(entry);
+        while self.track_preferences.len() > 300 {
+            self.track_preferences.remove(0);
+        }
     }
 
     pub fn set_track_preference(
@@ -334,12 +553,30 @@ impl Settings {
         if path.is_empty() {
             return;
         }
+        // Preserve the aspect/speed part of an existing entry while replacing
+        // the track selection.
+        let media = self
+            .track_preferences
+            .iter()
+            .find(|item| item.path == path)
+            .map(|item| {
+                (
+                    item.aspect_label.clone(),
+                    item.aspect_value.clone(),
+                    item.speed,
+                )
+            });
+        let (aspect_label, aspect_value, speed) =
+            media.unwrap_or_else(|| (default_aspect_label(), default_aspect_value(), 0.0));
         self.track_preferences.retain(|item| item.path != path);
         self.track_preferences.push(TrackPreference {
             path: path.to_string(),
             audio,
             subtitle,
             secondary_subtitle,
+            aspect_label,
+            aspect_value,
+            speed,
         });
         while self.track_preferences.len() > 300 {
             self.track_preferences.remove(0);
@@ -347,9 +584,10 @@ impl Settings {
     }
 
     fn normalize(&mut self) {
+        self.schema_version = SETTINGS_SCHEMA_VERSION;
         self.volume = self.volume.clamp(0, 100);
-        self.window_w = sane_float(self.window_w, 806.0, 320.0, 10000.0);
-        self.window_h = sane_float(self.window_h, 546.0, 200.0, 10000.0);
+        self.window_w = sane_float(self.window_w, 1100.0, 320.0, 10000.0);
+        self.window_h = sane_float(self.window_h, 680.0, 200.0, 10000.0);
         self.window_x = self.window_x.filter(|value| value.is_finite());
         self.window_y = self.window_y.filter(|value| value.is_finite());
         self.playlist_width = sane_float(self.playlist_width, 280.0, 160.0, 1000.0);
@@ -366,7 +604,7 @@ impl Settings {
         self.seek_huge = sane_float(self.seek_huge, 300.0, 0.1, 3600.0);
         self.volume_step = sane_float(self.volume_step, 5.0, 1.0, 20.0);
         self.sub_size = self.sub_size.clamp(10, 150);
-        self.sub_pos = self.sub_pos.clamp(0, 150);
+        self.sub_pos = self.sub_pos.clamp(0, 100);
         if !matches!(self.sub_auto.as_str(), "exact" | "fuzzy" | "all" | "no") {
             self.sub_auto = "fuzzy".into();
         }
@@ -405,7 +643,99 @@ impl Settings {
         ) {
             self.hdr_tone_mapping_mode = "bt.2390".into();
         }
+        // The preferences UI exposes monitors 0..=8; accept a little headroom for
+        // larger multi-monitor setups but reject absurd indices from a corrupt file.
+        self.fullscreen_monitor = self.fullscreen_monitor.min(MAX_FULLSCREEN_MONITOR);
+        if !matches!(self.theme.as_str(), "dark" | "light") {
+            self.theme = "dark".into();
+        }
+        if !matches!(
+            self.accent.as_str(),
+            "gold" | "blue" | "green" | "rose" | "graphite"
+        ) {
+            self.accent = "gold".into();
+        }
+        if !matches!(self.language.as_str(), "en" | "fa") {
+            self.language = "en".into();
+        }
+        self.volume_max = self.volume_max.clamp(100, 200);
+        if !matches!(self.loop_mode.as_str(), "none" | "file" | "playlist") {
+            self.loop_mode = "none".into();
+        }
+        // Keep the list inside the formats mpv knows how to bitstream.
+        self.audio_spdif = self
+            .audio_spdif
+            .split(',')
+            .map(str::trim)
+            .filter(|token| matches!(*token, "ac3" | "dts" | "eac3" | "truehd" | "dts-hd"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !matches!(
+            self.audio_channels.as_str(),
+            "auto" | "stereo" | "reverse" | "5.1" | "7.1"
+        ) {
+            self.audio_channels = "auto".into();
+        }
+        if !matches!(
+            self.video_sync.as_str(),
+            "auto" | "audio" | "display-resync" | "display-desync"
+        ) {
+            self.video_sync = "auto".into();
+        }
+        if !matches!(
+            self.scale_profile.as_str(),
+            "bilinear" | "bicubic" | "spline36" | "lanczos" | "ewa_lanczossharp"
+        ) {
+            self.scale_profile = "bilinear".into();
+        }
+        self.cache_secs = self.cache_secs.clamp(0, 600);
+        self.demuxer_max_mb = self.demuxer_max_mb.clamp(0, 4096);
+        if !matches!(
+            self.ytdl_quality.as_str(),
+            "best" | "2160" | "1440" | "1080" | "720" | "480" | "360" | "audio"
+        ) {
+            self.ytdl_quality = "best".into();
+        }
+        self.sub_color = sane_hex_color(&self.sub_color, "#ffffff");
+        self.sub_border_color = sane_hex_color(&self.sub_border_color, "#000000");
+        self.sub_back_color = sane_hex_color(&self.sub_back_color, "#000000");
+        self.sub_border_size = sane_float(self.sub_border_size, 3.0, 0.0, 10.0);
+        self.sub_shadow_offset = sane_float(self.sub_shadow_offset, 0.0, 0.0, 10.0);
+        if !matches!(self.visualizer.as_str(), "off" | "wave" | "spectrum") {
+            self.visualizer = "off".into();
+        }
+        self.history.truncate(MAX_HISTORY);
+        self.history.retain(|entry| !entry.path.is_empty());
     }
+}
+
+/// Clamp a "#rrggbb" string back to a valid color or fall back to `fallback`.
+fn sane_hex_color(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    let valid = trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed[1..].chars().all(|c| c.is_ascii_hexdigit());
+    if valid {
+        trimmed.to_lowercase()
+    } else {
+        fallback.to_string()
+    }
+}
+
+/// File name part of a path (history titles are shown without directories).
+fn title_of_file(title: &str) -> String {
+    std::path::Path::new(title)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| title.to_string())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn sane_float(value: f64, default: f64, min: f64, max: f64) -> f64 {
@@ -510,12 +840,11 @@ mod ordered_positions {
             }
             Value::Array(items) => {
                 for item in items {
-                    if let Value::Array(pair) = item {
-                        if let (Some(key), Some(seconds)) = (pair.first(), pair.get(1)) {
-                            if let (Some(key), Some(seconds)) = (key.as_str(), seconds.as_f64()) {
-                                positions.push((key.to_string(), seconds));
-                            }
-                        }
+                    if let Value::Array(pair) = item
+                        && let (Some(key), Some(seconds)) = (pair.first(), pair.get(1))
+                        && let (Some(key), Some(seconds)) = (key.as_str(), seconds.as_f64())
+                    {
+                        positions.push((key.to_string(), seconds));
                     }
                 }
             }
@@ -540,11 +869,95 @@ mod tests {
     }
 
     #[test]
+    fn history_moves_replayed_files_to_the_front_and_is_capped() {
+        let mut settings = Settings::default();
+        settings.add_history("/tmp/a.mkv", "/tmp/a.mkv");
+        settings.add_history("/tmp/b.mkv", "/tmp/b.mkv");
+        settings.add_history("/tmp/a.mkv", "/tmp/a.mkv");
+        assert_eq!(settings.history[0].path, "/tmp/a.mkv");
+        assert_eq!(settings.history.len(), 2);
+        settings.update_history("/tmp/b.mkv", 12.5, 120.0);
+        assert_eq!(settings.history[1].position, 12.5);
+        assert_eq!(settings.history[1].duration, 120.0);
+        for i in 0..(MAX_HISTORY + 10) {
+            settings.add_history(&format!("/tmp/{i}.mkv"), &format!("/tmp/{i}.mkv"));
+        }
+        assert_eq!(settings.history.len(), MAX_HISTORY);
+        settings.clear_history();
+        assert!(settings.history.is_empty());
+    }
+
+    #[test]
+    fn media_preference_roundtrip_preserves_track_selection() {
+        let mut settings = Settings::default();
+        settings.set_track_preference("/tmp/a.mkv", 2, 3, -1);
+        settings.set_media_preference("/tmp/a.mkv", "16:9", "16:9", 1.25);
+        let preference = settings.track_preference("/tmp/a.mkv").unwrap();
+        assert_eq!(preference.audio, 2);
+        assert_eq!(preference.subtitle, 3);
+        assert_eq!(preference.aspect_label, "16:9");
+        assert_eq!(preference.aspect_value, "16:9");
+        assert_eq!(preference.speed, 1.25);
+    }
+
+    #[test]
+    fn old_track_preference_files_still_load() {
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"track_preferences":[{"path":"/tmp/a.mkv","audio":2,"subtitle":3,
+                 "secondary_subtitle":-1}]}"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(&path);
+        let preference = settings.track_preference("/tmp/a.mkv").unwrap();
+        assert_eq!(preference.aspect_label, "Default");
+        assert_eq!(preference.aspect_value, "-1");
+        assert_eq!(preference.speed, 0.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_audio_and_network_settings_are_normalized() {
+        let mut settings = Settings {
+            volume_max: 500,
+            audio_spdif: "ac3, bogus, dts".into(),
+            audio_channels: "quad".into(),
+            video_sync: "weird".into(),
+            scale_profile: "nnedi".into(),
+            ytdl_quality: "9999".into(),
+            sub_color: "red".into(),
+            cache_secs: 999_999,
+            http_headers: "Referer: x, Cookie: y".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.volume_max, 200);
+        assert_eq!(settings.audio_spdif, "ac3,dts");
+        assert_eq!(settings.audio_channels, "auto");
+        assert_eq!(settings.video_sync, "auto");
+        assert_eq!(settings.scale_profile, "bilinear");
+        assert_eq!(settings.ytdl_quality, "best");
+        assert_eq!(settings.sub_color, "#ffffff");
+        assert_eq!(settings.cache_secs, 600);
+        assert_eq!(settings.http_headers, "Referer: x, Cookie: y");
+    }
+
+    #[test]
     fn defaults_roundtrip() {
         let settings = Settings::default();
         let json = serde_json::to_string(&settings).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings, loaded);
+    }
+
+    #[test]
+    fn settings_use_current_schema_version() {
+        let settings = Settings::default();
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["schema_version"], SETTINGS_SCHEMA_VERSION);
     }
 
     #[test]
@@ -648,6 +1061,32 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_monitor_index_is_bounded() {
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"fullscreen_monitor":4000000}"#).unwrap();
+        let settings = Settings::load_from(&path);
+        assert!(settings.fullscreen_monitor <= 64);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn appearance_settings_survive_corrupt_values() {
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"theme":"neon","accent":"purple","language":"de"}"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(&path);
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.accent, "gold");
+        assert_eq!(settings.language, "en");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn positions_are_saved_as_ordered_object() {
         let mut settings = Settings::default();
         settings.set_position("/tmp/first.mkv", Some(1.25));
@@ -683,9 +1122,11 @@ mod tests {
     fn save_to_uses_unique_atomic_temp_file() {
         let dir = test_dir();
         let path = dir.join("settings.json");
-        let mut settings = Settings::default();
-        settings.volume = 37;
-        settings.save_to(&path);
+        let settings = Settings {
+            volume: 37,
+            ..Default::default()
+        };
+        settings.try_save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path).volume, 37);
         assert!(
             std::fs::read_dir(&dir)
@@ -696,6 +1137,16 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".settings-"))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn try_save_to_reports_success() {
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        let result = Settings::default().try_save_to(&path);
+        assert!(result.is_ok());
+        assert!(path.is_file());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

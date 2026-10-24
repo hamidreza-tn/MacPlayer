@@ -1,6 +1,6 @@
 [package]
 name = "macplayer"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -21,3 +21,17 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[lints.rust]
+# The no-unsafe rule is denied crate-wide; the C boundary files (src/ffi.rs,
+# src/engine.rs, src/render.rs, src/value.rs and the getuid shim in
+# src/main.rs) carry their own scoped `allow(unsafe_code)` annotations.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
