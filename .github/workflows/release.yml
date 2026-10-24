@@ -24,6 +24,15 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Check formatting
+        run: make fmt
+
+      - name: Run compiler checks
+        run: make check
+
+      - name: Run clippy
+        run: cargo clippy --offline --locked --all-targets -- -D warnings
+
       - name: Run offline locked tests
         run: make test
 

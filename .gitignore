@@ -8,3 +8,4 @@
 *.crash
 .idea/
 .vscode/
+.opencode/

@@ -304,6 +304,17 @@ mkdir -p \
 
 cp "$release_binary" "$APP_BINARY"
 cp "$INFO_PLIST" "$APP_BUNDLE/Contents/Info.plist"
+
+# Keep the bundle version in sync with Cargo.toml so Finder's "Get Info" and
+# `macplayer --version` always agree, even when the plist copy lags behind.
+app_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+    "$PROJECT_ROOT/Cargo.toml" | head -1)"
+if [[ -n "${app_version}" ]]; then
+    plutil -replace CFBundleShortVersionString -string "$app_version" \
+        "$APP_BUNDLE/Contents/Info.plist"
+    plutil -replace CFBundleVersion -string "$app_version" \
+        "$APP_BUNDLE/Contents/Info.plist"
+fi
 chmod 755 "$APP_BINARY"
 
 iconset_stage=""

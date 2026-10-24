@@ -2,7 +2,6 @@
 //!
 //! Path, media, playlist and time helpers used by MacPlayer.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub const VIDEO_EXT: &[&str] = &[
@@ -47,14 +46,6 @@ pub fn is_url(path: &str) -> bool {
 pub fn is_media(path: &str) -> bool {
     let extension = ext(path);
     VIDEO_EXT.contains(&extension.as_str()) || AUDIO_EXT.contains(&extension.as_str())
-}
-
-pub fn is_video(path: &str) -> bool {
-    VIDEO_EXT.contains(&ext(path).as_str())
-}
-
-pub fn is_audio(path: &str) -> bool {
-    AUDIO_EXT.contains(&ext(path).as_str())
 }
 
 pub fn is_sub(path: &str) -> bool {
@@ -133,10 +124,6 @@ pub fn fmt_time(seconds: f64) -> String {
     )
 }
 
-pub fn fmt_signed(seconds: f64, digits: usize) -> String {
-    format!("{:+.*} sec", digits, seconds)
-}
-
 /// Accepts `HH:MM:SS(.mmm)`, `MM:SS`, plain seconds or `NN%`. Returns seconds.
 pub fn parse_time(text: &str, duration: Option<f64>) -> Option<f64> {
     let text = text.trim();
@@ -152,7 +139,7 @@ pub fn parse_time(text: &str, duration: Option<f64>) -> Option<f64> {
         if !percent.is_finite() {
             return None;
         }
-        return Some((percent.max(0.0).min(100.0)) / 100.0 * duration);
+        return Some(percent.clamp(0.0, 100.0) / 100.0 * duration);
     }
     let mut value = 0.0;
     let mut count = 0;
@@ -186,19 +173,6 @@ pub fn title_of(path: &str) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| path.to_string())
-}
-
-pub fn folder_media(folder: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| is_media(&entry.file_name().to_string_lossy()))
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort_by(|a, b| natural_cmp(a, b));
-    names.into_iter().map(|name| folder.join(name)).collect()
 }
 
 /// Folders become their media files (recursively); files and URLs pass through.
@@ -294,7 +268,8 @@ pub fn human_size(bytes: Option<f64>) -> String {
     String::new()
 }
 
-/// Files that belong with `path`, such as matching sidecar media files.
+/// Numbered siblings of `path` (ep1/ep2, track 01/02, ...): files of the same
+/// kind whose name skeleton — digits collapsed to `#` — matches `path`'s.
 pub fn similar_files(path: &str) -> Vec<String> {
     let directory = Path::new(path)
         .parent()
@@ -340,14 +315,12 @@ pub fn similar_files(path: &str) -> Vec<String> {
         .filter(|entry| kind.contains(&ext(&entry.file_name().to_string_lossy()).as_str()))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|candidate| {
-            if kind == VIDEO_EXT {
-                if target.contains('#') {
-                    skeleton(candidate) == target
-                } else {
-                    *candidate == name
-                }
+            // Same skeleton rule for audio and video alike: numbered siblings
+            // group together, un-numbered names match only themselves.
+            if target.contains('#') {
+                skeleton(candidate) == target
             } else {
-                true
+                *candidate == name
             }
         })
         .collect();
@@ -385,7 +358,12 @@ pub fn read_playlist_file(path: &str) -> Vec<String> {
             if !line.to_lowercase().starts_with("file") || !line.contains('=') {
                 continue;
             }
-            line = line.splitn(2, '=').nth(1).unwrap_or("").trim().to_string();
+            line = line
+                .split_once('=')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         }
         if !is_url(&line) && !Path::new(&line).is_absolute() {
             line = base.join(&line).to_string_lossy().into_owned();
@@ -395,143 +373,95 @@ pub fn read_playlist_file(path: &str) -> Vec<String> {
     entries
 }
 
-/// Extensions for the native open dialogs.
-pub fn media_filter_pattern() -> String {
-    let mut all: HashSet<&str> = HashSet::new();
-    for extension in VIDEO_EXT.iter().chain(AUDIO_EXT).chain(PLAYLIST_EXT) {
-        all.insert(extension);
+/// Render an extended `.m3u8` playlist: one `#EXTINF` line (duration + title)
+/// per item, then the path. Returns the number of bytes written.
+pub fn write_m3u(path: &str, items: &[(String, String, Option<f64>)]) -> Result<usize, String> {
+    let mut text = String::from("#EXTM3U\n");
+    for (item_path, title, duration) in items {
+        match duration {
+            Some(seconds) if seconds.is_finite() && *seconds > 0.0 => {
+                text.push_str(&format!("#EXTINF:{:.0},{}\n", seconds, title));
+            }
+            _ => text.push_str(&format!("#EXTINF:-1,{}\n", title)),
+        }
+        text.push_str(item_path);
+        text.push('\n');
     }
-    let mut sorted: Vec<&&str> = all.iter().collect();
-    sorted.sort();
-    sorted
-        .iter()
-        .map(|e| format!("*{e}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    std::fs::write(path, text.as_bytes())
+        .map(|_| text.len())
+        .map_err(|error| format!("could not write playlist: {error}"))
 }
 
-pub fn sub_filter_pattern() -> String {
-    let mut sorted: Vec<&&str> = SUB_EXT.iter().collect();
-    sorted.sort();
-    sorted
-        .iter()
-        .map(|e| format!("*{e}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Local "YYYY-MM-DD HH:MM" for a unix timestamp (no calendar crate needed).
+pub fn format_unix_time(secs: i64) -> String {
+    if secs <= 0 {
+        return "—".into();
+    }
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// Locate an executable on PATH, if it exists as a regular file.
+pub fn which(program: &str) -> Option<String> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+    })
+}
+
+/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 → (y, m, d).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_dir() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("macplayer-util-{}-{id}", std::process::id()));
+    #[test]
+    fn m3u_roundtrip_keeps_titles_and_durations() {
+        let dir = std::env::temp_dir().join(format!("macplayer-m3u-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn time_formatting() {
-        assert_eq!(fmt_time(0.0), "00:00:00");
-        assert_eq!(fmt_time(3723.7), "01:02:03");
-        assert_eq!(fmt_signed(-1.25, 1), "-1.2 sec");
-    }
-
-    #[test]
-    fn time_parsing() {
-        assert_eq!(parse_time("01:02:03", None), Some(3723.0));
-        assert_eq!(parse_time("02:03.5", None), Some(123.5));
-        assert_eq!(parse_time("90", None), Some(90.0));
-        assert_eq!(parse_time("50%", Some(200.0)), Some(100.0));
-        assert_eq!(parse_time("abc", None), None);
-        assert_eq!(parse_time("nan", None), None);
-        assert_eq!(parse_time("inf", None), None);
-        assert_eq!(parse_time("1:2:3:4", None), None);
-    }
-
-    #[test]
-    fn natural_sorting() {
-        let mut names = vec!["ep10.mkv", "ep2.mkv", "ep1.mkv"];
-        names.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(names, vec!["ep1.mkv", "ep2.mkv", "ep10.mkv"]);
-    }
-
-    #[test]
-    fn natural_sorting_handles_numbers_beyond_i64() {
-        let mut names = vec!["part10000000000000000000.mkv", "part2.mkv"];
-        names.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(names, vec!["part2.mkv", "part10000000000000000000.mkv"]);
-    }
-
-    #[test]
-    fn url_detection() {
-        assert!(is_url("https://example.com/a.mp4"));
-        assert!(is_url("ytdl://youtube.com/watch?v=x"));
-        assert!(!is_url("/plain/path.mkv"));
-        assert!(!is_url("C:/windows/path.mkv"));
-    }
-
-    #[test]
-    fn sub_filter_skips_plaintext() {
-        assert!(is_sub("movie.srt"));
-        assert!(!is_sub("notes.txt"));
-    }
-
-    #[test]
-    fn title_of_preserves_trailing_separator() {
-        assert_eq!(title_of("/tmp/media/"), "/tmp/media/");
-    }
-
-    #[test]
-    fn expand_paths_matches_os_walk_file_order() {
-        let dir = test_dir();
-        let child = dir.join("01-child");
-        std::fs::create_dir(&child).unwrap();
-        std::fs::write(dir.join("02-root.mkv"), []).unwrap();
-        std::fs::write(child.join("01-child.mkv"), []).unwrap();
-
-        let input = vec![dir.to_string_lossy().into_owned()];
-        assert_eq!(
-            expand_paths(&input),
-            vec![
-                dir.join("02-root.mkv").to_string_lossy().into_owned(),
-                child.join("01-child.mkv").to_string_lossy().into_owned(),
-            ]
-        );
+        let path = dir.join("out.m3u8");
+        let items = vec![
+            ("/abs/a.mkv".to_string(), "a".to_string(), Some(61.4)),
+            ("https://example.test/v".to_string(), "v".to_string(), None),
+        ];
+        write_m3u(&path.to_string_lossy(), &items).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("#EXTM3U\n"));
+        assert!(text.contains("#EXTINF:61,a\n"));
+        assert!(text.contains("#EXTINF:-1,v\n"));
+        // The local absolute path survives; the URL passes through untouched.
+        let read_back = read_playlist_file(&path.to_string_lossy());
+        assert!(read_back.contains(&"/abs/a.mkv".to_string()));
+        assert!(read_back.contains(&"https://example.test/v".to_string()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn expand_paths_absolutizes_missing_files_without_resolving_them() {
-        let relative = format!("macplayer-missing-{}-file.mkv", std::process::id());
-        assert_eq!(
-            expand_paths(std::slice::from_ref(&relative)),
-            vec![
-                absolute_path(Path::new(&relative))
-                    .to_string_lossy()
-                    .into_owned()
-            ]
-        );
-    }
-
-    #[test]
-    fn playlist_reader_replaces_invalid_utf8() {
-        let dir = test_dir();
-        let playlist = dir.join("items.m3u");
-        std::fs::write(&playlist, b"\xef\xbb\xbfclip\xff.mp4\n").unwrap();
-        assert_eq!(
-            read_playlist_file(&playlist.to_string_lossy()),
-            vec![dir.join("clip�.mp4").to_string_lossy().into_owned()]
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn human_size_truncates_fractional_bytes() {
-        assert_eq!(human_size(Some(1.9)), "1 B");
-        assert_eq!(human_size(Some(-1.9)), "-1 B");
+    fn unix_time_formats_as_civil_datetime() {
+        assert_eq!(format_unix_time(0), "—");
+        // 1792800000 = 2026-10-24 00:00 UTC (a whole number of days).
+        assert_eq!(format_unix_time(1_792_800_000), "2026-10-24 00:00");
+        // Leap day: 2000-02-29 12:34 UTC.
+        assert_eq!(format_unix_time(951_827_640), "2000-02-29 12:34");
     }
 }

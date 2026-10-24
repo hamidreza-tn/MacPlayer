@@ -1,14 +1,21 @@
 //! MacPlayer — a native Rust media player built on egui + libmpv.
+// The no-unwrap/no-panic lints are a production-code rule; unit tests assert on
+// Result and Option everywhere, so relax them for the test harness builds.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod dialogs;
 mod engine;
 mod ffi;
+mod i18n;
+mod logging;
 mod menus;
 mod player;
 mod playlist;
 mod render;
+mod services;
 mod settings;
 mod skin;
+mod thumbs;
 mod util;
 mod value;
 mod widgets;
@@ -25,6 +32,13 @@ use std::time::Duration;
 use player::Player;
 
 fn main() {
+    // Crash reports land in the diagnostics log, next to the engine's own errors.
+    std::panic::set_hook(Box::new(|info| {
+        let message = format!("panic: {info}");
+        eprintln!("{message}");
+        logging::write(&message);
+    }));
+
     let cli = Cli::parse(std::env::args().skip(1));
     if cli.version {
         println!("MacPlayer {}", env!("CARGO_PKG_VERSION"));
@@ -55,6 +69,7 @@ fn main() {
             Ok((server, rx)) => (Some(server), rx),
             Err(error) => {
                 eprintln!("could not start the single-instance listener: {error}");
+                logging::write(&format!("single-instance listener: {error}"));
                 return;
             }
         }
@@ -62,9 +77,11 @@ fn main() {
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("MacPlayer")
-        .with_decorations(false)
+        .with_decorations(!cli.fullscreen)
         .with_inner_size([settings.window_w as f32, settings.window_h as f32])
-        .with_min_inner_size([320.0, 200.0])
+        // The video fills the window and every control floats above it, so the window
+        // only needs to stay above the smallest comfortable player surface.
+        .with_min_inner_size([480.0, 270.0])
         .with_fullscreen(cli.fullscreen);
     if cli.fullscreen {
         viewport = viewport.with_monitor(settings.fullscreen_monitor);
@@ -95,6 +112,7 @@ fn main() {
         }),
     ) {
         eprintln!("eframe error: {error}");
+        logging::write(&format!("eframe: {error}"));
     }
     drop(ipc_server);
 }
@@ -181,6 +199,7 @@ fn ipc_path() -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn libc_getuid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -324,7 +343,11 @@ fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<Atom
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => break,
+            // A transient accept error must not kill the listener and leave a
+            // socket file nothing can talk to behind; back off and keep serving.
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }

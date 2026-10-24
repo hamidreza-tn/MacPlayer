@@ -3,15 +3,16 @@
 //! Each dialog is an egui `Window` on a custom frame, styled with the MacPlayer palette.
 
 use crate::engine::{AudioTrackInfo, AudioTrackState, FileTrackState, TrackSelection};
+use crate::i18n;
 use crate::menus::Action;
 use crate::menus::{TrackKind, TrackSel};
 use crate::settings::Settings;
 use crate::skin;
 use crate::skin::*;
-use crate::util::parse_time;
-use crate::value::Value;
+use crate::util::{fmt_time, parse_time};
 use egui::{
-    Align, Align2, Frame, Id, Layout, Rect, RichText, Sense, Stroke, TextEdit, Window, pos2, vec2,
+    Align, Align2, Color32, Frame, Id, Layout, Rect, RichText, Sense, Stroke, TextEdit, Window,
+    pos2, vec2,
 };
 
 fn active_colors() -> skin::ThemeColors {
@@ -24,35 +25,53 @@ fn dlg_frame() -> Frame {
     Frame::new()
         .fill(active_colors().dialog_bg)
         .stroke(Stroke::new(1.0, active_colors().dialog_line))
-        .corner_radius(8.0)
-        .outer_margin(egui::Margin::same(4))
-        .inner_margin(egui::Margin::same(10))
+        .corner_radius(10.0)
+        .outer_margin(egui::Margin::same(6))
+        .inner_margin(egui::Margin::same(12))
 }
 
 fn dialog_header(ui: &mut egui::Ui, title: &str) -> bool {
+    let colors = active_colors();
     let mut close = false;
     ui.horizontal(|ui| {
+        // Accent dot + title — the same signature as the playlist drawer header.
+        let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+        ui.painter().circle_filled(dot.center(), 3.0, colors.accent);
+        ui.add_space(3.0);
         ui.label(
             RichText::new(title)
-                .size(14.0)
-                .color(active_colors().text_e4)
+                .size(14.5)
+                .color(colors.text_bright)
                 .strong(),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let response = ui
-                .add_sized(
-                    vec2(28.0, 26.0),
-                    egui::Button::new(RichText::new("×").size(18.0).color(active_colors().text_e4)),
-                )
-                .on_hover_text("Close");
-            if response.clicked() {
+            let (r, resp) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::click());
+            let resp = resp.on_hover_text(i18n::tr("Close"));
+            let p = ui.painter_at(r);
+            let hover = resp.hovered();
+            if hover {
+                p.rect_filled(r, 6.0, colors.close_hover);
+            }
+            skin::draw_icon(
+                &p,
+                "close",
+                r.center().x.round(),
+                r.center().y.round(),
+                if hover {
+                    Color32::WHITE
+                } else {
+                    colors.text_9a
+                },
+                colors.dialog_bg,
+            );
+            if resp.clicked() {
                 close = true;
             }
         });
     });
-    ui.add_space(4.0);
-    ui.separator();
     ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(8.0);
     close
 }
 
@@ -76,7 +95,6 @@ fn label(ui: &mut egui::Ui, text: &str) {
 
 /// A row containing a label and its associated widget.
 fn row<T>(ui: &mut egui::Ui, text: &str, add: impl FnOnce(&mut egui::Ui) -> T) -> T {
-    let mut out = None;
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         let w = 190.0;
@@ -88,59 +106,84 @@ fn row<T>(ui: &mut egui::Ui, text: &str, add: impl FnOnce(&mut egui::Ui) -> T) -
             font(12.0, false),
             active_colors().text_a8,
         );
-        out = Some(add(ui));
-    });
-    out.expect("row closure ran")
+        add(ui)
+    })
+    .inner
 }
 
+/// Rounded checkbox + label; the whole box+text area toggles, not just the box.
 fn check(ui: &mut egui::Ui, id: &str, text: &str, value: &mut bool) -> bool {
-    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
-    let p = ui.painter_at(r);
-    let hover = resp.hovered();
-    p.rect_filled(
-        r,
-        2.0,
-        if *value {
-            active_colors().accent
-        } else if hover {
-            active_colors().button_hover
-        } else {
-            active_colors().base
-        },
+    let colors = active_colors();
+    let box_size = 16.0;
+    let gap = 7.0;
+    let text_w = skin::text_width(ui.painter(), text, &skin::font(12.0, false));
+    let total_w = box_size + gap + text_w;
+    let (total, _) = ui.allocate_exact_size(vec2(total_w, 20.0), Sense::click());
+    let resp = ui.interact(total, Id::new(("dialog-check", id)), Sense::click());
+    let p = ui.painter_at(total);
+    let box_rect = Rect::from_min_size(
+        pos2(total.left(), total.center().y - box_size / 2.0),
+        vec2(box_size, box_size),
     );
+    let hover = resp.hovered();
+    if *value {
+        p.rect_filled(box_rect, 4.0, colors.accent);
+    } else {
+        p.rect_filled(
+            box_rect,
+            4.0,
+            if hover {
+                colors.button_hover
+            } else {
+                colors.base
+            },
+        );
+        p.rect_stroke(
+            box_rect,
+            4.0,
+            Stroke::new(1.0, if hover { colors.text_dim } else { colors.line }),
+            egui::StrokeKind::Inside,
+        );
+    }
     if *value {
         for i in 0..4 {
             p.rect_filled(
                 Rect::from_min_size(
-                    pos2(r.left() + 3.0 + i as f32, r.top() + 7.0 + i as f32),
+                    pos2(
+                        box_rect.left() + 3.0 + i as f32,
+                        box_rect.top() + 7.0 + i as f32,
+                    ),
                     vec2(2.0, 1.0),
                 ),
                 0.0,
-                active_colors().bg,
+                colors.bg,
             );
             if i > 0 {
                 p.rect_filled(
                     Rect::from_min_size(
-                        pos2(r.left() + 3.0 + i as f32, r.top() + 11.0 - i as f32),
+                        pos2(
+                            box_rect.left() + 3.0 + i as f32,
+                            box_rect.top() + 11.0 - i as f32,
+                        ),
                         vec2(2.0, 1.0),
                     ),
                     0.0,
-                    active_colors().bg,
+                    colors.bg,
                 );
             }
         }
     }
+    p.text(
+        pos2(box_rect.right() + gap, total.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font(12.0, false),
+        colors.text_e4,
+    );
     let clicked = resp.clicked();
     if clicked {
         *value = !*value;
     }
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(text)
-            .size(12.0)
-            .color(active_colors().text_e4),
-    );
-    let _ = id;
     clicked
 }
 
@@ -171,11 +214,11 @@ fn spin(
             .data_mut(|data| data.insert_temp(text_id, text.clone()));
     }
     if r.lost_focus() {
-        if let Ok(v) = text.trim().parse::<f64>() {
-            if (v - *value).abs() > f64::EPSILON {
-                *value = v.clamp(lo, hi);
-                changed = true;
-            }
+        if let Ok(v) = text.trim().parse::<f64>()
+            && (v - *value).abs() > f64::EPSILON
+        {
+            *value = v.clamp(lo, hi);
+            changed = true;
         }
         ui.ctx().data_mut(|data| data.remove::<String>(text_id));
     }
@@ -213,10 +256,13 @@ fn spin(
     if arrow(ui, true) {
         *value = (*value + step).min(hi);
         changed = true;
+        // Drop any in-progress typed text so the field shows the arrowed value.
+        ui.ctx().data_mut(|data| data.remove::<String>(text_id));
     }
     if arrow(ui, false) {
         *value = (*value - step).max(lo);
         changed = true;
+        ui.ctx().data_mut(|data| data.remove::<String>(text_id));
     }
     if !suffix.is_empty() {
         ui.add_space(3.0);
@@ -226,7 +272,6 @@ fn spin(
                 .color(active_colors().text_a8),
         );
     }
-    let _ = id;
     changed
 }
 
@@ -237,6 +282,7 @@ fn line_edit(ui: &mut egui::Ui, id: &str, value: &mut String, width: f32, hint: 
             .desired_width(width)
             .font(egui::TextStyle::Monospace)
             .margin(vec2(3.0, 2.0))
+            .id_salt(Id::new(("dialog-line-edit", id)))
             .hint_text(
                 RichText::new(hint)
                     .size(12.0)
@@ -247,7 +293,6 @@ fn line_edit(ui: &mut egui::Ui, id: &str, value: &mut String, width: f32, hint: 
     if changed {
         *value = text;
     }
-    let _ = id;
     changed
 }
 
@@ -292,8 +337,11 @@ fn combo<T: PartialEq + Clone>(
 }
 
 fn button(ui: &mut egui::Ui, _id: &str, text: &str) -> bool {
+    // Measure the real text so byte-heavy scripts (Persian) neither bloat nor
+    // clip the button.
+    let text_w = skin::text_width(ui.painter(), text, &skin::font(12.0, false));
     ui.add_sized(
-        vec2((text.len() as f32) * 7.0 + 26.0, 24.0),
+        vec2(text_w.max(34.0) + 26.0, 24.0),
         egui::Button::new(
             RichText::new(text)
                 .size(12.0)
@@ -303,111 +351,112 @@ fn button(ui: &mut egui::Ui, _id: &str, text: &str) -> bool {
     .clicked()
 }
 
-fn ok_cancel_apply(ui: &mut egui::Ui) -> (bool, bool, bool, bool) {
-    let mut ok = false;
-    let mut cancel = false;
-    let mut apply = false;
-    let mut close = false;
-    ui.horizontal(|ui| {
-        ui.add_space(2.0);
-        if ui
-            .add_sized(
-                vec2(84.0, 26.0),
-                egui::Button::new(
-                    RichText::new("OK")
-                        .size(12.0)
-                        .color(active_colors().text_e4),
-                ),
-            )
-            .clicked()
-        {
-            ok = true;
-        }
-        ui.add_space(4.0);
-        if ui
-            .add_sized(
-                vec2(84.0, 26.0),
-                egui::Button::new(
-                    RichText::new("Cancel")
-                        .size(12.0)
-                        .color(active_colors().text_e4),
-                ),
-            )
-            .clicked()
-        {
-            cancel = true;
-        }
-        ui.add_space(4.0);
-        if ui
-            .add_sized(
-                vec2(84.0, 26.0),
-                egui::Button::new(
-                    RichText::new("Apply")
-                        .size(12.0)
-                        .color(active_colors().text_e4),
-                ),
-            )
-            .clicked()
-        {
-            apply = true;
-        }
-        ui.add_space(4.0);
-        if ui
-            .add_sized(
-                vec2(84.0, 26.0),
-                egui::Button::new(
-                    RichText::new("Close")
-                        .size(12.0)
-                        .color(active_colors().text_e4),
-                ),
-            )
-            .clicked()
-        {
-            close = true;
-        }
-    });
-    (ok, cancel, apply, close)
+/// Accent-filled primary action (OK / Apply / Resume): dark text on the accent color.
+fn primary_button(ui: &mut egui::Ui, text: &str, width: f32, height: f32) -> bool {
+    let colors = active_colors();
+    let text_w = skin::text_width(ui.painter(), text, &skin::font(12.0, false));
+    ui.add_sized(
+        vec2(width.max(text_w + 26.0), height),
+        egui::Button::new(RichText::new(text).size(12.0).color(colors.bg).strong())
+            .fill(colors.accent)
+            .corner_radius(6.0),
+    )
+    .clicked()
 }
 
+/// OK / Cancel / Apply footer shared by the modal dialogs; each flag draws its button
+/// and reports whether it was clicked. OK and Apply draw as accent primaries.
+fn dialog_footer(ui: &mut egui::Ui, ok: bool, cancel: bool, apply: bool) -> (bool, bool, bool) {
+    let mut ok_clicked = false;
+    let mut cancel_clicked = false;
+    let mut apply_clicked = false;
+    let footer_button = |ui: &mut egui::Ui, text: &str, clicked: &mut bool| {
+        if ui
+            .add_sized(
+                vec2(84.0, 26.0),
+                egui::Button::new(
+                    RichText::new(text)
+                        .size(12.0)
+                        .color(active_colors().text_e4),
+                ),
+            )
+            .clicked()
+        {
+            *clicked = true;
+        }
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        if ok && primary_button(ui, i18n::tr("OK"), 84.0, 26.0) {
+            ok_clicked = true;
+        }
+        if ok {
+            ui.add_space(4.0);
+        }
+        if cancel {
+            footer_button(ui, i18n::tr("Cancel"), &mut cancel_clicked);
+            ui.add_space(4.0);
+        }
+        if apply && primary_button(ui, i18n::tr("Apply"), 84.0, 26.0) {
+            apply_clicked = true;
+        }
+    });
+    (ok_clicked, cancel_clicked, apply_clicked)
+}
+
+/// Segmented control over `names`; the selected segment gets a raised fill and an
+/// accent outline. Used for dialog tab strips and small mode switches.
 fn tabs(ui: &mut egui::Ui, names: &[&str], current: &mut usize) {
-    let start_x = ui.cursor().left();
-    let mut x = start_x;
-    let y = ui.cursor().top();
+    let colors = active_colors();
+    let item_h = 26.0;
+    let pad_x = 12.0;
+    let gap = 4.0;
+    let widths: Vec<f32> = names
+        .iter()
+        .map(|name| {
+            skin::text_width(ui.painter(), name, &skin::font(12.0, false)).max(24.0) + pad_x * 2.0
+        })
+        .collect();
+    let total = widths.iter().sum::<f32>() + gap * names.len().saturating_sub(1) as f32 + pad_x;
+    let (container, _) = ui.allocate_exact_size(vec2(total, item_h), Sense::hover());
+    let p = ui.painter_at(container);
+    p.rect_filled(container, 7.0, colors.tab_bg);
+    let mut x = container.left() + pad_x / 2.0;
     for (i, name) in names.iter().enumerate() {
-        let w = (name.chars().count() as f32) * 7.0 + 30.0;
-        let rect = Rect::from_min_size(pos2(x, y), vec2(w, 24.0));
-        let resp = ui.interact(rect, Id::new(("tab", i)), Sense::click());
-        let p = ui.painter_at(rect);
-        let sel = i == *current;
-        p.rect_filled(
-            rect,
-            0.0,
-            if sel {
-                active_colors().tab_sel
-            } else if resp.hovered() {
-                active_colors().button_hover
-            } else {
-                active_colors().tab_bg
-            },
+        let rect = Rect::from_min_size(
+            pos2(x, container.top() + 3.0),
+            vec2(widths[i], item_h - 6.0),
         );
+        let resp = ui.interact(rect, Id::new(("tab", i)), Sense::click());
+        let sel = i == *current;
+        if sel {
+            p.rect_filled(rect, 5.0, colors.tab_sel);
+            p.rect_stroke(
+                rect,
+                5.0,
+                Stroke::new(1.0, colors.accent.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            p.rect_filled(rect, 5.0, colors.button_hover);
+        }
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
             *name,
             font(12.0, sel),
             if sel {
-                active_colors().text_e4
+                colors.text_bright
             } else {
-                active_colors().text_a8
+                colors.text_a8
             },
         );
         if resp.clicked() {
             *current = i;
         }
-        x += w + 2.0;
+        x += widths[i] + gap;
     }
-    ui.allocate_space(vec2((x - start_x).max(0.0), 24.0));
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 }
 
 // -- GoTo ------------------------------------------------------------------------------------------
@@ -418,11 +467,103 @@ pub enum GoToMode {
     Percent,
 }
 
+// -- Resume playback ------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeChoice {
+    Resume,
+    StartOver,
+}
+
+#[derive(Default)]
+pub struct ResumeDialog {
+    pub open: bool,
+    position: f64,
+}
+
+impl ResumeDialog {
+    pub fn open(&mut self, position: f64) {
+        self.position = position.max(0.0);
+        self.open = true;
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<ResumeChoice> {
+        if !self.open {
+            return None;
+        }
+
+        let colors = active_colors();
+        let mut choice = None;
+        Window::new(i18n::tr("Resume playback"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(dlg_frame())
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, -24.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(i18n::tr("Continue watching?"))
+                            .size(15.0)
+                            .color(colors.text_bright)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(i18n::tr("You previously watched this file up to"))
+                            .size(12.0)
+                            .color(colors.text_a8),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(fmt_time(self.position))
+                            .size(24.0)
+                            .color(colors.accent)
+                            .monospace(),
+                    );
+                    ui.add_space(12.0);
+                });
+                ui.horizontal(|ui| {
+                    if primary_button(
+                        ui,
+                        &format!("{} {}", i18n::tr("Resume from"), fmt_time(self.position)),
+                        156.0,
+                        28.0,
+                    ) {
+                        choice = Some(ResumeChoice::Resume);
+                    }
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized(
+                            vec2(156.0, 28.0),
+                            egui::Button::new(
+                                RichText::new(i18n::tr("Start from beginning"))
+                                    .size(12.0)
+                                    .color(colors.text_e4),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        choice = Some(ResumeChoice::StartOver);
+                    }
+                });
+            });
+
+        if choice.is_some() {
+            self.open = false;
+        }
+        choice
+    }
+}
+
 pub struct GoToDialog {
     pub open: bool,
     pub mode: GoToMode,
     pub input: String,
     pub error: Option<String>,
+    focus_pending: bool,
 }
 
 impl Default for GoToDialog {
@@ -432,6 +573,7 @@ impl Default for GoToDialog {
             mode: GoToMode::Time,
             input: String::new(),
             error: None,
+            focus_pending: false,
         }
     }
 }
@@ -442,6 +584,7 @@ impl GoToDialog {
         self.mode = mode;
         self.input.clear();
         self.error = None;
+        self.focus_pending = true;
     }
 
     pub fn show(&mut self, ctx: &egui::Context, duration: f64, actions: &mut Vec<Action>) {
@@ -450,7 +593,7 @@ impl GoToDialog {
         }
         let mut open = self.open;
         let mut submit = false;
-        Window::new("Go to")
+        Window::new(i18n::tr("Go to"))
             .open(&mut open)
             .title_bar(false)
             .collapsible(false)
@@ -459,46 +602,32 @@ impl GoToDialog {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
             .show(ctx, |ui| {
                 ui.set_min_width(250.0);
-                heading(ui, "Go to");
-                ui.horizontal(|ui| {
-                    let mut m = self.mode;
-                    if ui
-                        .selectable_label(
-                            m == GoToMode::Time,
-                            RichText::new("Time")
-                                .size(12.0)
-                                .color(active_colors().text_e4),
-                        )
-                        .clicked()
-                    {
-                        m = GoToMode::Time;
-                    }
-                    if ui
-                        .selectable_label(
-                            m == GoToMode::Percent,
-                            RichText::new("Percent")
-                                .size(12.0)
-                                .color(active_colors().text_e4),
-                        )
-                        .clicked()
-                    {
-                        m = GoToMode::Percent;
-                    }
-                    self.mode = m;
-                });
-                ui.add_space(6.0);
+                heading(ui, i18n::tr("Go to"));
+                let mut mode_tab = match self.mode {
+                    GoToMode::Time => 0,
+                    GoToMode::Percent => 1,
+                };
+                tabs(ui, &[i18n::tr("Time"), i18n::tr("Percent")], &mut mode_tab);
+                self.mode = match mode_tab {
+                    1 => GoToMode::Percent,
+                    _ => GoToMode::Time,
+                };
+                ui.add_space(2.0);
                 let mut input = self.input.clone();
                 let r = ui.add(
                     TextEdit::singleline(&mut input)
                         .desired_width(230.0)
                         .font(egui::TextStyle::Monospace)
                         .hint_text(
-                            RichText::new("HH:MM:SS or 01:30")
+                            RichText::new(i18n::tr("HH:MM:SS or 01:30"))
                                 .size(12.0)
                                 .color(active_colors().text_9a),
                         ),
                 );
                 self.input = input;
+                if std::mem::take(&mut self.focus_pending) {
+                    r.request_focus();
+                }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
                 }
@@ -512,25 +641,15 @@ impl GoToDialog {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            vec2(80.0, 24.0),
-                            egui::Button::new(
-                                RichText::new("OK")
-                                    .size(12.0)
-                                    .color(active_colors().text_e4),
-                            ),
-                        )
-                        .clicked()
-                    {
+                    if primary_button(ui, i18n::tr("OK"), 84.0, 26.0) {
                         submit = true;
                     }
                     ui.add_space(4.0);
                     if ui
                         .add_sized(
-                            vec2(80.0, 24.0),
+                            vec2(80.0, 26.0),
                             egui::Button::new(
-                                RichText::new("Cancel")
+                                RichText::new(i18n::tr("Cancel"))
                                     .size(12.0)
                                     .color(active_colors().text_e4),
                             ),
@@ -553,7 +672,7 @@ impl GoToDialog {
                         });
                         self.open = false;
                     }
-                    Ok(_) | Err(_) => self.error = Some("Please enter a number".into()),
+                    Ok(_) | Err(_) => self.error = Some(i18n::tr("Please enter a number").into()),
                 },
                 GoToMode::Time => match parse_time(&s, Some(duration)) {
                     Some(secs) if secs.is_finite() => {
@@ -563,7 +682,7 @@ impl GoToDialog {
                         });
                         self.open = false;
                     }
-                    _ => self.error = Some("Please enter a valid time".into()),
+                    _ => self.error = Some(i18n::tr("Please enter a valid time").into()),
                 },
             }
         }
@@ -659,17 +778,7 @@ impl TextDialog {
                     });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            vec2(90.0, 24.0),
-                            egui::Button::new(
-                                RichText::new("Copy")
-                                    .size(12.0)
-                                    .color(active_colors().text_e4),
-                            ),
-                        )
-                        .clicked()
-                    {
+                    if primary_button(ui, i18n::tr("Copy"), 90.0, 24.0) {
                         ui.copy_text(self.body.clone());
                     }
                     ui.add_space(4.0);
@@ -677,7 +786,7 @@ impl TextDialog {
                         .add_sized(
                             vec2(90.0, 24.0),
                             egui::Button::new(
-                                RichText::new("Close")
+                                RichText::new(i18n::tr("Close"))
                                     .size(12.0)
                                     .color(active_colors().text_e4),
                             ),
@@ -699,6 +808,7 @@ pub struct UrlDialog {
     pub url: String,
     pub loop_input: String,
     pub error: Option<String>,
+    focus_pending: bool,
 }
 
 impl Default for UrlDialog {
@@ -708,18 +818,25 @@ impl Default for UrlDialog {
             url: String::new(),
             loop_input: "0".into(),
             error: None,
+            focus_pending: false,
         }
     }
 }
 
 impl UrlDialog {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.error = None;
+        self.focus_pending = true;
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if !self.open {
             return;
         }
         let mut open = self.open;
         let mut submit = false;
-        Window::new("Play URL")
+        Window::new(i18n::tr("Play URL"))
             .open(&mut open)
             .title_bar(false)
             .collapsible(false)
@@ -728,7 +845,7 @@ impl UrlDialog {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, -30.0))
             .show(ctx, |ui| {
                 ui.set_min_width(340.0);
-                heading(ui, "Enter URL:");
+                heading(ui, i18n::tr("Enter URL:"));
                 let mut url = self.url.clone();
                 let r = ui.add(
                     TextEdit::singleline(&mut url)
@@ -741,12 +858,15 @@ impl UrlDialog {
                         ),
                 );
                 self.url = url;
+                if std::mem::take(&mut self.focus_pending) {
+                    r.request_focus();
+                }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    label(ui, "Loop interval (seconds, 0 = no loop):");
+                    label(ui, i18n::tr("Loop interval (seconds, 0 = no loop):"));
                     let mut li = self.loop_input.clone();
                     ui.add(
                         TextEdit::singleline(&mut li)
@@ -765,17 +885,7 @@ impl UrlDialog {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            vec2(84.0, 26.0),
-                            egui::Button::new(
-                                RichText::new("OK")
-                                    .size(12.0)
-                                    .color(active_colors().text_e4),
-                            ),
-                        )
-                        .clicked()
-                    {
+                    if primary_button(ui, i18n::tr("OK"), 84.0, 26.0) {
                         submit = true;
                     }
                     ui.add_space(4.0);
@@ -783,7 +893,7 @@ impl UrlDialog {
                         .add_sized(
                             vec2(84.0, 26.0),
                             egui::Button::new(
-                                RichText::new("Cancel")
+                                RichText::new(i18n::tr("Cancel"))
                                     .size(12.0)
                                     .color(active_colors().text_e4),
                             ),
@@ -797,11 +907,20 @@ impl UrlDialog {
         if submit {
             let u = self.url.trim().to_string();
             if !crate::util::is_url(&u) {
-                self.error = Some("Please enter a valid URL".into());
+                self.error = Some(i18n::tr("Please enter a valid URL").into());
             } else {
-                let loop_s: i64 = self.loop_input.trim().parse().unwrap_or(0);
-                actions.push(Action::PlayUrl { url: u, loop_s });
-                self.open = false;
+                match self.loop_input.trim().parse::<i64>() {
+                    Ok(loop_s) if (0..=86_400).contains(&loop_s) => {
+                        self.error = None;
+                        actions.push(Action::PlayUrl { url: u, loop_s });
+                        self.open = false;
+                    }
+                    _ => {
+                        self.error = Some(
+                            i18n::tr("Loop interval must be a whole number from 0 to 86400").into(),
+                        );
+                    }
+                }
             }
         }
         self.open = self.open && open;
@@ -893,6 +1012,14 @@ impl ControlPanel {
         }
     }
 
+    /// Open the panel fresh: clear any drag state left over from a previous session,
+    /// so the periodic refresh can never stay disabled by a stale `loading` flag.
+    pub fn open_panel(&mut self) {
+        self.open = true;
+        self.loading = false;
+        self.next_refresh = 0.0;
+    }
+
     /// Re-read every property from mpv, unless the user is mid-drag.
     pub fn refresh(&mut self, engine: &crate::engine::Engine, settings: &Settings) {
         if self.loading {
@@ -946,12 +1073,17 @@ impl ControlPanel {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.set_min_width(450.0);
-                if dialog_header(ui, "Control Panel") {
+                if dialog_header(ui, i18n::tr("Control panel")) {
                     close = true;
                 }
                 tabs(
                     ui,
-                    &["Audio", "Video", "Subtitles", "Playback"],
+                    &[
+                        i18n::tr("Audio"),
+                        i18n::tr("Video"),
+                        i18n::tr("Subtitles"),
+                        i18n::tr("Playback"),
+                    ],
                     &mut self.tab,
                 );
                 ui.separator();
@@ -968,7 +1100,7 @@ impl ControlPanel {
                         _ => self.playback_tab(ui, actions),
                     });
                 ui.add_space(10.0);
-                if button(ui, "control-panel-close", "Close") {
+                if button(ui, "control-panel-close", i18n::tr("Close")) {
                     self.open = false;
                 }
             });
@@ -980,8 +1112,8 @@ impl ControlPanel {
 
     fn audio_tab(&mut self, ui: &mut egui::Ui, settings: &mut Settings, actions: &mut Vec<Action>) {
         let mut track_items = vec![
-            ("Auto".to_string(), TrackSelection::Auto),
-            ("Off".to_string(), TrackSelection::None),
+            (i18n::tr("Auto").to_string(), TrackSelection::Auto),
+            (i18n::tr("Off").to_string(), TrackSelection::None),
         ];
         track_items.extend(self.state.audio_tracks.iter().map(|track| {
             let mut label = track.id.to_string();
@@ -996,7 +1128,7 @@ impl ControlPanel {
             }
             (label, TrackSelection::Id(track.id))
         }));
-        row(ui, "Audio track", |ui| {
+        row(ui, i18n::tr("Audio track"), |ui| {
             if let Some(selection) = combo(
                 ui,
                 "audio-track",
@@ -1013,7 +1145,7 @@ impl ControlPanel {
                 actions.push(action);
             }
         });
-        row(ui, "Audio volume (%)", |ui| {
+        row(ui, i18n::tr("Audio volume (%)"), |ui| {
             let mut volume = self.state.audio.primary_volume;
             if spin(ui, "audio-volume", &mut volume, 1.0, 0.0, 100.0, "%") {
                 self.state.audio.primary_volume = volume;
@@ -1025,22 +1157,22 @@ impl ControlPanel {
         let mut eq_changed = false;
 
         ui.horizontal(|ui| {
-            if check(ui, "eq-enable", "Enable equalizer", &mut enabled) {
+            if check(ui, "eq-enable", i18n::tr("Enable equalizer"), &mut enabled) {
                 eq_changed = true;
             }
             ui.add_space(8.0);
-            label(ui, "Preset...");
+            label(ui, i18n::tr("Preset..."));
             let items: Vec<(String, String)> = EQ_PRESETS
                 .iter()
-                .map(|(name, _)| (name.to_string(), name.to_string()))
+                .map(|(name, _)| ((*name).to_string(), (*name).to_string()))
                 .collect();
             let none = String::new();
-            if let Some(name) = combo(ui, "eq-preset", &items, &none, 110.0) {
-                if let Some((_, values)) = EQ_PRESETS.iter().find(|(n, _)| *n == name.as_str()) {
-                    eq = values.to_vec();
-                    enabled = true;
-                    eq_changed = true;
-                }
+            if let Some(name) = combo(ui, "eq-preset", &items, &none, 110.0)
+                && let Some((_, values)) = EQ_PRESETS.iter().find(|(n, _)| *n == name.as_str())
+            {
+                eq = values.to_vec();
+                enabled = true;
+                eq_changed = true;
             }
         });
         ui.add_space(6.0);
@@ -1050,6 +1182,15 @@ impl ControlPanel {
         let total_w = band_w * EQ_FREQS.len() as f32;
         let (rect, _) = ui.allocate_exact_size(vec2(total_w, 150.0), Sense::hover());
         let p = ui.painter_at(rect);
+        // 0 dB reference line across all bands.
+        let zero_y = rect.top() + 8.0 + 55.0;
+        p.line_segment(
+            [
+                pos2(rect.left() + 2.0, zero_y),
+                pos2(rect.right() - 2.0, zero_y),
+            ],
+            Stroke::new(1.0, active_colors().line),
+        );
         for (i, freq) in EQ_FREQS.iter().enumerate() {
             let x0 = rect.left() + band_w * i as f32;
             let track = Rect::from_min_size(
@@ -1097,12 +1238,17 @@ impl ControlPanel {
 
         let mut normalize = self.state.normalize;
         ui.horizontal(|ui| {
-            if check(ui, "normalize", "Normalize volume", &mut normalize) {
+            if check(
+                ui,
+                "normalize",
+                i18n::tr("Normalize volume"),
+                &mut normalize,
+            ) {
                 actions.push(Action::SetNormalize(normalize));
                 self.state.normalize = normalize;
             }
             ui.add_space(8.0);
-            label(ui, "Audio sync (sec):");
+            label(ui, i18n::tr("Audio sync (sec):"));
             let mut d = self.state.audio_delay;
             if spin(ui, "audio-delay", &mut d, 0.05, -60.0, 60.0, "") {
                 actions.push(Action::SetAudioDelay(d));
@@ -1121,11 +1267,11 @@ impl ControlPanel {
 
     fn video_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         for (label_text, prop, field) in [
-            ("Brightness", "brightness", 0usize),
-            ("Contrast", "contrast", 1),
-            ("Saturation", "saturation", 2),
-            ("Hue", "hue", 3),
-            ("Gamma", "gamma", 4),
+            (i18n::tr("Brightness"), "brightness", 0usize),
+            (i18n::tr("Contrast"), "contrast", 1),
+            (i18n::tr("Saturation"), "saturation", 2),
+            (i18n::tr("Hue"), "hue", 3),
+            (i18n::tr("Gamma"), "gamma", 4),
         ] {
             let mut v = [
                 self.state.brightness,
@@ -1166,7 +1312,7 @@ impl ControlPanel {
             }
         }
         ui.add_space(8.0);
-        if button(ui, "img-reset", "Reset") {
+        if button(ui, "img-reset", i18n::tr("Reset")) {
             actions.push(Action::ImageReset);
             self.state.brightness = 0.0;
             self.state.contrast = 0.0;
@@ -1177,14 +1323,14 @@ impl ControlPanel {
     }
 
     fn subtitle_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        row(ui, "Subtitle sync (sec)", |ui| {
+        row(ui, i18n::tr("Subtitle sync (sec)"), |ui| {
             let mut v = self.state.sub_delay;
             if spin(ui, "sub-delay", &mut v, 0.5, -600.0, 600.0, "") {
                 actions.push(Action::SetSubDelay(v));
                 self.state.sub_delay = v;
             }
         });
-        row(ui, "Size", |ui| {
+        row(ui, i18n::tr("Size"), |ui| {
             let mut v = self.state.sub_scale * 100.0;
             let r = ui.add(
                 egui::Slider::new(&mut v, 30.0..=300.0)
@@ -1196,10 +1342,10 @@ impl ControlPanel {
                 self.state.sub_scale = v / 100.0;
             }
         });
-        row(ui, "Vertical position", |ui| {
+        row(ui, i18n::tr("Vertical position"), |ui| {
             let mut v = self.state.sub_pos;
             let r = ui.add(
-                egui::Slider::new(&mut v, 0.0..=150.0)
+                egui::Slider::new(&mut v, 0.0..=100.0)
                     .fixed_decimals(0)
                     .show_value(false),
             );
@@ -1210,18 +1356,18 @@ impl ControlPanel {
         });
         ui.add_space(4.0);
         let mut visible = self.state.sub_visible;
-        if check(ui, "sub-vis", "Show subtitles", &mut visible) {
+        if check(ui, "sub-vis", i18n::tr("Show subtitles"), &mut visible) {
             actions.push(Action::ToggleSubVisibility);
             self.state.sub_visible = visible;
         }
         ui.add_space(8.0);
-        if button(ui, "sub-reset", "Reset") {
+        if button(ui, "sub-reset", i18n::tr("Reset")) {
             actions.push(Action::SubReset);
         }
     }
 
     fn playback_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        row(ui, "Speed", |ui| {
+        row(ui, i18n::tr("Speed"), |ui| {
             let mut v = self.state.speed * 100.0;
             let r = ui.add(
                 egui::Slider::new(&mut v, 20.0..=400.0)
@@ -1240,22 +1386,22 @@ impl ControlPanel {
             );
         });
         ui.add_space(4.0);
-        if button(ui, "normal-speed", "Normal Speed") {
+        if button(ui, "normal-speed", i18n::tr("Normal Speed")) {
             actions.push(Action::SetSpeed(1.0));
             self.state.speed = 1.0;
         }
         ui.add_space(8.0);
-        label(ui, "A-B repeat");
+        label(ui, i18n::tr("A-B repeat"));
         ui.horizontal(|ui| {
-            if button(ui, "ab-a", "Set A") {
+            if button(ui, "ab-a", i18n::tr("Set A")) {
                 actions.push(Action::AbSet('a'));
             }
             ui.add_space(4.0);
-            if button(ui, "ab-b", "Set B") {
+            if button(ui, "ab-b", i18n::tr("Set B")) {
                 actions.push(Action::AbSet('b'));
             }
             ui.add_space(4.0);
-            if button(ui, "ab-clear", "Clear") {
+            if button(ui, "ab-clear", i18n::tr("Clear")) {
                 actions.push(Action::AbClear);
             }
         });
@@ -1281,6 +1427,7 @@ impl ControlPanel {
 
 // -- Preferences -----------------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct PreferencesDialog {
     pub open: bool,
     pub tab: usize,
@@ -1288,18 +1435,6 @@ pub struct PreferencesDialog {
     orig_hwdec: bool,
     /// Set when the user presses OK or Apply; the player swaps it in and re-applies.
     pub result: Option<(Settings, bool)>,
-}
-
-impl Default for PreferencesDialog {
-    fn default() -> Self {
-        Self {
-            open: false,
-            tab: 0,
-            temp: Settings::default(),
-            orig_hwdec: false,
-            result: None,
-        }
-    }
 }
 
 impl PreferencesDialog {
@@ -1311,7 +1446,7 @@ impl PreferencesDialog {
     }
 
     pub fn select_tab(&mut self, name: &str) {
-        for (i, t) in ["General", "Playback", "Subtitles", "Audio"]
+        for (i, t) in ["General", "Playback", "Subtitles", "Audio", "Network"]
             .iter()
             .enumerate()
         {
@@ -1339,12 +1474,18 @@ impl PreferencesDialog {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.set_min_width(540.0);
-                if dialog_header(ui, "Preferences") {
+                if dialog_header(ui, i18n::tr("Preferences")) {
                     close = true;
                 }
                 tabs(
                     ui,
-                    &["General", "Playback", "Subtitles", "Audio"],
+                    &[
+                        i18n::tr("General"),
+                        i18n::tr("Playback"),
+                        i18n::tr("Subtitles"),
+                        i18n::tr("Audio"),
+                        i18n::tr("Network"),
+                    ],
                     &mut self.tab,
                 );
                 ui.separator();
@@ -1358,10 +1499,11 @@ impl PreferencesDialog {
                         0 => self.tab_general(ui),
                         1 => self.tab_playback(ui),
                         2 => self.tab_subtitles(ui),
-                        _ => self.tab_audio(ui),
+                        3 => self.tab_audio(ui),
+                        _ => self.tab_network(ui),
                     });
                 ui.add_space(10.0);
-                let (ok, cancel, apply, close_button) = ok_cancel_apply(ui);
+                let (ok, cancel, apply) = dialog_footer(ui, true, true, true);
                 if cancel {
                     self.open = false;
                 }
@@ -1373,10 +1515,6 @@ impl PreferencesDialog {
                     self.orig_hwdec = self.temp.hwdec;
                     self.result = Some((self.temp.clone(), hwdec_changed));
                     actions.push(Action::ApplySettings { hwdec_changed });
-                }
-                if close_button {
-                    self.open = false;
-                    close = true;
                 }
             });
         if close {
@@ -1392,12 +1530,12 @@ impl PreferencesDialog {
         if check(
             ui,
             "autofit",
-            "Resize the window to the video when a file opens",
+            i18n::tr("Resize the window to the video when a file opens"),
             &mut autofit,
         ) {
             t.autofit = autofit;
         }
-        row(ui, "Largest window size (of the screen)", |ui| {
+        row(ui, i18n::tr("Largest window size (of the screen)"), |ui| {
             let mut pct = t.autofit_max_pct as f64;
             if spin(ui, "autofit-pct", &mut pct, 1.0, 30.0, 100.0, "%") {
                 t.autofit_max_pct = pct as i64;
@@ -1407,17 +1545,17 @@ impl PreferencesDialog {
         if check(
             ui,
             "resume",
-            "Remember the playback position of each file",
+            i18n::tr("Remember the playback position of each file"),
             &mut resume,
         ) {
             t.resume = resume;
         }
         let mut ont = t.on_top.clone();
-        row(ui, "Always on top", |ui| {
+        row(ui, i18n::tr("Always on top"), |ui| {
             let items: Vec<(String, String)> = [
-                ("Never", "never"),
-                ("Always", "always"),
-                ("While playing", "playing"),
+                (i18n::tr("Never"), "never"),
+                (i18n::tr("Always"), "always"),
+                (i18n::tr("While playing"), "playing"),
             ]
             .iter()
             .map(|(l, v)| (l.to_string(), v.to_string()))
@@ -1431,16 +1569,21 @@ impl PreferencesDialog {
         if check(
             ui,
             "show-remaining",
-            "Show remaining time instead of total",
+            i18n::tr("Show the remaining time instead of the total"),
             &mut show_remaining,
         ) {
             t.show_remaining = show_remaining;
         }
         let mut hdr = t.hdr_tone_mapping;
-        if check(ui, "hdr-tone-mapping", "Convert HDR video to SDR", &mut hdr) {
+        if check(
+            ui,
+            "hdr-tone-mapping",
+            i18n::tr("Tone-map HDR video for standard displays"),
+            &mut hdr,
+        ) {
             t.hdr_tone_mapping = hdr;
         }
-        row(ui, "HDR tone mapping", |ui| {
+        row(ui, i18n::tr("HDR tone mapping"), |ui| {
             let items: Vec<(String, String)> = ["bt.2390", "reinhard", "mobius", "hable"]
                 .into_iter()
                 .map(|mode| (mode.to_string(), mode.to_string()))
@@ -1455,32 +1598,73 @@ impl PreferencesDialog {
                 t.hdr_tone_mapping_mode = mode;
             }
         });
-        row(ui, "Fullscreen display index", |ui| {
+        row(ui, i18n::tr("Fullscreen monitor"), |ui| {
             let mut index = t.fullscreen_monitor as f64;
             if spin(ui, "fullscreen-monitor", &mut index, 1.0, 0.0, 8.0, "") {
                 t.fullscreen_monitor = index as usize;
             }
         });
-        row(ui, "Screenshot folder", |ui| {
+        row(ui, i18n::tr("Screenshot folder"), |ui| {
             let mut dir = t.screenshot_dir.clone();
             if line_edit(ui, "shot-dir", &mut dir, 200.0, "~/Pictures/MacPlayer") {
                 t.screenshot_dir = dir;
             }
             ui.add_space(4.0);
-            if button(ui, "shot-browse", "Browse...") {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    t.screenshot_dir = p.to_string_lossy().to_string();
-                }
+            if button(ui, "shot-browse", i18n::tr("Browse…"))
+                && let Some(p) = rfd::FileDialog::new().pick_folder()
+            {
+                t.screenshot_dir = p.to_string_lossy().to_string();
+            }
+        });
+        row(ui, i18n::tr("Theme"), |ui| {
+            let items: Vec<(String, String)> =
+                [(i18n::tr("Dark"), "dark"), (i18n::tr("Light"), "light")]
+                    .iter()
+                    .map(|(l, v)| (l.to_string(), v.to_string()))
+                    .collect();
+            let cur = t.theme.clone();
+            if let Some(v) = combo(ui, "pref-theme", &items, &cur, 130.0) {
+                t.theme = v;
+            }
+        });
+        row(ui, i18n::tr("Accent color"), |ui| {
+            let items: Vec<(String, String)> = [
+                (i18n::tr("Gold"), "gold"),
+                (i18n::tr("Blue"), "blue"),
+                (i18n::tr("Green"), "green"),
+                (i18n::tr("Rose"), "rose"),
+                (i18n::tr("Graphite"), "graphite"),
+            ]
+            .iter()
+            .map(|(l, v)| (l.to_string(), v.to_string()))
+            .collect();
+            let cur = t.accent.clone();
+            if let Some(v) = combo(ui, "pref-accent", &items, &cur, 130.0) {
+                t.accent = v;
+            }
+        });
+        row(ui, i18n::tr("Language"), |ui| {
+            let items: Vec<(String, String)> =
+                [(i18n::tr("English"), "en"), (i18n::tr("Persian"), "fa")]
+                    .iter()
+                    .map(|(l, v)| (l.to_string(), v.to_string()))
+                    .collect();
+            let cur = t.language.clone();
+            if let Some(v) = combo(ui, "pref-language", &items, &cur, 130.0) {
+                t.language = v;
             }
         });
     }
 
     fn tab_playback(&mut self, ui: &mut egui::Ui) {
         for (key, text) in [
-            ("seek_small", "Seek step: Left / Right"),
-            ("seek_medium", "Seek step: Ctrl + Left / Right"),
-            ("seek_large", "Seek step: Shift + Left / Right"),
-            ("seek_huge", "Seek step: Ctrl + Alt + Left / Right"),
+            ("seek_small", i18n::tr("Seek step: Left / Right")),
+            ("seek_medium", i18n::tr("Seek step: Ctrl + Left / Right")),
+            ("seek_large", i18n::tr("Seek step: Shift + Left / Right")),
+            (
+                "seek_huge",
+                i18n::tr("Seek step: Ctrl + Alt + Left / Right"),
+            ),
         ] {
             row(ui, text, |ui| {
                 let t = &mut self.temp;
@@ -1500,11 +1684,18 @@ impl PreferencesDialog {
                 }
             });
         }
-        row(ui, "Volume step", |ui| {
+        row(ui, i18n::tr("Volume step"), |ui| {
             let t = &mut self.temp;
             let mut v = t.volume_step;
             if spin(ui, "volume-step", &mut v, 1.0, 1.0, 20.0, "%") {
                 t.volume_step = v;
+            }
+        });
+        row(ui, i18n::tr("Maximum volume (%)"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.volume_max as f64;
+            if spin(ui, "volume-max", &mut v, 5.0, 100.0, 200.0, "%") {
+                t.volume_max = v as i64;
             }
         });
         let t = &mut self.temp;
@@ -1512,7 +1703,7 @@ impl PreferencesDialog {
         if check(
             ui,
             "hwdec",
-            "Use hardware video decoding when available",
+            i18n::tr("Use hardware video decoding when available"),
             &mut hwdec,
         ) {
             t.hwdec = hwdec;
@@ -1522,7 +1713,7 @@ impl PreferencesDialog {
     fn tab_subtitles(&mut self, ui: &mut egui::Ui) {
         let t = &mut self.temp;
         let mut use_default = t.sub_font.is_empty();
-        row(ui, "Font", |ui| {
+        row(ui, i18n::tr("Font"), |ui| {
             let mut family = t.sub_font.clone();
             if line_edit(ui, "sub-font", &mut family, 200.0, "sans-serif") {
                 t.sub_font = family;
@@ -1532,14 +1723,13 @@ impl PreferencesDialog {
         if check(
             ui,
             "sub-font-default",
-            "Use the default font",
+            i18n::tr("Use the default font"),
             &mut use_default,
-        ) {
-            if use_default {
-                t.sub_font.clear();
-            }
+        ) && use_default
+        {
+            t.sub_font.clear();
         }
-        row(ui, "Size", |ui| {
+        row(ui, i18n::tr("Size"), |ui| {
             let t = &mut self.temp;
             let mut v = t.sub_size as f64;
             if spin(ui, "sub-size", &mut v, 1.0, 10.0, 150.0, "") {
@@ -1548,10 +1738,10 @@ impl PreferencesDialog {
         });
         let t = &mut self.temp;
         let mut bold = t.sub_bold;
-        if check(ui, "sub-bold", "Bold", &mut bold) {
+        if check(ui, "sub-bold", i18n::tr("Bold"), &mut bold) {
             t.sub_bold = bold;
         }
-        row(ui, "Text encoding for non-Unicode files", |ui| {
+        row(ui, i18n::tr("Text encoding for non-Unicode files"), |ui| {
             let t = &mut self.temp;
             let items: Vec<(String, String)> = ENCODINGS
                 .iter()
@@ -1562,13 +1752,13 @@ impl PreferencesDialog {
                 t.sub_codepage = v;
             }
         });
-        row(ui, "Load subtitles automatically", |ui| {
+        row(ui, i18n::tr("Load subtitles automatically"), |ui| {
             let t = &mut self.temp;
             let items: Vec<(String, String)> = [
-                ("Same name as the video", "exact"),
-                ("Names containing the video name", "fuzzy"),
-                ("Every subtitle in the folder", "all"),
-                ("Do not load automatically", "no"),
+                (i18n::tr("Same name as the video"), "exact"),
+                (i18n::tr("Names containing the video name"), "fuzzy"),
+                (i18n::tr("Every subtitle in the folder"), "all"),
+                (i18n::tr("Do not load automatically"), "no"),
             ]
             .iter()
             .map(|(l, m)| (l.to_string(), m.to_string()))
@@ -1578,126 +1768,530 @@ impl PreferencesDialog {
                 t.sub_auto = v;
             }
         });
-        row(ui, "Preferred subtitle languages", |ui| {
+        row(ui, i18n::tr("Preferred subtitle languages"), |ui| {
             let t = &mut self.temp;
             let mut v = t.preferred_sub_lang.clone();
             if line_edit(ui, "sub-lang", &mut v, 170.0, "e.g. fa,per,en") {
                 t.preferred_sub_lang = v;
             }
         });
+        ui.add_space(6.0);
+        heading(ui, i18n::tr("Subtitle Style"));
+        let palette = |ui: &mut egui::Ui, id: &str, current: &mut String| {
+            let items: Vec<(String, String)> = SUB_COLORS
+                .iter()
+                .map(|(hex, label)| (i18n::tr(label).to_string(), (*hex).to_string()))
+                .collect();
+            let mut cur = current.clone();
+            if let Some(v) = combo(ui, id, &items, &cur, 130.0) {
+                cur = v;
+            }
+            *current = cur;
+        };
+        row(ui, i18n::tr("Text color"), |ui| {
+            let t = &mut self.temp;
+            palette(ui, "sub-color", &mut t.sub_color);
+        });
+        row(ui, i18n::tr("Border width"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.sub_border_size;
+            if spin(ui, "sub-border-size", &mut v, 0.5, 0.0, 10.0, "px") {
+                t.sub_border_size = v;
+            }
+        });
+        row(ui, i18n::tr("Border color"), |ui| {
+            let t = &mut self.temp;
+            palette(ui, "sub-border-color", &mut t.sub_border_color);
+        });
+        row(ui, i18n::tr("Shadow"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.sub_shadow_offset;
+            if spin(ui, "sub-shadow", &mut v, 0.5, 0.0, 10.0, "px") {
+                t.sub_shadow_offset = v;
+            }
+        });
+        let t = &mut self.temp;
+        let mut back = t.sub_back_enable;
+        if check(ui, "sub-back", i18n::tr("Background box"), &mut back) {
+            t.sub_back_enable = back;
+        }
+        if t.sub_back_enable {
+            row(ui, i18n::tr("Background color"), |ui| {
+                let t = &mut self.temp;
+                palette(ui, "sub-back-color", &mut t.sub_back_color);
+            });
+        }
     }
 
     fn tab_audio(&mut self, ui: &mut egui::Ui) {
-        row(ui, "Preferred audio languages", |ui| {
+        row(ui, i18n::tr("Preferred audio languages"), |ui| {
             let t = &mut self.temp;
             let mut v = t.preferred_audio_lang.clone();
             if line_edit(ui, "audio-lang", &mut v, 170.0, "e.g. en,fa") {
                 t.preferred_audio_lang = v;
             }
         });
-    }
-}
-
-// -- media info ------------------------------------------------------------------------------------
-
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::None => String::new(),
-        Value::Bool(value) => value.to_string(),
-        Value::Int(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::Str(value) => value.clone(),
-        Value::Array(values) => format!(
-            "[{}]",
-            values.iter().map(value_text).collect::<Vec<_>>().join(", ")
-        ),
-        Value::Map(values) => values
+        let t = &mut self.temp;
+        let mut pitch = t.audio_pitch_correction;
+        if check(
+            ui,
+            "audio-pitch",
+            i18n::tr("Keep pitch when changing speed"),
+            &mut pitch,
+        ) {
+            t.audio_pitch_correction = pitch;
+        }
+        row(ui, i18n::tr("Audio passthrough (S/PDIF)"), |ui| {
+            let t = &mut self.temp;
+            let items: Vec<(String, String)> = SPDIF_MODES
+                .iter()
+                .map(|(value, label)| (i18n::tr(label).to_string(), (*value).to_string()))
+                .collect();
+            let cur = t.audio_spdif.clone();
+            if let Some(v) = combo(ui, "audio-spdif", &items, &cur, 190.0) {
+                t.audio_spdif = v;
+            }
+        });
+        let t = &mut self.temp;
+        let mut exclusive = t.audio_exclusive;
+        if check(
+            ui,
+            "audio-exclusive",
+            i18n::tr("Exclusive audio output"),
+            &mut exclusive,
+        ) {
+            t.audio_exclusive = exclusive;
+        }
+        row(ui, i18n::tr("Channel layout"), |ui| {
+            let t = &mut self.temp;
+            let items: Vec<(String, String)> = [
+                (i18n::tr("Auto"), "auto"),
+                (i18n::tr("Stereo"), "stereo"),
+                (i18n::tr("Reversed stereo"), "reverse"),
+                ("5.1", "5.1"),
+                ("7.1", "7.1"),
+            ]
             .iter()
-            .map(|(key, value)| format!("{key}: {}", value_text(value)))
-            .collect::<Vec<_>>()
-            .join(", "),
+            .map(|(l, v)| (l.to_string(), v.to_string()))
+            .collect();
+            let cur = t.audio_channels.clone();
+            if let Some(v) = combo(ui, "audio-channels", &items, &cur, 130.0) {
+                t.audio_channels = v;
+            }
+        });
+        row(ui, i18n::tr("Default visualizer"), |ui| {
+            let t = &mut self.temp;
+            let items: Vec<(String, String)> = [
+                (i18n::tr("Off"), "off"),
+                (i18n::tr("Wave"), "wave"),
+                (i18n::tr("Spectrum"), "spectrum"),
+            ]
+            .iter()
+            .map(|(l, v)| (l.to_string(), v.to_string()))
+            .collect();
+            let cur = t.visualizer.clone();
+            if let Some(v) = combo(ui, "visualizer", &items, &cur, 130.0) {
+                t.visualizer = v;
+            }
+        });
+        let t = &mut self.temp;
+        let mut auto_viz = t.auto_visualizer;
+        if check(
+            ui,
+            "auto-visualizer",
+            i18n::tr("Show visualizer for audio files"),
+            &mut auto_viz,
+        ) {
+            t.auto_visualizer = auto_viz;
+        }
+    }
+
+    fn tab_network(&mut self, ui: &mut egui::Ui) {
+        row(ui, i18n::tr("Stream cache (sec, 0 = auto)"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.cache_secs as f64;
+            if spin(ui, "cache-secs", &mut v, 1.0, 0.0, 600.0, "") {
+                t.cache_secs = v as i64;
+            }
+        });
+        row(ui, i18n::tr("Demuxer cache (MiB, 0 = auto)"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.demuxer_max_mb as f64;
+            if spin(ui, "demuxer-max", &mut v, 16.0, 0.0, 4096.0, "") {
+                t.demuxer_max_mb = v as i64;
+            }
+        });
+        row(ui, i18n::tr("HTTP user agent"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.http_user_agent.clone();
+            if line_edit(ui, "http-user-agent", &mut v, 240.0, "Mozilla/5.0") {
+                t.http_user_agent = v;
+            }
+        });
+        row(ui, i18n::tr("HTTP headers"), |ui| {
+            let t = &mut self.temp;
+            let mut v = t.http_headers.clone();
+            if line_edit(
+                ui,
+                "http-headers",
+                &mut v,
+                240.0,
+                "Referer: https://example.com",
+            ) {
+                t.http_headers = v;
+            }
+        });
+        ui.add_space(4.0);
+        label(ui, i18n::tr("One header per line, format: Key: Value"));
+        ui.add_space(4.0);
+        label(
+            ui,
+            i18n::tr("These apply to URLs; local files are unaffected"),
+        );
     }
 }
 
-/// Build the "Media Information" text block from mpv properties.
-pub fn media_info_text(engine: &crate::engine::Engine) -> String {
-    let mut out = String::new();
-    let s = |name: &str| engine.get(name).map(|v| value_text(&v)).unwrap_or_default();
-    let path = engine
-        .get("path")
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
-    let _ = path;
-    out.push_str(&format!(
-        "File: {}\n",
-        engine
-            .get("media-title")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default()
-    ));
-    out.push_str(&format!(
-        "Duration: {}\n",
-        crate::util::fmt_time(engine.get_f64("duration"))
-    ));
-    out.push('\n');
-    let video = engine.get("video-params");
-    if !video.is_none() {
-        out.push_str("Video:\n");
-        for (key, label) in [
-            ("codec", "Codec"),
-            ("width", "Width"),
-            ("height", "Height"),
-            ("pixelformat", "Pixel format"),
-            ("hw-pixelformat", "Hardware pixel format"),
-            ("container-fps", "Container FPS"),
-            ("estimated-vf-fps", "Estimated FPS"),
-            ("color-space", "Color space"),
-            ("color-range", "Color range"),
-            ("hardware", "Hardware decoder"),
-        ] {
-            let v = video
-                .as_ref()
-                .map(|value| value.get(key))
-                .unwrap_or(Value::None);
-            if !v.is_none() {
-                out.push_str(&format!("  {label}: {}\n", value_text(&v)));
+/// Fixed palette offered for subtitle colors.
+const SUB_COLORS: &[(&str, &str)] = &[
+    ("#ffffff", "White"),
+    ("#ffff00", "Yellow"),
+    ("#00ffff", "Cyan"),
+    ("#ffb000", "Amber"),
+    ("#00ff00", "Green"),
+    ("#000000", "Black"),
+];
+
+/// Passthrough presets: (mpv audio-spdif value, label).
+const SPDIF_MODES: &[(&str, &str)] = &[
+    ("", "None"),
+    ("ac3", "AC3 (Dolby Digital)"),
+    ("dts", "DTS"),
+    ("ac3,dts", "AC3 + DTS"),
+    ("eac3,ac3,dts", "E-AC3 + AC3 + DTS"),
+    ("truehd,eac3,ac3,dts", "TrueHD + E-AC3 + AC3 + DTS"),
+    (
+        "dts-hd,truehd,eac3,ac3,dts",
+        "Everything (DTS-HD, TrueHD, ...)",
+    ),
+];
+
+// -- History dialog --------------------------------------------------------------------------------
+
+/// Watched-file history list with per-row play buttons.
+#[derive(Default)]
+pub struct HistoryDialog {
+    pub open: bool,
+}
+
+impl HistoryDialog {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        history: &[crate::settings::HistoryEntry],
+        actions: &mut Vec<Action>,
+    ) {
+        if !self.open {
+            return;
+        }
+        let mut open = self.open;
+        let mut close = false;
+        Window::new(i18n::tr("History"))
+            .open(&mut open)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(420.0)
+            .frame(dlg_frame())
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(500.0);
+                if dialog_header(ui, i18n::tr("History")) {
+                    close = true;
+                }
+                let scroll_height = ui.available_height().max(200.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("history-scroll")
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        if history.is_empty() {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(i18n::tr("Nothing watched yet"))
+                                    .size(12.0)
+                                    .color(active_colors().text_dim),
+                            );
+                        }
+                        let colors = active_colors();
+                        let row_font = skin::font(12.0, false);
+                        let meta_font = skin::mono(10.0);
+                        for (index, entry) in history.iter().take(200).enumerate() {
+                            let row_h = 40.0;
+                            let row_w = ui.available_width();
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(row_w, row_h), Sense::click());
+                            let resp =
+                                ui.interact(rect, Id::new(("history-row", index)), Sense::click());
+                            let p = ui.painter_at(rect);
+                            if resp.hovered() {
+                                p.rect_filled(rect, 6.0, colors.button_hover);
+                            }
+                            // Accent play chip on the left.
+                            let chip = Rect::from_center_size(
+                                pos2(rect.left() + 22.0, rect.center().y),
+                                vec2(24.0, 24.0),
+                            );
+                            p.rect_filled(chip, 6.0, colors.select);
+                            skin::draw_icon(
+                                &p,
+                                "play",
+                                chip.center().x + 0.5,
+                                chip.center().y,
+                                colors.accent,
+                                colors.select,
+                            );
+                            // Title over progress meta.
+                            let title_x = chip.right() + 10.0;
+                            let title_w = (row_w - (title_x - rect.left()) - 150.0).max(60.0);
+                            let title = skin::elide(&p, &entry.title, &row_font, title_w);
+                            p.text(
+                                pos2(title_x, rect.top() + 7.0),
+                                Align2::LEFT_TOP,
+                                title,
+                                row_font.clone(),
+                                if resp.hovered() {
+                                    colors.text_bright
+                                } else {
+                                    colors.text_e4
+                                },
+                            );
+                            let progress = if entry.duration > 0.0 {
+                                format!(
+                                    "{} / {}  ·  ",
+                                    crate::util::fmt_time(entry.position),
+                                    crate::util::fmt_time(entry.duration)
+                                )
+                            } else {
+                                format!("{}  ·  ", crate::util::fmt_time(entry.position))
+                            };
+                            p.text(
+                                pos2(title_x, rect.bottom() - 9.0),
+                                Align2::LEFT_BOTTOM,
+                                format!(
+                                    "{progress}{}",
+                                    crate::util::format_unix_time(entry.played_at)
+                                ),
+                                meta_font.clone(),
+                                colors.text_dim,
+                            );
+                            if resp.clicked() {
+                                actions.push(Action::PlayHistory(entry.path.clone()));
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if button(ui, "history-clear", i18n::tr("Clear History")) && !history.is_empty()
+                    {
+                        actions.push(Action::ClearHistory);
+                    }
+                    ui.add_space(4.0);
+                    if button(ui, "history-close", i18n::tr("Close")) {
+                        self.open = false;
+                    }
+                });
+            });
+        if close {
+            self.open = false;
+        }
+        self.open = self.open && open;
+    }
+}
+
+// -- settings popover -----------------------------------------------------------------------------
+
+/// The small quick-settings popover from the title-bar gear: theme, language and the
+/// two most common toggles. Everything rarer lives in the full Preferences dialog.
+#[derive(Debug, Default)]
+pub struct SettingsPopover {
+    pub open: bool,
+    /// The click that opens the popover arrives in the same frame `show` first runs;
+    /// the outside-close check must skip that frame or it closes instantly.
+    pub just_opened: bool,
+}
+
+impl SettingsPopover {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        anchor: Rect,
+        settings: &mut Settings,
+        actions: &mut Vec<Action>,
+    ) {
+        if !self.open {
+            return;
+        }
+        let colors = active_colors();
+        let width = 292.0;
+        let pos = pos2((anchor.right() - width).max(8.0), anchor.bottom() + 6.0);
+        let mut keep_open = true;
+        let area = egui::Area::new(egui::Id::new("settings-popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(colors.dialog_bg)
+                    .stroke(Stroke::new(1.0, colors.dialog_line))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(6))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 2,
+                        color: colors.shadow,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(width - 12.0);
+                        let theme_items: Vec<(String, String)> =
+                            [(i18n::tr("Dark"), "dark"), (i18n::tr("Light"), "light")]
+                                .iter()
+                                .map(|(l, v)| (l.to_string(), v.to_string()))
+                                .collect();
+                        popover_row(ui, i18n::tr("Theme"), |ui| {
+                            if popover_seg(ui, &theme_items, &mut settings.theme) {
+                                actions.push(Action::SetThemeLive(settings.theme.clone()));
+                            }
+                        });
+                        let lang_items: Vec<(String, String)> =
+                            [(i18n::tr("English"), "en"), (i18n::tr("Persian"), "fa")]
+                                .iter()
+                                .map(|(l, v)| (l.to_string(), v.to_string()))
+                                .collect();
+                        popover_row(ui, i18n::tr("Language"), |ui| {
+                            if popover_seg(ui, &lang_items, &mut settings.language) {
+                                actions.push(Action::SetLanguageLive(settings.language.clone()));
+                            }
+                        });
+                        if popover_toggle(
+                            ui,
+                            i18n::tr("Resume where you left off"),
+                            settings.resume,
+                        ) {
+                            actions.push(Action::ToggleResume);
+                        }
+                        if popover_toggle(ui, i18n::tr("Hardware decoding"), settings.hwdec) {
+                            actions.push(Action::SetHwdec(!settings.hwdec));
+                        }
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(i18n::tr("All settings are in Preferences"))
+                                        .size(11.5)
+                                        .color(colors.text_9a),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            actions.push(Action::ShowPreferences(None));
+                            keep_open = false;
+                        }
+                    });
+            });
+        // Click anywhere outside the popover's real rect closes it — except on the
+        // opening frame, whose click belongs to the gear button itself.
+        if self.just_opened {
+            self.just_opened = false;
+        } else if ctx.input(|i| i.pointer.any_click())
+            && !area
+                .response
+                .rect
+                .contains(ctx.input(|i| i.pointer.latest_pos()).unwrap_or(pos))
+        {
+            keep_open = false;
+        }
+        self.open = keep_open;
+    }
+}
+
+/// One labelled row of the settings popover.
+fn popover_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(label)
+                .size(12.0)
+                .color(active_colors().text_e4),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            add(ui);
+            ui.add_space(6.0);
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// Small segmented control; mutates `current` and returns true when it changed.
+fn popover_seg(ui: &mut egui::Ui, items: &[(String, String)], current: &mut String) -> bool {
+    let colors = active_colors();
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for (label, value) in items {
+            let selected = value == current;
+            let text = RichText::new(label.as_str()).size(11.0).color(if selected {
+                colors.text_e4
+            } else {
+                colors.text_9a
+            });
+            let btn = egui::Button::new(text)
+                .fill(if selected {
+                    colors.button_hover
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .corner_radius(6.0);
+            if ui.add(btn).clicked() && !selected {
+                *current = value.clone();
+                changed = true;
             }
         }
-        out.push('\n');
-    }
-    let audio = engine.get("audio-params");
-    if !audio.is_none() {
-        out.push_str("Audio:\n");
-        for (key, label) in [
-            ("codec", "Codec"),
-            ("samplerate", "Sample rate"),
-            ("channels", "Channels"),
-        ] {
-            let v = audio
-                .as_ref()
-                .map(|value| value.get(key))
-                .unwrap_or(Value::None);
-            if !v.is_none() {
-                out.push_str(&format!("  {label}: {}\n", value_text(&v)));
-            }
-        }
-        out.push('\n');
-    }
-    let sub = engine.get("current-tracks/sub");
-    if !sub.is_none() {
-        out.push_str("Subtitle:\n");
-        for (key, label) in [("codec", "Codec"), ("lang", "Language"), ("title", "Title")] {
-            let v = sub
-                .as_ref()
-                .map(|value| value.get(key))
-                .unwrap_or(Value::None);
-            if !v.is_none() {
-                out.push_str(&format!("  {label}: {}\n", value_text(&v)));
-            }
-        }
-        out.push('\n');
-    }
-    out.push_str("Pixel format:\n");
-    out.push_str(&format!("  {}\n", s("video-format")));
-    out
+    });
+    changed
+}
+
+/// Small toggle row; returns true when clicked (the caller applies the flip).
+/// The knob slides between ends with a short eased animation.
+fn popover_toggle(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let colors = active_colors();
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(label)
+                    .size(12.0)
+                    .color(active_colors().text_e4),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 20.0), Sense::click());
+                let painter = ui.painter_at(rect);
+                let fill = if on {
+                    colors.accent
+                } else {
+                    colors.button_hover
+                };
+                painter.rect_filled(rect, 10.0, fill);
+                let slide = ui.ctx().animate_value_with_time(
+                    Id::new(("popover-toggle", label)),
+                    if on { 1.0 } else { 0.0 },
+                    0.12,
+                );
+                let knob_x = rect.left() + 11.0 + slide * (rect.width() - 22.0);
+                painter.circle_filled(pos2(knob_x, rect.center().y), 8.0, colors.text_e4);
+            });
+        })
+        .response;
+    response.clicked()
 }

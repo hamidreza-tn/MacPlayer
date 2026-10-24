@@ -32,6 +32,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY assets ./assets
 
 RUN cargo build --release --locked
 

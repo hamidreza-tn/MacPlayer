@@ -14,13 +14,33 @@ interface for a responsive, keyboard-friendly experience.
 - One Universal release for Apple Silicon and Intel Macs.
 - Hardware decoding when supported, with software fallback.
 - Local files, folders, URLs, playlists and external subtitles.
-- Playlist queueing, sorting, repeat, shuffle, filtering and drag reorder.
+- Playlist queueing, sorting, repeat, shuffle, filtering and drag reorder,
+  with live playback progress, total duration and auto-reveal of the
+  playing row.
 - Subtitle and audio track selection, synchronization and language preferences.
 - Chapters, A/B repeat, speed control, frame stepping, zoom, pan and rotation.
 - HDR-to-SDR tone mapping, equalizer controls and screenshot capture.
 - Bookmarks, resume positions, recent files and single-instance forwarding.
 - Clipboard opening for local paths and URLs.
 - Keyboard shortcuts that use macOS conventions such as `Cmd` and `Option`.
+- Light and dark themes with five accent colors, switchable live in Preferences.
+- A `Cmd+K` command palette that searches the full menu tree and shows each
+  command's shortcut.
+- English and Persian (RTL-shaped) UI, selectable in Preferences.
+- Seekbar hover thumbnails (generated in the background with ffmpeg).
+- Watch history, playlist export to `.m3u8`, and a sleep timer.
+- Loop modes, volume boost up to 200%, and per-file aspect/speed memory.
+- yt-dlp stream quality picker, DVD/Blu-ray folder playback, HTTP header and
+  user-agent overrides for streams.
+- Audio passthrough (S/PDIF), exclusive output, channel layout, pitch-preserving
+  speed change, video sync/interpolation, scaler profiles and toggleable video
+  filters (deband/denoise/sharpen).
+- A music-mode audio visualizer (wave/spectrum) for audio-only files.
+- Trackpad gestures: pinch for fullscreen, `Ctrl`/`Cmd`+scroll to zoom the
+  video, two-finger horizontal scroll to seek.
+- Media keys via `F7`/`F8`/`F9` (previous / play-pause / next) and a PiP-style
+  always-on-top mini player window.
+- Size-capped rotating diagnostic log for crash reports and playback issues.
 
 ## Download
 
@@ -203,6 +223,13 @@ On macOS, settings are stored at:
 ~/Library/Application Support/MacPlayer/settings.json
 ```
 
+Diagnostics (engine errors, crash reports) are written next to it, rotated at
+512 KB with one `.old` generation kept:
+
+```text
+~/Library/Application Support/MacPlayer/Logs/macplayer.log
+```
+
 Build output and local artifacts are intentionally ignored:
 
 ```text
@@ -215,6 +242,7 @@ dist/
 
 ```text
 src/                         Rust application
+assets/fonts/                Bundled Vazirmatn font (SIL OFL 1.1, see OFL.txt)
 macos/                       App metadata and icon generation
 scripts/                    macOS packaging tools
 .github/workflows/           Automated Universal releases

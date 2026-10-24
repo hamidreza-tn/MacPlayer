@@ -69,12 +69,6 @@ impl Value {
         matches!(self, Value::None)
     }
 
-    /// `number | string | bool` shorthand used by the handful of places that need to push
-    /// a scalar straight back into mpv.
-    pub fn number(value: f64) -> Value {
-        Value::Float(value)
-    }
-
     /// Deep-copy a libmpv `mpv_node` into owned data.
     ///
     /// Strings and nested lists/maps are copied, so the result may outlive the node
@@ -82,6 +76,7 @@ impl Value {
     ///
     /// # Safety
     /// `node` must point at a fully initialized `mpv_node`.
+    #[allow(unsafe_code)]
     pub unsafe fn from_mpv_node(node: &crate::ffi::mpv_node) -> Value {
         use crate::ffi::{
             MPV_FORMAT_DOUBLE, MPV_FORMAT_FLAG, MPV_FORMAT_INT64, MPV_FORMAT_NODE_ARRAY,
@@ -129,7 +124,7 @@ impl Value {
                     }
                 }
                 if node.format == MPV_FORMAT_NODE_MAP {
-                    Value::Map(items.into_iter().map(|(k, v)| (k, v)).collect())
+                    Value::Map(items.into_iter().collect())
                 } else {
                     Value::Array(items.into_iter().map(|(_, v)| v).collect())
                 }

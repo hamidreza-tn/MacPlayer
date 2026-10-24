@@ -1,12 +1,18 @@
 CARGO ?= cargo
 
-.PHONY: check test build package-macos package-macos-universal docker-build
+.PHONY: check test clippy fmt build package-macos package-macos-universal docker-build
 
 check:
 	$(CARGO) check --offline --locked --message-format=short
 
 test:
 	$(CARGO) test --offline --locked
+
+clippy:
+	$(CARGO) clippy --offline --locked --all-targets -- -D warnings
+
+fmt:
+	$(CARGO) fmt --all -- --check
 
 build:
 	$(CARGO) build --release --offline --locked
