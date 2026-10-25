@@ -313,7 +313,7 @@ make package-macos-universal \
   OUT=dist/macos-universal
 ```
 
-Pushing a tag (`git tag v1.9.0 && git push origin v1.9.0`) makes
+Pushing a tag (`git tag v1.9.2 && git push origin v1.9.2`) makes
 [GitHub Actions](.github/workflows/release.yml) build both architectures natively,
 merge them, and attach the ZIP + DMG to the matching GitHub Release. Manual runs
 are supported from the **Actions** tab. The packaging script refuses mismatched

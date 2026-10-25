@@ -1,6 +1,6 @@
 [package]
 name = "macplayer"
-version = "1.9.0"
+version = "1.9.2"
 edition = "2024"
 license = "MIT"
 description = "A fast, native media player for macOS built with Rust, egui and libmpv"
