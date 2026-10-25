@@ -21,7 +21,7 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 

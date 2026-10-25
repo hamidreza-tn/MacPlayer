@@ -198,6 +198,7 @@ fn fa(key: &str) -> &str {
         "Drop a file here · ⌘O · or press play" => {
             "فایل را اینجا رها کنید · ⌘O · یا پخش را بزنید"
         }
+        "Reading folder…" => "در حال خواندن پوشه…",
         "Seek back" => "پرش به عقب",
         "Seek forward" => "پرش به جلو",
         "Settings" => "تنظیمات",

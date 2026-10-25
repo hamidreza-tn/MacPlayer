@@ -893,7 +893,18 @@ impl Playlist {
                     colors.text_dim,
                 );
             } else {
-                self.paint_rows(ui, ctx, view, &visible_rows, &mut out, thumbs);
+                // A handful of first-use PNG decodes per frame keeps opening the
+                // drawer hitch-free; the rest fill in over the next frames.
+                let mut texture_budget = 6u32;
+                self.paint_rows(
+                    ui,
+                    ctx,
+                    view,
+                    &visible_rows,
+                    &mut out,
+                    thumbs,
+                    &mut texture_budget,
+                );
             }
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
@@ -1057,6 +1068,7 @@ impl Playlist {
         visible_rows: &[usize],
         out: &mut PlaylistOut,
         thumbs: &mut Thumbnails,
+        texture_budget: &mut u32,
     ) {
         let colors = skin::active_colors();
         let painter = ui.painter_at(view);
@@ -1153,7 +1165,11 @@ impl Playlist {
                 && item_duration > 1.0
             {
                 let path = &self.items[row].path;
-                if let Some(handle) = thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
+                // Budgeted decode: first-use PNG uploads stop after a few per
+                // frame so a freshly opened drawer never hitches on one frame.
+                if *texture_budget > 0
+                    && let Some(handle) =
+                        thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
                 {
                     // Aspect-fit the frame inside the slot (letterboxed by the fill).
                     let size = handle.size_vec2();
@@ -1165,6 +1181,7 @@ impl Playlist {
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
                     drew_frame = true;
+                    *texture_budget -= 1;
                 } else {
                     // Queue once; the worker fills it while the row stays visible.
                     thumbs.ensure(path, item_duration);

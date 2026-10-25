@@ -53,6 +53,25 @@ for the first public release.
   bookmarks, A-B repeat, equalizer and sleep timer behavior unchanged and
   covered by the expanded test suite.
 
+### Performance
+
+- Repaint cadence is now power-aware: during playback the interface follows
+  mpv's decoded-frame callback (a 24 fps video repaints ~24×/s instead of a
+  fixed 60×/s), and when paused the UI drops to a coarse keepalive — waking
+  only for OSD fades and buffering readouts. The main process idles at a
+  fraction of its previous CPU during playback.
+- Hardware decoding prefers direct VideoToolbox→GL interop over copy-back on
+  macOS, skipping the per-frame GPU→RAM→GPU round-trip (notably at 4K), with
+  copy mode and `auto-safe` kept as automatic per-file fallbacks.
+- The 10 s settings autosave persists from a background thread, so the periodic
+  JSON write + fsync can no longer bump the UI.
+- Playlist row previews decode at most a few frames per frame budget, keeping
+  drawer opening hitch-free even with a screenful of rows.
+- Opening a folder expands off the UI thread on a persistent worker (large
+  folders no longer freeze the window); playback of files and URLs keeps the
+  instant synchronous path.
+- Release builds now use full LTO.
+
 ### Diagnostics & platform
 
 - Size-capped rotating diagnostic log at

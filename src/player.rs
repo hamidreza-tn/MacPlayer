@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,9 @@ pub struct Player {
     renderer: Option<Arc<Mutex<Renderer>>>,
     startup_error: Option<String>,
     ipc_rx: Receiver<Vec<String>>,
+    /// Request/result channels for the off-thread folder expansion worker.
+    expander: Option<Sender<(Vec<String>, bool)>>,
+    expanded_rx: Receiver<(Vec<String>, bool)>,
     services: Box<dyn Services>,
 
     settings: Settings,
@@ -227,6 +230,14 @@ impl Player {
         verbose: bool,
         fullscreen: bool,
     ) -> Self {
+        // Folder expansion worker: one persistent thread turns open requests
+        // into fully expanded path lists without ever blocking the UI.
+        let (expander_tx, expander_rx) = channel::<(Vec<String>, bool)>();
+        let (expanded_tx, expanded_rx) = channel::<(Vec<String>, bool)>();
+        let expander_worker = std::thread::Builder::new()
+            .name("open-expander".into())
+            .spawn(move || expand_worker(expander_rx, expanded_tx))
+            .ok();
         // Appearance globals must be set before the first style/font application.
         skin::set_theme(Theme::from_str(&settings.theme));
         skin::set_accent(Accent::from_str(&settings.accent));
@@ -253,6 +264,8 @@ impl Player {
             renderer,
             startup_error,
             ipc_rx,
+            expander: expander_worker.is_some().then_some(expander_tx),
+            expanded_rx,
             services: Box::new(PlatformServices),
             settings,
             settings_error: None,
@@ -957,7 +970,28 @@ impl Player {
     fn autosave(&mut self) {
         self.remember_position();
         self.sync_playlist_settings();
-        self.save_settings();
+        // The 10 s autosave must never stall the UI thread on JSON + fsync:
+        // persist from a background thread instead (single-flight, so a slow
+        // disk cannot pile up writers — the next tick carries newer state).
+        static SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        use std::sync::atomic::Ordering;
+        if SAVING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let snapshot = self.settings.clone();
+        let spawned = std::thread::Builder::new()
+            .name("settings-save".into())
+            .spawn(move || {
+                if let Err(error) = snapshot.try_save() {
+                    crate::logging::write(&format!("settings autosave: {error}"));
+                }
+                SAVING.store(false, Ordering::Release);
+            })
+            .is_ok();
+        if !spawned {
+            SAVING.store(false, Ordering::Release);
+            self.save_settings();
+        }
     }
 
     fn sync_playlist_settings(&mut self) {
@@ -979,13 +1013,28 @@ impl Player {
             self.pending_open.push((paths, append));
             return;
         }
+        // A folder walk can touch tens of thousands of entries: expand off the
+        // UI thread and finish when the worker answers. Plain files and URLs
+        // stay on the fast synchronous path.
+        if paths.iter().any(|p| !is_url(p) && Path::new(p).is_dir()) {
+            if let Some(expander) = &self.expander {
+                let _ = expander.send((paths, append));
+                self.osd(i18n::tr("Reading folder…"));
+                return;
+            }
+        }
+        let expanded = expand_paths(&paths);
+        self.open_expanded(&expanded, append);
+    }
+
+    /// Continuation of [`Self::open_paths`] once paths are fully expanded.
+    fn open_expanded(&mut self, expanded: &[String], append: bool) {
         let mut items: Vec<String> = Vec::new();
-        for path in expand_paths(&paths) {
-            if !is_url(&path) && PLAYLIST_EXT.contains(&ext(&path).as_str()) && ext(&path) != ".cue"
-            {
-                items.extend(read_playlist_file(&path));
+        for path in expanded {
+            if !is_url(path) && PLAYLIST_EXT.contains(&ext(path).as_str()) && ext(path) != ".cue" {
+                items.extend(read_playlist_file(path));
             } else {
-                items.push(path);
+                items.push(path.clone());
             }
         }
         let subs: Vec<String> = items.iter().filter(|p| is_sub(p)).cloned().collect();
@@ -1026,14 +1075,14 @@ impl Player {
             }
             return;
         }
-        let (group, row) = if paths.len() == 1 && media.len() == 1 && Path::new(&media[0]).is_file()
-        {
-            let group = similar_files(&media[0]);
-            let row = group.iter().position(|p| *p == media[0]).unwrap_or(0);
-            (group, row)
-        } else {
-            (media, 0)
-        };
+        let (group, row) =
+            if expanded.len() == 1 && media.len() == 1 && Path::new(&media[0]).is_file() {
+                let group = similar_files(&media[0]);
+                let row = group.iter().position(|p| *p == media[0]).unwrap_or(0);
+                (group, row)
+            } else {
+                (media, 0)
+            };
         self.playlist.set_items(&group);
         self.pending_subs = subs;
         self.play_row(row, true);
@@ -3340,6 +3389,11 @@ impl Player {
             }
         }
 
+        // Folder-expansion answers from the worker thread.
+        while let Ok((expanded, append)) = self.expanded_rx.try_recv() {
+            self.open_expanded(&expanded, append);
+        }
+
         // Control panel refresh timer.
         if self.panel.open && self.now >= self.panel.next_refresh {
             self.panel.next_refresh = self.now + 0.4;
@@ -3441,7 +3495,21 @@ impl Player {
             }
         }
 
-        let interval = if self.is_playing() { 16 } else { 80 };
+        // Repaint cadence is the app's main power lever. While playing, mpv's
+        // frame callback already requests one repaint per decoded frame, so a
+        // slow safety net is enough — a fixed 16 ms timer would repaint a 24 fps
+        // video at 60 fps. When paused the UI is static: repaint only for the
+        // pending OSD fade, active buffering or a coarse keepalive.
+        let buffering = self
+            .state
+            .get("paused-for-cache")
+            .map(|v| v.as_bool())
+            .unwrap_or(false);
+        let message_remaining_ms = self
+            .osd
+            .message_until
+            .map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64);
+        let interval = repaint_interval_ms(self.is_playing(), buffering, message_remaining_ms);
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
@@ -4761,6 +4829,27 @@ fn normalize_speed(value: f64) -> f64 {
     (value.clamp(0.2, 12.0) * 100.0).round() / 100.0
 }
 
+/// Next-repaint delay in milliseconds — the app's main power lever.
+///
+/// * Playing: mpv's frame callback already requests one repaint per decoded
+///   frame; the 200 ms value is only a safety net for property-driven UI
+///   (time text, progress) in case frame events stall.
+/// * Buffering: the percentage readout must tick smoothly.
+/// * OSD message pending: repaint fast enough for the 300 ms fade-out, never
+///   past the deadline itself.
+/// * Otherwise (paused / idle): the UI is static — a coarse 250 ms keepalive.
+fn repaint_interval_ms(playing: bool, buffering: bool, message_remaining_ms: Option<u64>) -> u64 {
+    if playing {
+        200
+    } else if buffering {
+        33
+    } else if let Some(remaining) = message_remaining_ms {
+        remaining.min(33).max(1)
+    } else {
+        250
+    }
+}
+
 /// Right-cluster compaction of the transport row for a given row width.
 #[derive(Debug, Clone, Copy)]
 struct ControlCluster {
@@ -4785,6 +4874,17 @@ fn control_cluster(row_w: f32) -> ControlCluster {
 
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
+}
+
+/// Body of the open-expander thread: expand request paths (following folders
+/// recursively) and hand the result back to the UI thread.
+fn expand_worker(requests: Receiver<(Vec<String>, bool)>, results: Sender<(Vec<String>, bool)>) {
+    while let Ok((paths, append)) = requests.recv() {
+        let expanded = crate::util::expand_paths(&paths);
+        if results.send((expanded, append)).is_err() {
+            break;
+        }
+    }
 }
 
 fn shellexpand(path: &str) -> String {
@@ -4843,7 +4943,30 @@ fn escape_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlCluster, EscapeTarget, control_cluster, escape_target, normalize_speed};
+    use super::{
+        ControlCluster, EscapeTarget, control_cluster, escape_target, expand_worker,
+        normalize_speed, repaint_interval_ms,
+    };
+
+    #[test]
+    fn expander_worker_expands_folders_and_keeps_append_flag() {
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || expand_worker(req_rx, res_tx));
+        let dir = std::env::temp_dir().join(format!("mp-expander-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip.mkv"), b"x").unwrap();
+        req_tx
+            .send((vec![dir.to_string_lossy().into_owned()], true))
+            .unwrap();
+        let (expanded, append) = res_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(append);
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded[0].ends_with("clip.mkv"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn transport_cluster_never_overflows_narrow_rows() {
@@ -4924,5 +5047,21 @@ mod tests {
         assert_eq!(normalize_speed(50.0), 12.0);
         assert_eq!(normalize_speed(f64::NAN), 1.0);
         assert_eq!(normalize_speed(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn repaint_cadence_minimizes_work_per_state() {
+        use super::repaint_interval_ms;
+        // Playing: mpv's frame callback drives the real cadence; 200 ms is a net.
+        assert_eq!(repaint_interval_ms(true, false, None), 200);
+        assert_eq!(repaint_interval_ms(true, false, Some(10)), 200);
+        // Buffering: smooth percentage ticking.
+        assert_eq!(repaint_interval_ms(false, true, None), 33);
+        // OSD message: repaint at fade rate, capped by the remaining time.
+        assert_eq!(repaint_interval_ms(false, false, Some(2_000)), 33);
+        assert_eq!(repaint_interval_ms(false, false, Some(8)), 8);
+        assert_eq!(repaint_interval_ms(false, false, Some(0)), 1);
+        // Static UI: coarse keepalive.
+        assert_eq!(repaint_interval_ms(false, false, None), 250);
     }
 }

@@ -400,14 +400,18 @@ impl Engine {
         })
     }
 
-    /// Copy-back decoders work with any render surface; on macOS the `auto-copy-safe`
-    /// entry resolves to `videotoolbox-copy`.
+    /// On macOS the plain `videotoolbox` entry resolves to a direct
+    /// VideoToolbox→GL interop, which skips the per-frame GPU→RAM→GPU
+    /// round-trip of the `-copy` variants — a large CPU and battery saving at
+    /// 4K. The `-copy` mode and `auto-safe` stay in the chain as per-file
+    /// fallbacks for formats whose direct interop is unsupported; mpv then
+    /// falls back on its own, worst case to software decoding.
     #[cfg(target_os = "macos")]
     pub fn hwdec_value(enabled: bool) -> &'static str {
         if !enabled {
             "no"
         } else {
-            "videotoolbox-copy,vaapi-copy,nvdec-copy,auto-copy-safe"
+            "videotoolbox,videotoolbox-copy,auto-safe"
         }
     }
 
