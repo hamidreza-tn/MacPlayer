@@ -175,14 +175,16 @@ pub fn title_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Folders become their media files (recursively); files and URLs pass through.
+/// Folders become their media files (recursively, following symlinked folders);
+/// files and URLs pass through.
 pub fn expand_paths(paths: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for path in paths {
         if is_url(path) {
             out.push(path.clone());
         } else if Path::new(path).is_dir() {
-            collect_media_recursive(Path::new(path), &mut out);
+            let mut visited = std::collections::HashSet::new();
+            collect_media_recursive(Path::new(path), &mut out, &mut visited);
         } else {
             // Make relative paths absolute without resolving symlinks.
             out.push(
@@ -195,7 +197,17 @@ pub fn expand_paths(paths: &[String]) -> Vec<String> {
     out
 }
 
-fn collect_media_recursive(dir: &Path, out: &mut Vec<String>) {
+fn collect_media_recursive(
+    dir: &Path,
+    out: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) {
+    // Canonicalized path as the cycle key: a symlink pointing back at an ancestor
+    // (or at any already-walked directory) must not loop the walk forever.
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(canonical) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -204,11 +216,10 @@ fn collect_media_recursive(dir: &Path, out: &mut Vec<String>) {
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
-        if entry
-            .file_type()
-            .map(|file_type| file_type.is_dir())
-            .unwrap_or(false)
-        {
+        // `path.is_dir()` follows symlinks, so linked folders are walked like
+        // real ones; broken symlinks fall through to the file branch and are
+        // dropped by the media-extension filter.
+        if path.is_dir() {
             directories.push((name, path));
         } else {
             files.push((name, path));
@@ -225,7 +236,7 @@ fn collect_media_recursive(dir: &Path, out: &mut Vec<String>) {
         }
     }
     for (_, path) in directories {
-        collect_media_recursive(&path, out);
+        collect_media_recursive(&path, out, visited);
     }
 }
 
@@ -463,5 +474,37 @@ mod tests {
         assert_eq!(format_unix_time(1_792_800_000), "2026-10-24 00:00");
         // Leap day: 2000-02-29 12:34 UTC.
         assert_eq!(format_unix_time(951_827_640), "2000-02-29 12:34");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_expansion_walks_symlinks_without_looping() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("macplayer-walk-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("root.mkv"), b"x").unwrap();
+        std::fs::write(nested.join("inner.mp4"), b"x").unwrap();
+        // A symlinked folder must be walked like a real one...
+        symlink(&nested, dir.join("link")).unwrap();
+        // ...and a cycle pointing back at the parent must terminate the walk.
+        symlink(&dir, nested.join("loop")).unwrap();
+
+        let mut found = expand_paths(&[dir.to_string_lossy().into_owned()]);
+        found.sort();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["inner.mp4", "root.mkv"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

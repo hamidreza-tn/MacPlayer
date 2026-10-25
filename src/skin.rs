@@ -674,6 +674,18 @@ pub fn draw_icon(p: &Painter, name: &str, cx: f32, cy: f32, color: Color32, bg: 
             ]);
             rect(2.0, -4.0, 2.0, 8.0);
         }
+        // Double-triangle rewind / fast-forward: the universal transport glyphs.
+        // The older arc-with-arrowhead marks read like "repeat / rotate".
+        "rewind" => {
+            for dx in [-7.0f32, 1.0] {
+                poly(&[(dx, 0.0), (dx + 6.2, -4.4), (dx + 6.2, 4.4)]);
+            }
+        }
+        "fast_forward" => {
+            for dx in [-7.2f32, 0.8] {
+                poly(&[(dx, -4.4), (dx, 4.4), (dx + 6.4, 0.0)]);
+            }
+        }
         "eject" => {
             poly(&[
                 (0.0, -4.2),

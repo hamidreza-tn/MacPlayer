@@ -360,7 +360,11 @@ pub fn seek_bar(
         out.wheel = wheel_steps(ui, &mut state.scroll_acc);
     }
     if response.hovered() {
-        if let Some(pos) = response.hover_pos() {
+        // No time bubble when nothing is playing: the mapping is meaningless
+        // without a duration and would hover "0:00:00" over the empty bar.
+        if state.duration > 0.0
+            && let Some(pos) = response.hover_pos()
+        {
             out.hover = Some(state.time_at(pos.x - rect.left(), rect.width()));
         }
     } else if was_hovered {

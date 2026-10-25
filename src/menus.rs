@@ -163,6 +163,9 @@ pub enum Action {
     PlayUrl {
         url: String,
         loop_s: i64,
+        /// `false` replaces the playlist (Open URL), `true` appends to it
+        /// (the playlist's "Add URL...").
+        append: bool,
     },
     OpenDisc,
     SetYtdlQuality(&'static str),
@@ -1299,12 +1302,10 @@ fn sleep_menu(active: i32) -> Vec<Entry> {
     let mut entries =
         vec![Entry::item(i18n::tr("Off"), Action::SetSleepTimer(0)).checked(active == 0)];
     for minutes in [15, 30, 60, 90, 120] {
-        let label = if active == minutes {
-            format!("{minutes} min ✓")
-        } else {
-            format!("{minutes} min")
-        };
-        entries.push(Entry::item(label, Action::SetSleepTimer(minutes)));
+        entries.push(
+            Entry::item(format!("{minutes} min"), Action::SetSleepTimer(minutes))
+                .checked(active == minutes),
+        );
     }
     entries.push(Entry::Sep);
     entries.push(

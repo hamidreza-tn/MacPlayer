@@ -1,12 +1,16 @@
-//! Seekbar hover thumbnails: a background worker decodes a handful of preview
-//! frames with ffmpeg (one process per frame, PNG to a pipe) and the UI turns
+//! Seekbar hover thumbnails and playlist row previews: a background worker decodes
+//! preview frames with ffmpeg (one process per frame, PNG to a pipe) and the UI turns
 //! them into egui textures on demand.
+//!
+//! Two job lanes feed one worker: the *priority* lane carries the currently playing
+//! file (its seek-bar previews must appear promptly) and is drained before the FIFO
+//! lane that fills playlist row previews as they scroll into view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -18,8 +22,12 @@ const THUMB_COUNT: usize = 10;
 const THUMB_W: i32 = 168;
 /// Per-frame decode budget before the worker kills ffmpeg.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-/// Files whose previews are kept in memory (each is ~10 small PNGs).
-const CACHE_FILES: usize = 4;
+/// Files whose previews are kept in memory (each set is ten small PNGs, so two
+/// dozen files stay well under ~20 MB while comfortably covering a screenful
+/// of playlist rows without regenerating on every scroll).
+const CACHE_FILES: usize = 24;
+/// Cap on the `requested` dedupe set; clearing it merely allows regeneration.
+const MAX_REQUESTED: usize = 512;
 
 struct Job {
     path: String,
@@ -28,7 +36,10 @@ struct Job {
 
 /// ffmpeg-backed preview generator; degrades to a no-op when ffmpeg is absent.
 pub struct Thumbnails {
+    /// FIFO lane for playlist row previews.
     jobs: Option<Sender<Job>>,
+    /// Priority lane: the currently playing file (seek-bar previews).
+    priority: Option<Sender<Job>>,
     results: Receiver<(String, Vec<Option<Vec<u8>>>)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -38,49 +49,79 @@ pub struct Thumbnails {
     order: Vec<String>,
     /// GPU textures created from `frames`, lazily, on the UI thread.
     textures: HashMap<String, Vec<Option<TextureHandle>>>,
+    /// Paths already queued or generated, so rows are queued exactly once.
+    requested: HashSet<String>,
+    /// The file the seek-bar pipeline owns; row queuing skips it.
+    active: String,
 }
 
 impl Thumbnails {
     pub fn new() -> Self {
         let (job_tx, job_rx) = channel::<Job>();
+        let (priority_tx, priority_rx) = channel::<Job>();
         let (result_tx, result_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker = which("ffmpeg").and_then(|ffmpeg| {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("thumbs".into())
-                .spawn(move || worker_loop(ffmpeg, job_rx, result_tx, stop))
+                .spawn(move || worker_loop(ffmpeg, job_rx, priority_rx, result_tx, stop))
                 .ok()
         });
         Self {
             jobs: worker.is_some().then_some(job_tx),
+            priority: worker.is_some().then_some(priority_tx),
             results: result_rx,
             stop,
             worker,
             frames: HashMap::new(),
             order: Vec::new(),
             textures: HashMap::new(),
+            requested: HashSet::new(),
+            active: String::new(),
         }
     }
 
     /// True when previews can be generated (ffmpeg found on this machine).
     pub fn available(&self) -> bool {
-        self.jobs.is_some()
+        self.priority.is_some()
     }
 
-    /// Queue preview generation for a file; replaces any pending request.
+    /// Queue preview generation for the currently playing file; its seek-bar
+    /// previews take priority over playlist row work.
     pub fn queue(&mut self, path: &str, duration: f64) {
-        if let Some(jobs) = &self.jobs
+        if let Some(priority) = &self.priority
             && duration.is_finite()
             && duration > 1.0
         {
-            // A pending job for the same path is superseded by the new one;
-            // the worker skips stale duplicates itself.
-            let _ = jobs.send(Job {
+            self.active = path.to_string();
+            self.requested.insert(path.to_string());
+            let _ = priority.send(Job {
                 path: path.to_string(),
                 duration,
             });
         }
+    }
+
+    /// Queue preview generation for a playlist row, once. Rows call this as they
+    /// scroll into view; the dedupe set keeps repeat calls free.
+    pub fn ensure(&mut self, path: &str, duration: f64) {
+        let Some(jobs) = &self.jobs else {
+            return;
+        };
+        if path == self.active || !duration.is_finite() || duration <= 1.0 {
+            return;
+        }
+        if self.requested.len() >= MAX_REQUESTED {
+            self.requested.clear();
+        }
+        if !self.requested.insert(path.to_string()) {
+            return;
+        }
+        let _ = jobs.send(Job {
+            path: path.to_string(),
+            duration,
+        });
     }
 
     /// Take finished preview sets from the worker. Call once per frame.
@@ -97,10 +138,14 @@ impl Thumbnails {
             let evict = self.order.remove(0);
             self.frames.remove(&evict);
             self.textures.remove(&evict);
+            // Evicted files may be previewed again when their row reappears.
+            self.requested.remove(&evict);
         }
         // Fresh bytes invalidate any textures built earlier.
         self.textures.remove(&path);
-        self.frames.insert(path, frames);
+        self.frames.insert(path.clone(), frames);
+        // A generated file counts as requested; it never re-queues on its own.
+        self.requested.insert(path);
     }
 
     /// Texture for the preview slot nearest to `seconds`, decoding and
@@ -149,8 +194,9 @@ impl Thumbnails {
 impl Drop for Thumbnails {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // A closed sender wakes the worker from `recv()`.
+        // Dropping both senders wakes the worker from `recv()`.
         self.jobs = None;
+        self.priority = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -160,19 +206,25 @@ impl Drop for Thumbnails {
 fn worker_loop(
     ffmpeg: String,
     jobs: Receiver<Job>,
+    priority: Receiver<Job>,
     results: Sender<(String, Vec<Option<Vec<u8>>>)>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut pending: Option<Job> = None;
     while !stop.load(Ordering::Acquire) {
-        // Coalesce queued jobs: only the newest request matters.
-        let job = match pending.take().or_else(|| jobs.recv().ok()) {
-            Some(job) => job,
-            None => break,
+        // The priority lane (currently playing file) is drained first so
+        // seek-bar previews never queue behind a batch of row jobs.
+        let job = match priority.try_recv() {
+            Ok(job) => Some(job),
+            Err(TryRecvError::Empty) => match jobs.recv() {
+                Ok(job) => Some(job),
+                Err(_) => break,
+            },
+            Err(TryRecvError::Disconnected) => match jobs.recv() {
+                Ok(job) => Some(job),
+                Err(_) => break,
+            },
         };
-        while let Ok(newer) = jobs.try_recv() {
-            pending = Some(newer);
-        }
+        let Some(job) = job else { break };
         let frames = preview_frames(&ffmpeg, &job.path, job.duration, &stop);
         if results.send((job.path, frames)).is_err() {
             break;
@@ -261,4 +313,42 @@ fn decode_png(bytes: &[u8]) -> Option<ColorImage> {
 /// Locate an executable on PATH.
 fn which(program: &str) -> Option<String> {
     crate::util::which(program)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_queues_each_row_once_and_skips_the_active_file() {
+        let mut thumbs = Thumbnails::new();
+        // No ffmpeg-bound worker in tests (which() may find one; jobs would be
+        // real). Assert on the dedupe bookkeeping instead of the channel.
+        thumbs.requested.clear();
+        thumbs.ensure("/tmp/a.mp4", 30.0);
+        let queued_once = thumbs.requested.contains("/tmp/a.mp4");
+        thumbs.ensure("/tmp/a.mp4", 30.0);
+        assert_eq!(thumbs.requested.contains("/tmp/a.mp4"), queued_once);
+        // The active (playing) file belongs to the priority pipeline.
+        thumbs.active = "/tmp/active.mp4".into();
+        thumbs.ensure("/tmp/active.mp4", 30.0);
+        assert!(!thumbs.requested.contains("/tmp/active.mp4"));
+        // Non-finite or tiny durations are never queued.
+        thumbs.ensure("/tmp/b.mp4", f64::NAN);
+        thumbs.ensure("/tmp/b.mp4", 0.5);
+        assert!(!thumbs.requested.contains("/tmp/b.mp4"));
+    }
+
+    #[test]
+    fn eviction_forgets_the_request_so_rows_can_regenerate() {
+        let frames = || (0..THUMB_COUNT).map(|i| Some(vec![i as u8; 4])).collect();
+        let mut thumbs = Thumbnails::new();
+        thumbs.remember("/tmp/old.mp4".into(), frames());
+        assert!(thumbs.requested.contains("/tmp/old.mp4"));
+        for i in 0..CACHE_FILES {
+            thumbs.remember(format!("/tmp/fill-{i}.mp4"), frames());
+        }
+        assert!(!thumbs.frames.contains_key("/tmp/old.mp4"));
+        assert!(!thumbs.requested.contains("/tmp/old.mp4"));
+    }
 }

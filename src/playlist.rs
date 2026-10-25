@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use crate::i18n;
 
-use egui::{Context, Id, Pos2, Rect, Sense, Stroke, TextEdit, pos2, vec2};
+use egui::{Color32, Context, Id, Pos2, Rect, Sense, Stroke, TextEdit, pos2, vec2};
 
 use crate::menus::{self, Action, Entry, MenuState};
 use crate::skin;
+use crate::thumbs::Thumbnails;
 use crate::util::{fmt_time, is_url, natural_cmp, title_of};
 use crate::widgets::{IconBtn, text_button};
 
@@ -90,6 +91,9 @@ struct DurationProber {
     results: Receiver<(u64, String, f64)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Probe requests that did not fit the bounded job channel; flushed back
+    /// a slice at a time by `drain` so large playlists never lose durations.
+    backlog: std::sync::Mutex<Vec<(u64, String)>>,
 }
 
 impl DurationProber {
@@ -125,6 +129,7 @@ impl DurationProber {
                     results: result_rx,
                     stop,
                     worker,
+                    backlog: std::sync::Mutex::new(Vec::new()),
                 }
             }
             None => Self {
@@ -132,18 +137,28 @@ impl DurationProber {
                 results: result_rx,
                 stop,
                 worker: None,
+                backlog: std::sync::Mutex::new(Vec::new()),
             },
         }
     }
 
     fn probe(&self, generation: u64, path: &str) {
-        if let Some(jobs) = &self.jobs {
-            match jobs.try_send(Job::Probe {
-                generation,
-                path: path.to_string(),
-            }) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                Err(TrySendError::Full(_)) => {}
+        let Some(jobs) = &self.jobs else {
+            return;
+        };
+        match jobs.try_send(Job::Probe {
+            generation,
+            path: path.to_string(),
+        }) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                // Channel momentarily full (a big playlist was just added);
+                // hold the request and retry from `drain`.
+                if let Ok(mut backlog) = self.backlog.lock()
+                    && backlog.len() < 4096
+                {
+                    backlog.push((generation, path.to_string()));
+                }
             }
         }
     }
@@ -161,6 +176,31 @@ impl DurationProber {
                     item.duration = Some(duration);
                 }
             }
+        }
+        // Feed the bounded job channel from the backlog a slice at a time, so
+        // durations for large playlists arrive eventually instead of never.
+        if let Ok(mut backlog) = self.backlog.lock()
+            && !backlog.is_empty()
+            && let Some(jobs) = &self.jobs
+        {
+            let mut sent = 0usize;
+            let mut kept: Vec<(u64, String)> = Vec::new();
+            for (job_generation, path) in backlog.drain(..) {
+                if sent < 32
+                    && job_generation == generation
+                    && jobs
+                        .try_send(Job::Probe {
+                            generation: job_generation,
+                            path: path.clone(),
+                        })
+                        .is_ok()
+                {
+                    sent += 1;
+                } else {
+                    kept.push((job_generation, path));
+                }
+            }
+            *backlog = kept;
         }
     }
 }
@@ -457,13 +497,18 @@ impl Playlist {
     }
 
     /// Scroll the list so the playing row stays visible after a file switch.
-    /// Rows are only counted within the filtered view's real rows.
+    /// Rows are positioned by their index within the filtered view, so the reveal
+    /// computes the target from there; a row hidden by the filter is a no-op.
     pub fn reveal_current(&mut self) {
         let Some(row) = self.current else {
             return;
         };
-        let target = reveal_scroll(self.scroll, row as f32 * ROW_H, self.view_h);
-        let max = (self.items.len() as f32 * ROW_H - self.view_h).max(0.0);
+        let visible_rows = self.visible_rows();
+        let Some(position) = visible_rows.iter().position(|&visible| visible == row) else {
+            return;
+        };
+        let target = reveal_scroll(self.scroll, position as f32 * ROW_H, self.view_h);
+        let max = (visible_rows.len() as f32 * ROW_H - self.view_h).max(0.0);
         self.scroll = target.clamp(0.0, max);
     }
 
@@ -672,7 +717,15 @@ impl Playlist {
     // -- drawing -------------------------------------------------------------------------------
 
     /// Draw the panel into `rect` and report what the player should do.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &Context) -> PlaylistOut {
+    /// `thumbs` fills the rows' video previews: visible rows draw a real frame
+    /// when generated and queue their generation once otherwise.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        ctx: &Context,
+        thumbs: &mut Thumbnails,
+    ) -> PlaylistOut {
         let mut out = PlaylistOut::default();
         self.prober.drain(self.probe_generation, &mut self.items);
 
@@ -840,7 +893,7 @@ impl Playlist {
                     colors.text_dim,
                 );
             } else {
-                self.paint_rows(ui, ctx, view, &visible_rows, &mut out);
+                self.paint_rows(ui, ctx, view, &visible_rows, &mut out, thumbs);
             }
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
@@ -925,7 +978,7 @@ impl Playlist {
             ui,
             ui.id().with("pl-del"),
             del_rect,
-            if compact { "⋯" } else { "..." },
+            if compact { "⋯" } else { i18n::tr("More") },
         ) {
             self.open_menu(
                 MenuKind::Del,
@@ -1003,6 +1056,7 @@ impl Playlist {
         view: Rect,
         visible_rows: &[usize],
         out: &mut PlaylistOut,
+        thumbs: &mut Thumbnails,
     ) {
         let colors = skin::active_colors();
         let painter = ui.painter_at(view);
@@ -1070,9 +1124,12 @@ impl Playlist {
                 );
             }
 
+            // Landscape preview slot: the playing file shows a real decoded
+            // frame when its thumbnails are ready; every other row gets a tinted
+            // placeholder so the list reads as a filmstrip.
             let thumb = Rect::from_min_size(
-                pos2(row_rect.left() + 8.0, row_rect.top() + 6.0),
-                vec2(31.0, (row_rect.height() - 12.0).max(0.0)),
+                pos2(row_rect.left() + 8.0, row_rect.center().y - 16.0),
+                vec2(56.0, 32.0),
             );
             let thumb_palette = [
                 egui::Color32::from_rgb(0x24, 0x3d, 0x46),
@@ -1082,20 +1139,44 @@ impl Playlist {
                 egui::Color32::from_rgb(0x6d, 0x63, 0x45),
             ];
             let thumb_fill = if current {
-                egui::Color32::from_rgb(0x25, 0x3c, 0x45)
+                // Video letterbox: dark in both themes, matching the player surface.
+                colors.video_bg
             } else if selected {
                 colors.button_hover
             } else {
                 thumb_palette[row % thumb_palette.len()]
             };
             painter.rect_filled(thumb, 5.0, thumb_fill);
+            let mut drew_frame = false;
+            if !is_url(&self.items[row].path)
+                && let Some(item_duration) = self.items[row].duration
+                && item_duration > 1.0
+            {
+                let path = &self.items[row].path;
+                if let Some(handle) = thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
+                {
+                    // Aspect-fit the frame inside the slot (letterboxed by the fill).
+                    let size = handle.size_vec2();
+                    let scale = (thumb.width() / size.x).min(thumb.height() / size.y);
+                    let draw_rect = Rect::from_center_size(
+                        thumb.center(),
+                        vec2(size.x * scale, size.y * scale),
+                    );
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
+                    drew_frame = true;
+                } else {
+                    // Queue once; the worker fills it while the row stays visible.
+                    thumbs.ensure(path, item_duration);
+                }
+            }
             painter.rect_stroke(
                 thumb,
                 5.0,
                 Stroke::new(1.0, colors.line),
                 egui::StrokeKind::Inside,
             );
-            if current {
+            if current && !drew_frame {
                 skin::draw_icon(
                     &painter,
                     "play",
@@ -1104,7 +1185,7 @@ impl Playlist {
                     colors.accent,
                     thumb_fill,
                 );
-            } else {
+            } else if !current {
                 let item = &self.items[row];
                 let (label, label_color) = match &item.status {
                     MediaStatus::Loading => (i18n::tr("LOAD"), colors.accent),
@@ -1144,7 +1225,7 @@ impl Playlist {
                 );
                 right = (right - tw - 10.0).max(row_rect.left() + 10.0);
             }
-            let title_x = row_rect.left() + 48.0;
+            let title_x = row_rect.left() + 74.0;
             let room = (right - title_x).max(10.0);
             let title = skin::elide(&painter, &self.items[row].title, &font_id, room);
             if title.len() < self.items[row].title.len() {

@@ -17,8 +17,9 @@ for the first public release.
   snapping; the playlist drawer slides over the video with easing while the
   right-hand controls reflow alongside it.
 - Redesigned playlist drawer: accent header with total duration, per-row
-  playback progress line, automatic reveal of the playing row, and a draggable
-  scrollbar thumb.
+  playback progress line, automatic reveal of the playing row, a draggable
+  scrollbar thumb, and landscape video previews on every row (generated in the
+  background as rows scroll into view).
 - Command palette (`Cmd+K`) with full-width rows and right-aligned shortcut
   hints; the palette, the context menu and the keyboard all share one command
   source.
@@ -31,12 +32,23 @@ for the first public release.
   drag-and-drop accent ring, and a fade-out for on-screen messages.
 - Gesture fixes: trackpad pinch (only) toggles full screen, `Ctrl`/`Cmd`+scroll
   zooms the video, two-finger horizontal scroll seeks.
+- Universal double-triangle rewind / fast-forward transport icons, a quiet `—`
+  time readout when nothing is loaded, and fixed popover/palette widths that no
+  longer stretch to the screen edge.
 
 ### Playback
 
 - Fixed invalid `video-sync=auto` being sent to mpv on startup; the sync modes
   now map onto mpv's real option values.
 - Fixed rejected `target-peak=0` and mistyped `sub-margin-y` property writes.
+- Fixed the idle-screen play button losing clicks to the full-window video
+  hit target, playlist reveal scrolling to the wrong row when a filter was
+  active, and folder expansion skipping symlinked folders (with symlink-cycle
+  protection).
+- "Add URL..." from the playlist now appends to it instead of replacing it;
+  only "Open URL..." in the File menu starts a fresh list.
+- Playlists larger than the probe queue no longer lose row durations; overflow
+  is retried from a bounded backlog.
 - Per-file aspect ratio and speed, track selection, resume positions,
   bookmarks, A-B repeat, equalizer and sleep timer behavior unchanged and
   covered by the expanded test suite.

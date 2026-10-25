@@ -73,7 +73,8 @@ beyond libmpv.
 - Drag-to-reorder with undo/redo, multi-select, shift-range select, keyboard navigation
 - Sort by name / path / duration / reverse / random, dedupe, remove missing files
 - Live playback progress on the playing row, total duration in the header, filter-as-you-type
-- Background duration probing and seekbar hover thumbnails (via ffmpeg, when present)
+- Background duration probing, seekbar hover thumbnails and video previews on
+  every playlist row (via ffmpeg, when present)
 - Watch history, recent files, export to `.m3u8`
 
 **Interface**
@@ -263,7 +264,7 @@ src/                         Rust application
 ├── menus.rs                 Menu model & painter (context menu, command palette source)
 ├── dialogs.rs               Preferences, control panel, GoTo/URL/history dialogs
 ├── settings.rs              Schema, normalization, atomic persistence
-├── thumbs.rs                ffmpeg-backed seekbar previews
+├── thumbs.rs                ffmpeg-backed seekbar + playlist row previews
 ├── services.rs              Platform shell (file dialogs, clipboard, reveal)
 ├── i18n.rs                  English/Persian string table
 ├── logging.rs               Rotating diagnostic log

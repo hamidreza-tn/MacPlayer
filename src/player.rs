@@ -2827,7 +2827,7 @@ impl Player {
         match action {
             Action::OpenFiles { append } => self.open_files_dialog(append),
             Action::OpenFolder { append } => self.open_folder_dialog(append),
-            Action::OpenUrl => self.url_dialog.open(),
+            Action::OpenUrl => self.url_dialog.open(false),
             Action::OpenClipboard => self.open_clipboard(),
             Action::OpenRecent(path) => self.pending.open_paths(vec![path], false),
             Action::ClearRecent => {
@@ -2939,11 +2939,15 @@ impl Player {
                 self.settings.sub_pos = value.round().clamp(0.0, 100.0) as i64;
                 self.save_settings();
             }
-            Action::PlayUrl { url, loop_s } => {
+            Action::PlayUrl {
+                url,
+                loop_s,
+                append,
+            } => {
                 if loop_s > 0 {
                     self.set_prop("loop-playlist", loop_s);
                 }
-                self.pending.open_paths(vec![url], false);
+                self.pending.open_paths(vec![url], append);
             }
 
             Action::PlaylistRemove => {
@@ -3875,7 +3879,7 @@ impl Player {
             vec2(bw, row.height()),
         );
         let playing = self.is_playing();
-        let back = IconBtn::new("seek_back")
+        let back = IconBtn::new("rewind")
             .flat(true)
             .alpha(alpha)
             .tip(i18n::tr("Seek back"))
@@ -3896,7 +3900,7 @@ impl Player {
         if play.primary {
             self.pending.push(Action::TogglePause);
         }
-        let fwd = IconBtn::new("seek_fwd")
+        let fwd = IconBtn::new("fast_forward")
             .flat(true)
             .alpha(alpha)
             .tip(i18n::tr("Seek forward"))
@@ -3945,7 +3949,16 @@ impl Player {
         let gap = 10.0;
         let show_total = time_x + elapsed_w + 6.0 + total_w + gap <= cluster_left;
         let show_elapsed = time_x + elapsed_w + gap <= cluster_left;
-        if show_elapsed {
+        if !self.has_file() {
+            // Nothing loaded: a quiet dash instead of doubled zeros.
+            painter.text(
+                pos2(time_x, row.center().y),
+                Align2::LEFT_CENTER,
+                "—",
+                mono,
+                colors.text_dim.gamma_multiply(alpha),
+            );
+        } else if show_elapsed {
             painter.text(
                 pos2(time_x, row.center().y),
                 Align2::LEFT_CENTER,
@@ -4071,7 +4084,7 @@ impl Player {
             self.save_settings();
         }
         let ctx2 = ctx.clone();
-        let out = self.playlist.ui(ui, rect, &ctx2);
+        let out = self.playlist.ui(ui, rect, &ctx2, &mut self.thumbs);
         self.apply_playlist_out(out, ctx);
     }
 
@@ -4123,6 +4136,19 @@ impl Player {
         let colors = skin::active_colors();
         let painter = ui.painter_at(rect);
 
+        // Right-click anywhere on the video opens the main context menu; plain
+        // click and double-click are handled further down. Registered BEFORE the
+        // idle-screen widgets so egui's hit test (last widget wins ties) gives the
+        // idle play affordance precedence over this full-window rect.
+        let response = ui.interact(rect, Id::new("video"), Sense::click());
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            self.video_click_at = None;
+            self.menu.open_at(pos);
+            self.track_menu_kind = None;
+        }
+
         if idle && !self.file_ready {
             // Idle backdrop: a soft four-corner gradient with a faint dot grid —
             // the palette for both ships in the skin (`logo_grad_*`, `logo_dot`).
@@ -4173,7 +4199,14 @@ impl Player {
             let circle_center = pos2(center.x, center.y - 14.0);
             let radius = 42.0 + hover * 5.0;
             let fill_alpha = 12.0 + hover * 16.0;
-            let fill = Color32::from_rgba_unmultiplied(255, 255, 255, fill_alpha as u8);
+            // Tint follows the theme: translucent white on the dark gradient,
+            // translucent black on the light one.
+            let tint = if skin::current_theme() == Theme::Light {
+                (0, 0, 0)
+            } else {
+                (255, 255, 255)
+            };
+            let fill = Color32::from_rgba_unmultiplied(tint.0, tint.1, tint.2, fill_alpha as u8);
             painter.circle_filled(circle_center, radius, fill);
             painter.circle_stroke(
                 circle_center,
@@ -4259,17 +4292,6 @@ impl Player {
                 Color32::from_rgba_unmultiplied(255, 255, 255, alpha.max(40)),
                 Color32::TRANSPARENT,
             );
-        }
-
-        // Right-click anywhere on the video opens the main context menu — after the
-        // redesign this is the mouse entry point to the full feature set.
-        let response = ui.interact(rect, Id::new("video"), Sense::click());
-        if response.secondary_clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            self.video_click_at = None;
-            self.menu.open_at(pos);
-            self.track_menu_kind = None;
         }
 
         // Video surface: a plain click toggles pause (or opens media when empty), a
@@ -4480,7 +4502,10 @@ impl Player {
                         color: colors.shadow,
                     })
                     .show(ui, |ui| {
+                        // Pin both ends: an Area's available width runs to the
+                        // screen edge, so the rows would stretch otherwise.
                         ui.set_min_width(460.0);
+                        ui.set_max_width(460.0);
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.palette.query)
                                 .hint_text(
@@ -4636,7 +4661,9 @@ impl Player {
             self.pending.push(Action::OpenFolder { append: true });
         }
         if out.add_url {
-            self.pending.push(Action::OpenUrl);
+            // From the playlist the URL dialog opens in append mode, matching
+            // the "Add Files..." / "Add Folder..." entries next to it.
+            self.url_dialog.open(true);
         }
         if out.close {
             self.toggle_playlist(ctx);

@@ -808,6 +808,8 @@ pub struct UrlDialog {
     pub url: String,
     pub loop_input: String,
     pub error: Option<String>,
+    /// `false` replaces the playlist on submit, `true` appends to it.
+    pub append: bool,
     focus_pending: bool,
 }
 
@@ -818,16 +820,18 @@ impl Default for UrlDialog {
             url: String::new(),
             loop_input: "0".into(),
             error: None,
+            append: false,
             focus_pending: false,
         }
     }
 }
 
 impl UrlDialog {
-    pub fn open(&mut self) {
+    pub fn open(&mut self, append: bool) {
         self.open = true;
         self.error = None;
         self.focus_pending = true;
+        self.append = append;
     }
 
     pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -912,7 +916,11 @@ impl UrlDialog {
                 match self.loop_input.trim().parse::<i64>() {
                     Ok(loop_s) if (0..=86_400).contains(&loop_s) => {
                         self.error = None;
-                        actions.push(Action::PlayUrl { url: u, loop_s });
+                        actions.push(Action::PlayUrl {
+                            url: u,
+                            loop_s,
+                            append: self.append,
+                        });
                         self.open = false;
                     }
                     _ => {
@@ -2152,7 +2160,10 @@ impl SettingsPopover {
                         color: colors.shadow,
                     })
                     .show(ui, |ui| {
+                        // Pin both ends: an Area's available width runs to the screen
+                        // edge, so a min-width alone lets the rows stretch wide.
                         ui.set_min_width(width - 12.0);
+                        ui.set_max_width(width - 12.0);
                         let theme_items: Vec<(String, String)> =
                             [(i18n::tr("Dark"), "dark"), (i18n::tr("Light"), "light")]
                                 .iter()
