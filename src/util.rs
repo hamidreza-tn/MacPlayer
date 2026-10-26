@@ -48,6 +48,11 @@ pub fn is_media(path: &str) -> bool {
     VIDEO_EXT.contains(&extension.as_str()) || AUDIO_EXT.contains(&extension.as_str())
 }
 
+/// `true` for audio media (embedded cover art lives on these).
+pub fn is_audio(path: &str) -> bool {
+    AUDIO_EXT.contains(&ext(path).as_str())
+}
+
 pub fn is_sub(path: &str) -> bool {
     let extension = ext(path);
     SUB_EXT.contains(&extension.as_str()) && extension != ".txt"

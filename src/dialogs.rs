@@ -1498,7 +1498,12 @@ impl PreferencesDialog {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        update_available: Option<&str>,
+        actions: &mut Vec<Action>,
+    ) {
         if !self.open {
             return;
         }
@@ -1539,7 +1544,7 @@ impl PreferencesDialog {
                     .auto_shrink([false, false])
                     .max_height(scroll_height)
                     .show(ui, |ui| match self.tab {
-                        0 => self.tab_general(ui),
+                        0 => self.tab_general(ui, update_available, actions),
                         1 => self.tab_playback(ui),
                         2 => self.tab_subtitles(ui),
                         3 => self.tab_audio(ui),
@@ -1567,7 +1572,12 @@ impl PreferencesDialog {
         }
     }
 
-    fn tab_general(&mut self, ui: &mut egui::Ui) {
+    fn tab_general(
+        &mut self,
+        ui: &mut egui::Ui,
+        update_available: Option<&str>,
+        actions: &mut Vec<Action>,
+    ) {
         let t = &mut self.temp;
         let mut autofit = t.autofit;
         if check(
@@ -1660,11 +1670,14 @@ impl PreferencesDialog {
             }
         });
         row(ui, i18n::tr("Theme"), |ui| {
-            let items: Vec<(String, String)> =
-                [(i18n::tr("Dark"), "dark"), (i18n::tr("Light"), "light")]
-                    .iter()
-                    .map(|(l, v)| (l.to_string(), v.to_string()))
-                    .collect();
+            let items: Vec<(String, String)> = [
+                (i18n::tr("Match system"), "auto"),
+                (i18n::tr("Dark"), "dark"),
+                (i18n::tr("Light"), "light"),
+            ]
+            .iter()
+            .map(|(l, v)| (l.to_string(), v.to_string()))
+            .collect();
             let cur = t.theme.clone();
             if let Some(v) = combo(ui, "pref-theme", &items, &cur, 130.0) {
                 t.theme = v;
@@ -1677,6 +1690,7 @@ impl PreferencesDialog {
                 (i18n::tr("Green"), "green"),
                 (i18n::tr("Rose"), "rose"),
                 (i18n::tr("Graphite"), "graphite"),
+                (i18n::tr("Custom…"), "custom"),
             ]
             .iter()
             .map(|(l, v)| (l.to_string(), v.to_string()))
@@ -1684,6 +1698,16 @@ impl PreferencesDialog {
             let cur = t.accent.clone();
             if let Some(v) = combo(ui, "pref-accent", &items, &cur, 130.0) {
                 t.accent = v;
+            }
+            if t.accent == "custom" {
+                ui.add_space(4.0);
+                let mut channels = skin::parse_hex_color(&t.accent_custom)
+                    .map(|c| [c.r(), c.g(), c.b()])
+                    .unwrap_or([0xe6, 0xbd, 0x72]);
+                if ui.color_edit_button_srgb(&mut channels).changed() {
+                    t.accent_custom =
+                        format!("#{:02x}{:02x}{:02x}", channels[0], channels[1], channels[2]);
+                }
             }
         });
         row(ui, i18n::tr("Language"), |ui| {
@@ -1697,6 +1721,80 @@ impl PreferencesDialog {
                 t.language = v;
             }
         });
+        // -- Features: every optional behavior gets an on/off switch. ---------
+        ui.add_space(6.0);
+        heading(ui, i18n::tr("Features"));
+        let mut continue_watching = t.continue_watching;
+        if check(
+            ui,
+            "feat-continue-watching",
+            i18n::tr("Continue watching on the welcome screen"),
+            &mut continue_watching,
+        ) {
+            t.continue_watching = continue_watching;
+        }
+        let mut cover_art = t.cover_art;
+        if check(
+            ui,
+            "feat-cover-art",
+            i18n::tr("Cover art for audio files"),
+            &mut cover_art,
+        ) {
+            t.cover_art = cover_art;
+        }
+        let mut hover_thumbnails = t.hover_thumbnails;
+        if check(
+            ui,
+            "feat-hover-thumbnails",
+            i18n::tr("Seekbar hover thumbnails"),
+            &mut hover_thumbnails,
+        ) {
+            t.hover_thumbnails = hover_thumbnails;
+        }
+        let mut row_previews = t.row_previews;
+        if check(
+            ui,
+            "feat-row-previews",
+            i18n::tr("Playlist row video previews"),
+            &mut row_previews,
+        ) {
+            t.row_previews = row_previews;
+        }
+        let mut now_playing = t.now_playing;
+        if check(
+            ui,
+            "feat-now-playing",
+            i18n::tr("Now Playing in Control Center"),
+            &mut now_playing,
+        ) {
+            t.now_playing = now_playing;
+        }
+        let mut update_check = t.update_check;
+        if check(
+            ui,
+            "feat-update-check",
+            i18n::tr("Check for updates automatically"),
+            &mut update_check,
+        ) {
+            t.update_check = update_check;
+        }
+        // Update availability badge (fed by the startup checker).
+        if let Some(tag) = update_available {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} {tag}", i18n::tr("New version available")))
+                        .size(12.0)
+                        .color(active_colors().accent),
+                );
+                if ui
+                    .link(RichText::new(i18n::tr("Download")).size(12.0))
+                    .clicked()
+                {
+                    actions.push(Action::OpenUpdatePage);
+                }
+            });
+        }
     }
 
     fn tab_playback(&mut self, ui: &mut egui::Ui) {
@@ -2199,11 +2297,14 @@ impl SettingsPopover {
                         // edge, so a min-width alone lets the rows stretch wide.
                         ui.set_min_width(width - 12.0);
                         ui.set_max_width(width - 12.0);
-                        let theme_items: Vec<(String, String)> =
-                            [(i18n::tr("Dark"), "dark"), (i18n::tr("Light"), "light")]
-                                .iter()
-                                .map(|(l, v)| (l.to_string(), v.to_string()))
-                                .collect();
+                        let theme_items: Vec<(String, String)> = [
+                            (i18n::tr("Match system"), "auto"),
+                            (i18n::tr("Dark"), "dark"),
+                            (i18n::tr("Light"), "light"),
+                        ]
+                        .iter()
+                        .map(|(l, v)| (l.to_string(), v.to_string()))
+                        .collect();
                         popover_row(ui, i18n::tr("Theme"), |ui| {
                             if popover_seg(ui, &theme_items, &mut settings.theme) {
                                 actions.push(Action::SetThemeLive(settings.theme.clone()));

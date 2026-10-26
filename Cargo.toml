@@ -1,6 +1,6 @@
 [package]
 name = "macplayer"
-version = "1.9.4"
+version = "1.10.0"
 edition = "2024"
 license = "MIT"
 description = "A fast, native media player for macOS built with Rust, egui and libmpv"
@@ -18,6 +18,10 @@ rand = "0.10.3"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-media-player = "0.3"
+block2 = "0.6"
 
 [profile.release]
 opt-level = 3

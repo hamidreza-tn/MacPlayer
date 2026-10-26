@@ -4,6 +4,37 @@ All notable changes to MacPlayer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] - 2026-10-26
+
+The feature release: five headline features, every one of them with an
+on/off switch in Preferences, plus a full headless CLI for scripting and CI.
+
+### Added
+
+- **Continue watching** on the welcome screen: a card row of partially
+  watched recent files with live thumbnails at the resume position, a
+  progress line and one-click resume. (`Preferences → General → Features`)
+- **Now Playing in Control Center**: the playing title, elapsed time and
+  play state publish to the macOS Now Playing surface, and its remote
+  commands (play/pause, next/previous, scrubbing) control the player.
+  Toggleable; the in-app F7/F8/F9 mapping steps aside while it owns the
+  hardware media keys.
+- **Embedded cover art** for audio files: extracted in the background and
+  shown on the audio screen and playlist rows. Toggleable.
+- **Match system theme** ("auto") that follows the macOS appearance live,
+  plus a **custom accent color** picker next to the five presets.
+- **Update checker**: a startup query against GitHub Releases with a
+  "New version available" badge on the welcome screen and in Preferences.
+- **Report an issue**: one click in the Misc menu bundles versions and
+  recent diagnostics onto the clipboard and opens the issue tracker.
+- **Headless CLI**: `macplayer --cli <command>` for scripting and CI —
+  `info`, `settings list/get/set/reset`, `history`, `recent`, `playlist`,
+  `positions`, `bookmarks`, `logs`, `open` (single-instance handoff),
+  `update-check` and `selftest` (settings roundtrip, folder expansion,
+  helper invariants, config writability). Every command exits 0/1.
+- Per-feature toggles in `Preferences → General → Features` for all of the
+  above plus seek-bar hover thumbnails and playlist row previews.
+
 ## [1.9.4] - 2026-10-26
 
 Full-codebase audit: 24 defects found and fixed (8 major, 16 minor).

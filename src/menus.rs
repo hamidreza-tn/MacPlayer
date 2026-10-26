@@ -203,6 +203,8 @@ pub enum Action {
     ShowAbout,
     ShowHistory,
     ClearHistory,
+    ReportIssue,
+    OpenUpdatePage,
     PlayHistory(String),
     ExportPlaylist,
     ShowTrackMenu(TrackKind),
@@ -1113,6 +1115,7 @@ pub fn main_menu(c: &MenuCtx<'_>) -> Vec<Entry> {
         .checked(c.info_visible),
         Entry::sub(i18n::tr("Sleep Timer"), sleep_menu(c.sleep_minutes)),
         Entry::item(i18n::tr("History..."), Action::ShowHistory),
+        Entry::item(i18n::tr("Report an issue"), Action::ReportIssue),
     ];
     root.push(Entry::sub(i18n::tr("Misc"), misc));
     root.push(Entry::Sep);

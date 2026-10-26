@@ -223,6 +223,20 @@ pub struct Settings {
     pub auto_visualizer: bool,
     /// Watched-file history, newest first.
     pub history: Vec<HistoryEntry>,
+    /// Show a "Continue watching" card row on the idle/welcome screen.
+    pub continue_watching: bool,
+    /// Extract and display embedded cover art for audio files.
+    pub cover_art: bool,
+    /// Publish playback state to the macOS Now Playing (Control Center) surface.
+    pub now_playing: bool,
+    /// Check GitHub for a newer release at startup.
+    pub update_check: bool,
+    /// Show hover thumbnails above the seek bar.
+    pub hover_thumbnails: bool,
+    /// Show video previews on playlist rows.
+    pub row_previews: bool,
+    /// Custom accent color, "#rrggbb"; used when `accent` == "custom".
+    pub accent_custom: String,
 }
 
 impl Default for Settings {
@@ -300,6 +314,13 @@ impl Default for Settings {
             visualizer: "off".into(),
             auto_visualizer: true,
             history: Vec::new(),
+            continue_watching: true,
+            cover_art: true,
+            now_playing: true,
+            update_check: true,
+            hover_thumbnails: true,
+            row_previews: true,
+            accent_custom: String::new(),
         }
     }
 }
@@ -401,6 +422,26 @@ impl Settings {
             }
         }
         serde_json::from_value::<Settings>(current).ok()
+    }
+
+    /// Apply a JSON object patch (the CLI `settings set` path). Returns false
+    /// when the key is unknown or the value type is wrong; the merge pipeline
+    /// (per-key reconciliation + normalize) keeps everything else valid.
+    pub fn apply_patch(&mut self, map: serde_json::Map<String, Json>) -> bool {
+        let Some((key, requested)) = map.into_iter().next() else {
+            return false;
+        };
+        let single = serde_json::Map::from_iter([(key.clone(), requested.clone())]);
+        let mut probe = self.clone();
+        probe.merge(single);
+        let applied = serde_json::to_value(&probe)
+            .ok()
+            .and_then(|value| value.get(&key).cloned())
+            .is_some_and(|after| after == requested);
+        if applied {
+            *self = probe;
+        }
+        applied
     }
 
     pub fn try_save(&self) -> Result<(), String> {
@@ -700,7 +741,7 @@ impl Settings {
         // The preferences UI exposes monitors 0..=8; accept a little headroom for
         // larger multi-monitor setups but reject absurd indices from a corrupt file.
         self.fullscreen_monitor = self.fullscreen_monitor.min(MAX_FULLSCREEN_MONITOR);
-        if !matches!(self.theme.as_str(), "dark" | "light") {
+        if !matches!(self.theme.as_str(), "dark" | "light" | "auto") {
             self.theme = "dark".into();
         }
         if !matches!(
@@ -759,6 +800,7 @@ impl Settings {
         }
         self.history.truncate(MAX_HISTORY);
         self.history.retain(|entry| !entry.path.is_empty());
+        self.accent_custom = sane_hex_color(&self.accent_custom, "");
     }
 }
 

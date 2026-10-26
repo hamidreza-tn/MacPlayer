@@ -72,6 +72,7 @@ pub const DRAWER_FILL: Color32 = Color32::from_rgba_premultiplied(19, 20, 24, 24
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Theme {
+    Auto,
     Dark,
     Light,
 }
@@ -80,6 +81,7 @@ impl Theme {
     pub fn from_str(value: &str) -> Self {
         match value {
             "light" => Self::Light,
+            "auto" => Self::Auto,
             _ => Self::Dark,
         }
     }
@@ -92,6 +94,7 @@ pub enum Accent {
     Green,
     Rose,
     Graphite,
+    Custom,
 }
 
 impl Accent {
@@ -101,6 +104,7 @@ impl Accent {
             "green" => Self::Green,
             "rose" => Self::Rose,
             "graphite" => Self::Graphite,
+            "custom" => Self::Custom,
             _ => Self::Gold,
         }
     }
@@ -138,6 +142,8 @@ const ACCENT_SETS: &[(Accent, Color32, Color32)] = &[
 
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_ACCENT: AtomicU8 = AtomicU8::new(0);
+/// Custom accent color set alongside `Accent::Custom`, "#rrggbb".
+static CUSTOM_ACCENT: std::sync::Mutex<Option<Color32>> = std::sync::Mutex::new(None);
 
 pub fn set_theme(theme: Theme) {
     ACTIVE_THEME.store(u8::from(theme == Theme::Light), Ordering::Release);
@@ -149,6 +155,38 @@ pub fn set_accent(accent: Accent) {
         .position(|(candidate, _, _)| *candidate == accent)
         .unwrap_or(0);
     ACTIVE_ACCENT.store(index as u8, Ordering::Release);
+}
+
+/// Select the custom accent color and register it as the active accent.
+pub fn set_custom_accent(hex: &str) {
+    let color = hex_to_color32(hex);
+    *CUSTOM_ACCENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(color);
+    ACTIVE_ACCENT.store(ACCENT_SETS.len() as u8, Ordering::Release);
+}
+
+fn hex_to_color32(hex: &str) -> Color32 {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return ACCENT_SETS[0].1;
+    }
+    let value = u32::from_str_radix(hex, 16).unwrap_or(0);
+    Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+/// Parse a "#rrggbb" hex color (used by preferences for the custom accent).
+pub fn parse_hex_color(hex: &str) -> Option<Color32> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some(Color32::from_rgb(
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ))
 }
 
 pub fn current_theme() -> Theme {
@@ -359,18 +397,37 @@ impl ThemeColors {
 }
 
 /// The active palette: theme from `set_theme`, accent fields from `set_accent`.
+/// Active accent pair (color, focus variant), resolving the custom slot.
+fn resolve_accent() -> (Color32, Color32) {
+    let index = {
+        let len = ACCENT_SETS.len() as u8;
+        (ACTIVE_ACCENT.load(Ordering::Acquire) % (len + 1)) as usize
+    };
+    if index == ACCENT_SETS.len() {
+        let custom = CUSTOM_ACCENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(ACCENT_SETS[0].1);
+        let focus = Color32::from_rgb(
+            custom.r().saturating_add(24),
+            custom.g().saturating_add(24),
+            custom.b().saturating_add(24),
+        );
+        (custom, focus)
+    } else {
+        let (_, accent, focus) = ACCENT_SETS[index];
+        (accent, focus)
+    }
+}
+
 pub fn active_colors() -> ThemeColors {
     let (theme, accent, focus) = {
         let theme = current_theme();
-        let index = {
-            let len = ACCENT_SETS.len() as u8;
-            (ACTIVE_ACCENT.load(Ordering::Acquire) % len.max(1)) as usize
-        };
-        let (_, accent, focus) = ACCENT_SETS[index];
+        let (accent, focus) = resolve_accent();
         (theme, accent, focus)
     };
     match theme {
-        Theme::Dark => ThemeColors {
+        Theme::Dark | Theme::Auto => ThemeColors {
             accent,
             logo: accent,
             focus,
@@ -1008,20 +1065,18 @@ pub fn apply(ctx: &egui::Context) {
     let theme = current_theme();
     ctx.set_style_of(egui::Theme::Dark, style(Theme::Dark));
     ctx.set_style_of(egui::Theme::Light, style(Theme::Light));
+    // "auto" follows the macOS appearance live (egui handles the switch).
     ctx.set_theme(match theme {
+        Theme::Auto => egui::ThemePreference::System,
         Theme::Dark => egui::ThemePreference::Dark,
         Theme::Light => egui::ThemePreference::Light,
     });
 }
 
 pub fn style(theme: Theme) -> egui::Style {
-    let index = {
-        let len = ACCENT_SETS.len() as u8;
-        (ACTIVE_ACCENT.load(Ordering::Acquire) % len.max(1)) as usize
-    };
-    let (_, accent, focus) = ACCENT_SETS[index];
+    let (accent, focus) = resolve_accent();
     let colors = match theme {
-        Theme::Dark => ThemeColors {
+        Theme::Dark | Theme::Auto => ThemeColors {
             accent,
             logo: accent,
             focus,
@@ -1036,7 +1091,7 @@ pub fn style(theme: Theme) -> egui::Style {
     };
     let mut style = egui::Style::default();
     let v = &mut style.visuals;
-    v.dark_mode = theme == Theme::Dark;
+    v.dark_mode = theme != Theme::Light;
     v.override_text_color = Some(colors.text_e4);
     v.panel_fill = colors.dialog_bg;
     v.window_fill = colors.dialog_bg;
@@ -1076,4 +1131,53 @@ pub fn style(theme: Theme) -> egui::Style {
         color: colors.shadow,
     };
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skin;
+
+    #[test]
+    fn theme_from_str_covers_auto() {
+        assert_eq!(Theme::from_str("dark"), Theme::Dark);
+        assert_eq!(Theme::from_str("light"), Theme::Light);
+        assert_eq!(Theme::from_str("auto"), Theme::Auto);
+        assert_eq!(Theme::from_str("bogus"), Theme::Dark);
+        // Auto resolves to the classic palette for style building; the ctx
+        // holds both theme styles and System preference flips between them.
+        assert_ne!(
+            style(Theme::Auto).visuals.dark_mode,
+            style(Theme::Light).visuals.dark_mode
+        );
+    }
+
+    #[test]
+    fn accent_from_str_includes_custom() {
+        assert_eq!(Accent::from_str("custom"), Accent::Custom);
+        assert_eq!(Accent::from_str("blue"), Accent::Blue);
+    }
+
+    #[test]
+    fn custom_accent_sets_and_resolves() {
+        skin::set_custom_accent("#3366cc");
+        let (accent, _) = resolve_accent();
+        assert_eq!(accent, Color32::from_rgb(0x33, 0x66, 0xcc));
+        // Invalid hex falls back to the default gold.
+        skin::set_custom_accent("zzz");
+        let (accent, _) = resolve_accent();
+        assert_eq!(accent, Color32::from_rgb(0xe6, 0xbd, 0x72));
+        // Restore the default accent for other tests.
+        skin::set_accent(Accent::Gold);
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_garbage() {
+        assert_eq!(
+            parse_hex_color("#3366cc"),
+            Some(Color32::from_rgb(0x33, 0x66, 0xcc))
+        );
+        assert_eq!(parse_hex_color("red"), None);
+        assert_eq!(parse_hex_color("#12345"), None);
+    }
 }

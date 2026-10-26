@@ -3,12 +3,14 @@
 // Result and Option everywhere, so relax them for the test harness builds.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod cli;
 mod dialogs;
 mod engine;
 mod ffi;
 mod i18n;
 mod logging;
 mod menus;
+mod nowplaying;
 mod player;
 mod playlist;
 mod render;
@@ -16,6 +18,7 @@ mod services;
 mod settings;
 mod skin;
 mod thumbs;
+mod update;
 mod util;
 mod value;
 mod widgets;
@@ -32,6 +35,13 @@ use std::time::Duration;
 use player::Player;
 
 fn main() {
+    // Headless CLI: `macplayer --cli <command>` never opens a window.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(position) = raw_args.iter().position(|arg| arg == "--cli") {
+        let code = cli::run(&raw_args[position + 1..]);
+        std::process::exit(code);
+    }
+
     // Crash reports land in the diagnostics log, next to the engine's own errors.
     std::panic::set_hook(Box::new(|info| {
         let message = format!("panic: {info}");
@@ -228,7 +238,7 @@ fn libc_getuid() -> u32 {
 }
 
 /// Try to hand `paths` to an already-running instance over a Unix socket.
-fn send_to_running(paths: &[String]) -> bool {
+pub(crate) fn send_to_running(paths: &[String]) -> bool {
     let path = ipc_path();
     let mut stream = match UnixStream::connect(&path) {
         Ok(stream) => stream,

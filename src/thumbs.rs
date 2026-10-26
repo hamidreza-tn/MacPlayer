@@ -56,6 +56,16 @@ pub struct Thumbnails {
     requested: HashSet<String>,
     /// The file the seek-bar pipeline owns; row queuing skips it.
     active: String,
+    // -- embedded cover art (audio files) ---------------------------------
+    cover_jobs: Option<Sender<String>>,
+    cover_results: Receiver<(String, Option<Vec<u8>>)>,
+    cover_worker: Option<JoinHandle<()>>,
+    cover_stop: Arc<AtomicBool>,
+    /// Extracted cover PNG per file (one 256 px frame).
+    covers: HashMap<String, Vec<u8>>,
+    /// Paths whose extraction was attempted (success or not).
+    covers_tried: HashSet<String>,
+    cover_textures: HashMap<String, TextureHandle>,
 }
 
 impl Thumbnails {
@@ -72,6 +82,27 @@ impl Thumbnails {
                 .spawn(move || worker_loop(ffmpeg, job_rx, priority_rx, wake_rx, result_tx, stop))
                 .ok()
         });
+        // Cover-art extraction thread (audio files; single small ffmpeg pass).
+        let (cover_tx, cover_rx) = channel::<String>();
+        let (cover_result_tx, cover_result_rx) = channel();
+        let cover_stop = Arc::new(AtomicBool::new(false));
+        let cover_worker = which("ffmpeg").and_then(|ffmpeg| {
+            let cover_stop = Arc::clone(&cover_stop);
+            std::thread::Builder::new()
+                .name("covers".into())
+                .spawn(move || {
+                    while let Ok(path) = cover_rx.recv() {
+                        if cover_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let art = extract_cover(&ffmpeg, &path, &cover_stop);
+                        if cover_result_tx.send((path, art)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .ok()
+        });
         Self {
             jobs: worker.is_some().then_some(job_tx),
             priority: worker.is_some().then_some(priority_tx),
@@ -84,6 +115,13 @@ impl Thumbnails {
             textures: HashMap::new(),
             requested: HashSet::new(),
             active: String::new(),
+            cover_jobs: cover_worker.is_some().then_some(cover_tx),
+            cover_results: cover_result_rx,
+            cover_worker,
+            cover_stop,
+            covers: HashMap::new(),
+            covers_tried: HashSet::new(),
+            cover_textures: HashMap::new(),
         }
     }
 
@@ -144,6 +182,12 @@ impl Thumbnails {
     pub fn drain(&mut self) {
         while let Ok((path, frames)) = self.results.try_recv() {
             self.remember(path, frames);
+        }
+        while let Ok((path, art)) = self.cover_results.try_recv() {
+            self.covers_tried.insert(path.clone());
+            if let Some(png) = art.filter(|png| !png.is_empty()) {
+                self.covers.insert(path, png);
+            }
         }
     }
 
@@ -209,6 +253,31 @@ impl Thumbnails {
         Some((handle, fresh))
     }
 
+    /// Embedded cover-art texture for an audio file. Queues the extraction
+    /// once; returns `Some` as soon as the decoded art is uploaded. Returns
+    /// the handle plus a freshness flag (first upload this call).
+    pub fn cover(&mut self, ctx: &Context, path: &str) -> Option<(&TextureHandle, bool)> {
+        if self.covers_tried.contains(path) {
+            if !self.covers.contains_key(path) {
+                return None;
+            }
+            if !self.cover_textures.contains_key(path) {
+                let png = self.covers.get(path)?;
+                let image = decode_png(png)?;
+                let handle =
+                    ctx.load_texture(format!("cover-{path}"), image, TextureOptions::LINEAR);
+                self.cover_textures.insert(path.to_string(), handle);
+            }
+            return self.cover_textures.get(path).map(|handle| (handle, false));
+        }
+        if let Some(jobs) = &self.cover_jobs
+            && self.covers_tried.insert(path.to_string())
+        {
+            let _ = jobs.send(path.to_string());
+        }
+        None
+    }
+
     /// Cheap pre-check: is a texture already uploaded for this slot? Lets
     /// callers draw cached previews without charging a decode budget.
     pub fn peek_ready(&self, path: &str, seconds: f64, duration: f64) -> bool {
@@ -233,7 +302,12 @@ impl Drop for Thumbnails {
         self.jobs = None;
         self.priority = None;
         self.wake = None;
+        self.cover_jobs = None;
+        self.cover_stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.cover_worker.take() {
             let _ = worker.join();
         }
     }
@@ -357,6 +431,61 @@ fn decode_png(bytes: &[u8]) -> Option<ColorImage> {
         [width as usize, height as usize],
         rgba.as_raw(),
     ))
+}
+
+/// Pull the first video stream of an audio file (its embedded cover) as a
+/// small PNG. Fails cleanly for audio without attached art.
+fn extract_cover(ffmpeg: &str, path: &str, stop: &AtomicBool) -> Option<Vec<u8>> {
+    let mut child = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            path,
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-vf",
+            "scale=256:-2",
+            "-c:v",
+            "png",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                return (status.success() && !output.stdout.is_empty()).then_some(output.stdout);
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// Locate an executable on PATH.

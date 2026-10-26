@@ -40,6 +40,9 @@ pub trait Services {
 
     /// Reveal `path` in the platform file manager (Finder on macOS).
     fn reveal_path(&self, path: &str);
+
+    /// Open a URL (release page, issue tracker) in the default browser.
+    fn open_url(&self, url: &str);
 }
 
 /// Real desktop implementation backed by rfd, arboard and `open`/`xdg-open`.
@@ -138,6 +141,17 @@ impl Services for PlatformServices {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        }
+    }
+
+    fn open_url(&self, url: &str) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(url).spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
         }
     }
 }

@@ -233,6 +233,21 @@ fn fa(key: &str) -> &str {
         "Active" => "فعال",
         "none (software)" => "هیچ (نرم‌افزاری)",
         "Preferences..." => "تنظیمات...",
+        // -- features / preferences additions ------------------------------------------------------
+        "Features" => "قابلیت‌ها",
+        "Continue watching" => "ادامه تماشا",
+        "Continue watching on the welcome screen" => "ادامه تماشا در صفحه خوش‌آمد",
+        "Cover art for audio files" => "کاور آلبوم فایل‌های صوتی",
+        "Seekbar hover thumbnails" => "پیش‌نمایش‌های نوار جستجو",
+        "Playlist row video previews" => "پیش‌نمایش ویدیویی ردیف‌های پلی‌لیست",
+        "Now Playing in Control Center" => "Now Playing در Control Center",
+        "Check for updates automatically" => "بررسی خودکار به‌روزرسانی",
+        "Match system" => "مطابق سیستم",
+        "Custom…" => "سفارشی…",
+        "New version available" => "نسخه جدید موجود است",
+        "Download" => "دانلود",
+        "Report an issue" => "گزارش مشکل",
+        "Report copied to the clipboard" => "گزارش در کلیپ‌بورد کپی شد",
         // -- about ---------------------------------------------------------------------------------
         "A fast, native media player for macOS — built with Rust, egui and libmpv." => {
             "یک پخش‌کنندهٔ سریع و بومی برای macOS — ساخته‌شده با Rust و egui و libmpv."

@@ -58,6 +58,13 @@ pub struct Item {
     pub status: MediaStatus,
 }
 
+/// Which row-art features the player currently has enabled (settings-driven).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlaylistFeatures {
+    pub row_previews: bool,
+    pub cover_art: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct PlaylistSnapshot {
     items: Vec<Item>,
@@ -751,6 +758,7 @@ impl Playlist {
         rect: Rect,
         ctx: &Context,
         thumbs: &mut Thumbnails,
+        features: PlaylistFeatures,
     ) -> PlaylistOut {
         let mut out = PlaylistOut::default();
         self.prober.drain(self.probe_generation, &mut self.items);
@@ -930,6 +938,7 @@ impl Playlist {
                     &mut out,
                     thumbs,
                     &mut texture_budget,
+                    features,
                 );
             }
         }
@@ -1096,6 +1105,7 @@ impl Playlist {
         out: &mut PlaylistOut,
         thumbs: &mut Thumbnails,
         texture_budget: &mut u32,
+        features: PlaylistFeatures,
     ) {
         let colors = skin::active_colors();
         let painter = ui.painter_at(view);
@@ -1187,35 +1197,56 @@ impl Playlist {
             };
             painter.rect_filled(thumb, 5.0, thumb_fill);
             let mut drew_frame = false;
-            if !is_url(&self.items[row].path)
-                && let Some(item_duration) = self.items[row].duration
-                && item_duration > 1.0
-            {
+            let path_is_local = !is_url(&self.items[row].path);
+            let item_duration = self.items[row].duration.filter(|d| *d > 1.0);
+            let is_audio = crate::util::is_audio(&self.items[row].path);
+            if path_is_local && let Some(item_duration) = item_duration {
                 let path = &self.items[row].path;
-                // Budgeted decode: the budget charges only first-use PNG
-                // uploads, so a freshly opened drawer never hitches while rows
-                // whose textures are already uploaded always draw.
-                let cached = thumbs.peek_ready(path, item_duration * 0.5, item_duration);
-                if (cached || *texture_budget > 0)
-                    && let Some((handle, _fresh)) =
-                        thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
-                {
-                    // Aspect-fit the frame inside the slot (letterboxed by the fill).
-                    let size = handle.size_vec2();
-                    let scale = (thumb.width() / size.x).min(thumb.height() / size.y);
-                    let draw_rect = Rect::from_center_size(
-                        thumb.center(),
-                        vec2(size.x * scale, size.y * scale),
-                    );
-                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                    painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
-                    drew_frame = true;
-                    if !cached {
-                        *texture_budget = texture_budget.saturating_sub(1);
+                if is_audio {
+                    // Audio rows: embedded cover art (when the feature is on).
+                    if features.cover_art
+                        && let Some((handle, fresh)) = thumbs.cover(ctx, path)
+                    {
+                        let size = handle.size_vec2();
+                        let scale = (thumb.width() / size.x).min(thumb.height() / size.y);
+                        let draw_rect = Rect::from_center_size(
+                            thumb.center(),
+                            vec2(size.x * scale, size.y * scale),
+                        );
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
+                        drew_frame = true;
+                        if fresh {
+                            *texture_budget = texture_budget.saturating_sub(1);
+                        }
                     }
-                } else {
-                    // Queue once; the worker fills it while the row stays visible.
-                    thumbs.ensure(path, item_duration);
+                } else if features.row_previews {
+                    // Video rows: budgeted frame previews — the budget charges
+                    // only first-use PNG uploads, so a freshly opened drawer
+                    // never hitches while already-uploaded rows always draw.
+                    let cached = thumbs.peek_ready(path, item_duration * 0.5, item_duration);
+                    if (cached || *texture_budget > 0)
+                        && let Some((handle, _fresh)) =
+                            thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
+                    {
+                        // Aspect-fit the frame inside the slot (letterboxed by
+                        // the fill).
+                        let size = handle.size_vec2();
+                        let scale = (thumb.width() / size.x).min(thumb.height() / size.y);
+                        let draw_rect = Rect::from_center_size(
+                            thumb.center(),
+                            vec2(size.x * scale, size.y * scale),
+                        );
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
+                        drew_frame = true;
+                        if !cached {
+                            *texture_budget = texture_budget.saturating_sub(1);
+                        }
+                    } else {
+                        // Queue once; the worker fills it while the row is visible.
+                        thumbs.ensure(path, item_duration);
+                    }
                 }
             }
             painter.rect_stroke(

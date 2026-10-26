@@ -204,6 +204,14 @@ pub struct Player {
     open_generation: u64,
     /// Outstanding expander request: (generation, started_at, osd shown).
     expander_pending: Option<(u64, f64, bool)>,
+    // -- Now Playing (Control Center) -------------------------------------
+    now_playing: Option<crate::nowplaying::NowPlaying>,
+    now_playing_rx: Option<std::sync::mpsc::Receiver<crate::nowplaying::NowPlayingCommand>>,
+    now_playing_tx: Option<std::sync::mpsc::Sender<crate::nowplaying::NowPlayingCommand>>,
+    now_playing_last: f64,
+    // -- update checker ----------------------------------------------------
+    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    update_available: Option<String>,
     closing: bool,
     /// Last window title actually sent to the viewport; avoids re-sending it every frame.
     applied_title: String,
@@ -264,9 +272,24 @@ impl Player {
             .name("open-expander".into())
             .spawn(move || expand_worker(expander_rx, expanded_tx))
             .ok();
+        // Now Playing remote commands arrive outside frames; the UI drains
+        // the channel and maps them onto the normal action queue.
+        let (now_playing_tx, now_playing_rx) = crate::nowplaying::channel();
+        // Startup update check (only when the feature is on).
+        let (update_tx, update_rx) = channel::<String>();
+        if settings.update_check {
+            std::thread::Builder::new()
+                .name("update-check".into())
+                .spawn(move || {
+                    if let Some(tag) = crate::update::check_for_update() {
+                        let _ = update_tx.send(tag);
+                    }
+                })
+                .ok();
+        }
         // Appearance globals must be set before the first style/font application.
         skin::set_theme(Theme::from_str(&settings.theme));
-        skin::set_accent(Accent::from_str(&settings.accent));
+        Player::apply_accent_for(&settings);
         i18n::set_lang(Lang::from_str(&settings.language));
         skin::apply(&ctx);
         skin::apply_fonts(&ctx, i18n::rtl());
@@ -292,6 +315,16 @@ impl Player {
             ipc_rx,
             expander: expander_worker.is_some().then_some(expander_tx),
             expanded_rx,
+            now_playing: if settings.now_playing {
+                crate::nowplaying::NowPlaying::new(now_playing_tx.clone())
+            } else {
+                None
+            },
+            now_playing_rx: Some(now_playing_rx),
+            now_playing_tx: Some(now_playing_tx),
+            now_playing_last: 0.0,
+            update_rx: Some(update_rx),
+            update_available: None,
             services: Box::new(PlatformServices),
             settings,
             settings_error: None,
@@ -1080,11 +1113,11 @@ impl Player {
         // the whole batch to the expander thread. Results usually come back
         // within a frame; the "Reading folder…" OSD appears only after 150 ms
         // so plain file opens never flash it.
-        if let Some(expander) = &self.expander {
-            if expander.send((generation, paths.clone(), append)).is_ok() {
-                self.expander_pending = Some((generation, self.now, false));
-                return;
-            }
+        if let Some(expander) = &self.expander
+            && expander.send((generation, paths.clone(), append)).is_ok()
+        {
+            self.expander_pending = Some((generation, self.now, false));
+            return;
         }
         let expanded = expand_paths(&paths);
         self.open_expanded(&expanded, append);
@@ -2405,9 +2438,22 @@ impl Player {
     }
 
     /// Re-apply the appearance globals (theme, accent, language) after preferences change.
+    /// Push the configured accent (preset or custom hex) into the skin.
+    fn apply_accent(&self) {
+        Player::apply_accent_for(&self.settings);
+    }
+
+    fn apply_accent_for(settings: &Settings) {
+        if settings.accent == "custom" {
+            skin::set_custom_accent(&settings.accent_custom);
+        } else {
+            skin::set_accent(Accent::from_str(&settings.accent));
+        }
+    }
+
     fn apply_appearance(&mut self, ctx: &Context) {
         skin::set_theme(Theme::from_str(&self.settings.theme));
-        skin::set_accent(Accent::from_str(&self.settings.accent));
+        self.apply_accent();
         i18n::set_lang(Lang::from_str(&self.settings.language));
         skin::apply(ctx);
         skin::apply_fonts(ctx, i18n::rtl());
@@ -2501,6 +2547,17 @@ impl Player {
             "#00000000".to_string()
         };
         self.set_prop("sub-back-color", back);
+
+        // Now Playing follows the feature toggle at runtime.
+        if self.settings.now_playing && self.now_playing.is_none() {
+            if let Some(tx) = self.now_playing_tx.clone() {
+                self.now_playing = crate::nowplaying::NowPlaying::new(tx);
+            }
+        } else if !self.settings.now_playing
+            && let Some(now_playing) = self.now_playing.take()
+        {
+            now_playing.clear();
+        }
     }
 
     // -- new feature helpers -----------------------------------------------------------------
@@ -3263,6 +3320,28 @@ impl Player {
             Action::SetVisualizer(mode) => self.set_visualizer(mode),
             Action::ToggleMiniPlayer => self.toggle_mini_player(ctx),
             Action::ShowHistory => self.history_dialog.open = true,
+            Action::OpenUpdatePage => {
+                self.services.open_url(crate::update::releases_page());
+            }
+            Action::ReportIssue => {
+                // Bundle versions + recent diagnostics; the browser opens the
+                // issue tracker and the text is on the clipboard.
+                let engine = self.engine();
+                let mpv = engine
+                    .and_then(|e| e.get("mpv-version"))
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "?".into());
+                let report = format!(
+                    "MacPlayer {}\nmpv: {}\n\n--- recent diagnostics ---\n{}",
+                    env!("CARGO_PKG_VERSION"),
+                    mpv,
+                    engine.map(|e| e.log_lines().join("\n")).unwrap_or_default(),
+                );
+                ctx.copy_text(report);
+                self.services
+                    .open_url("https://github.com/hamidreza-tn/MacPlayer/issues/new");
+                self.osd_ms(i18n::tr("Report copied to the clipboard"), 2500);
+            }
             Action::ClearHistory => {
                 self.settings.clear_history();
                 self.save_settings();
@@ -3416,9 +3495,12 @@ impl Player {
             K::Q if ctrl => (Action::Quit, false),
             // Hardware media keys arrive as F7/F8/F9 when "Use F1-F12 as
             // standard function keys" is enabled (or with fn held).
-            K::F7 => (Action::PrevFile, false),
-            K::F8 => (Action::TogglePause, false),
-            K::F9 => (Action::NextFile, false),
+            // With the Now Playing integration enabled, the system media keys
+            // are handled by MPRemoteCommandCenter — honoring them here too
+            // would double-toggle.
+            K::F7 if !s.now_playing => (Action::PrevFile, false),
+            K::F8 if !s.now_playing => (Action::TogglePause, false),
+            K::F9 if !s.now_playing => (Action::NextFile, false),
             _ => return None,
         };
         Some(action)
@@ -3516,15 +3598,69 @@ impl Player {
                 self.open_expanded(&expanded, append);
             }
         }
+        // Now Playing remote commands (system media keys / Control Center).
+        if let Some(rx) = &self.now_playing_rx {
+            while let Ok(command) = rx.try_recv() {
+                match command {
+                    crate::nowplaying::NowPlayingCommand::TogglePlayPause => {
+                        self.pending.push(Action::TogglePause);
+                    }
+                    crate::nowplaying::NowPlayingCommand::NextTrack => {
+                        self.pending.push(Action::NextFile);
+                    }
+                    crate::nowplaying::NowPlayingCommand::PreviousTrack => {
+                        self.pending.push(Action::PrevFile);
+                    }
+                    crate::nowplaying::NowPlayingCommand::SeekTo(position) => {
+                        self.pending.push(Action::SeekAbs(position.max(0.0)));
+                    }
+                }
+            }
+        }
+        // Startup update check result.
+        if let Some(rx) = &self.update_rx {
+            while let Ok(tag) = rx.try_recv() {
+                if self.update_available.as_deref() != Some(tag.as_str()) {
+                    self.update_available = Some(tag);
+                }
+            }
+        }
+        // Throttled Now Playing publish (once per second while anything is open).
+        if let Some(now_playing) = &self.now_playing
+            && self.now - self.now_playing_last >= 1.0
+        {
+            self.now_playing_last = self.now;
+            if self.has_file() {
+                let title = self
+                    .state
+                    .get("media-title")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .or_else(|| {
+                        self.current_path
+                            .as_deref()
+                            .map(|path| crate::util::title_of(path).to_string())
+                    })
+                    .unwrap_or_else(|| "MacPlayer".into());
+                now_playing.update(&crate::nowplaying::NowPlayingInfo {
+                    title,
+                    duration: self.duration(),
+                    elapsed: self.position(),
+                    playing: self.is_playing(),
+                });
+            } else {
+                now_playing.clear();
+            }
+        }
         // Still waiting on the expander? Announce it once, after a beat.
-        if let Some((generation, started, shown)) = self.expander_pending {
-            if !shown && self.now - started > 0.15 {
-                if let Some((_, _, shown_ref)) = self.expander_pending.as_mut() {
-                    *shown_ref = true;
-                }
-                if generation == self.open_generation {
-                    self.osd(i18n::tr("Reading folder…"));
-                }
+        if let Some((generation, started, shown)) = self.expander_pending
+            && !shown
+            && self.now - started > 0.15
+        {
+            if let Some((_, _, shown_ref)) = self.expander_pending.as_mut() {
+                *shown_ref = true;
+            }
+            if generation == self.open_generation {
+                self.osd(i18n::tr("Reading folder…"));
             }
         }
 
@@ -4022,6 +4158,7 @@ impl Player {
                 .current_path
                 .as_deref()
                 .filter(|path| !is_url(path))
+                .filter(|_| self.settings.hover_thumbnails)
                 .and_then(|path| self.thumbs.texture(&ctx, path, seconds, duration))
                 .map(|(handle, _)| {
                     let size = handle.size_vec2();
@@ -4299,7 +4436,13 @@ impl Player {
             self.save_settings();
         }
         let ctx2 = ctx.clone();
-        let out = self.playlist.ui(ui, rect, &ctx2, &mut self.thumbs);
+        let features = crate::playlist::PlaylistFeatures {
+            row_previews: self.settings.row_previews,
+            cover_art: self.settings.cover_art,
+        };
+        let out = self
+            .playlist
+            .ui(ui, rect, &ctx2, &mut self.thumbs, features);
         self.apply_playlist_out(out, ctx);
     }
 
@@ -4458,14 +4601,217 @@ impl Player {
                 skin::font(12.0, false),
                 colors.text_dim,
             );
+
+            // Update-available pill (fed by the startup checker).
+            if let Some(tag) = &self.update_available {
+                let pill =
+                    Rect::from_center_size(pos2(center.x, center.y + 78.0), vec2(300.0, 26.0));
+                let pill_resp = ui
+                    .interact(pill, Id::new("update-pill"), Sense::click())
+                    .on_hover_text(i18n::tr("Download"));
+                let p = ui.painter_at(pill);
+                p.rect_filled(pill, 13.0, colors.panel);
+                p.rect_stroke(
+                    pill,
+                    13.0,
+                    Stroke::new(1.0, colors.logo),
+                    egui::StrokeKind::Outside,
+                );
+                p.text(
+                    pill.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!(
+                        "{} {tag} · {}",
+                        i18n::tr("New version available"),
+                        i18n::tr("Download")
+                    ),
+                    skin::font(11.0, false),
+                    colors.text_bright,
+                );
+                if pill_resp.clicked() {
+                    self.services.open_url(crate::update::releases_page());
+                }
+            }
+
+            // Continue-watching cards: partially watched recent files, one
+            // click resumes (play_row restores the saved position). Only
+            // drawn when there is room and the feature is enabled.
+            if self.settings.continue_watching && rect.height() > 380.0 {
+                let entries: Vec<&crate::settings::HistoryEntry> = self
+                    .settings
+                    .history
+                    .iter()
+                    .filter(|entry| {
+                        entry.duration > 60.0
+                            && entry.position > 15.0
+                            && entry.position < entry.duration * 0.92
+                            && self
+                                .settings
+                                .get_position(&entry.path)
+                                .map(|saved| saved > 0.0)
+                                .unwrap_or(false)
+                    })
+                    .take(6)
+                    .collect();
+                if !entries.is_empty() {
+                    let card_w = 148.0f32;
+                    let card_h = 96.0f32;
+                    let gap = 12.0f32;
+                    let row_w = entries.len() as f32 * card_w
+                        + (entries.len().saturating_sub(1)) as f32 * gap;
+                    let row_left = center.x - row_w / 2.0;
+                    let row_top = center.y + 104.0;
+                    let label = i18n::tr("Continue watching");
+                    painter.text(
+                        pos2(center.x, row_top - 22.0),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        skin::font(11.0, false),
+                        colors.text_dim,
+                    );
+                    for (index, entry) in entries.iter().enumerate() {
+                        let card_rect = Rect::from_min_size(
+                            pos2(row_left + index as f32 * (card_w + gap), row_top),
+                            vec2(card_w, card_h),
+                        );
+                        let card = ui
+                            .interact(
+                                card_rect,
+                                Id::new("continue-card").with(index),
+                                Sense::click(),
+                            )
+                            .on_hover_text(&entry.title);
+                        let hover = ui.ctx().animate_bool_with_time(
+                            Id::new("continue-hover").with(index),
+                            card.hovered(),
+                            0.15,
+                        );
+                        let p = ui.painter_at(card_rect);
+                        let art_rect =
+                            Rect::from_min_size(card_rect.min, vec2(card_w, card_w * 9.0 / 16.0));
+                        // Art: live frame at the resume position (video) or the
+                        // embedded cover (audio); tinted block as fallback.
+                        let mut drew_art = false;
+                        if !is_url(&entry.path) {
+                            if crate::util::is_audio(&entry.path) {
+                                if self.settings.cover_art
+                                    && let Some((handle, _)) =
+                                        self.thumbs.cover(ui.ctx(), &entry.path)
+                                {
+                                    let size = handle.size_vec2();
+                                    let scale =
+                                        (art_rect.width() / size.x).min(art_rect.height() / size.y);
+                                    let draw = Rect::from_center_size(
+                                        art_rect.center(),
+                                        vec2(size.x * scale, size.y * scale),
+                                    );
+                                    p.image(
+                                        handle.id(),
+                                        draw,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                    drew_art = true;
+                                }
+                            } else {
+                                self.thumbs.ensure(&entry.path, entry.duration.max(60.0));
+                                if let Some((handle, _)) = self.thumbs.texture(
+                                    ui.ctx(),
+                                    &entry.path,
+                                    entry.position,
+                                    entry.duration,
+                                ) {
+                                    p.image(
+                                        handle.id(),
+                                        art_rect,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                    drew_art = true;
+                                }
+                            }
+                        }
+                        if !drew_art {
+                            p.rect_filled(art_rect, 6.0, colors.panel);
+                            skin::draw_icon(
+                                &p,
+                                "play",
+                                art_rect.center().x,
+                                art_rect.center().y,
+                                colors.logo,
+                                colors.panel,
+                            );
+                        }
+                        p.rect_stroke(
+                            art_rect,
+                            6.0,
+                            Stroke::new(
+                                1.0 + hover,
+                                colors.logo.gamma_multiply(0.35 + 0.5 * hover),
+                            ),
+                            egui::StrokeKind::Outside,
+                        );
+                        // Resume-progress line under the art.
+                        let track = Rect::from_min_max(
+                            pos2(art_rect.left() + 2.0, art_rect.bottom() - 5.0),
+                            pos2(art_rect.right() - 2.0, art_rect.bottom() - 3.0),
+                        );
+                        p.rect_filled(track, 1.0, colors.line);
+                        let fraction = (entry.position / entry.duration).clamp(0.0, 1.0) as f32;
+                        p.rect_filled(
+                            Rect::from_min_max(
+                                track.min,
+                                pos2(track.left() + track.width() * fraction, track.max.y),
+                            ),
+                            1.0,
+                            colors.accent,
+                        );
+                        let title = skin::elide(&p, &entry.title, &skin::font(11.0, false), card_w);
+                        p.text(
+                            pos2(card_rect.center().x, art_rect.bottom() + 10.0),
+                            egui::Align2::CENTER_TOP,
+                            title,
+                            skin::font(11.0, false),
+                            if card.hovered() {
+                                colors.text_bright
+                            } else {
+                                colors.text
+                            },
+                        );
+                        if card.clicked() {
+                            self.video_click_at = None;
+                            self.pending.open_paths(vec![entry.path.clone()], false);
+                        }
+                    }
+                }
+            }
         } else if audio_only {
-            // Audio-only media: a quiet disc mark, the title and the elapsed time.
+            // Audio-only media: embedded cover art when available (and enabled),
+            // otherwise a quiet disc mark — plus the title and the elapsed time.
             let center = rect.center();
-            let disc = pos2(center.x, center.y - 54.0);
-            painter.circle_filled(disc, 34.0, colors.panel);
-            painter.circle_stroke(disc, 34.0, Stroke::new(1.0, colors.line));
-            painter.circle_stroke(disc, 9.0, Stroke::new(1.0, colors.line));
-            skin::draw_icon(&painter, "note", disc.x, disc.y, colors.logo, colors.panel);
+            let art_size = 150.0f32.min(rect.height() * 0.34);
+            let art_center = pos2(center.x, center.y - art_size * 0.42);
+            let mut drew_cover = false;
+            if self.settings.cover_art
+                && let Some(path) = self.current_path.as_deref().filter(|p| !is_url(p))
+                && let Some((handle, _)) = self.thumbs.cover(ui.ctx(), path)
+            {
+                let size = handle.size_vec2();
+                let scale = (art_size / size.x).min(art_size / size.y);
+                let draw = vec2(size.x * scale, size.y * scale);
+                let draw_rect = Rect::from_center_size(art_center, draw);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
+                drew_cover = true;
+            }
+            if !drew_cover {
+                let disc_r = art_size * 0.42;
+                let disc = art_center;
+                painter.circle_filled(disc, disc_r, colors.panel);
+                painter.circle_stroke(disc, disc_r, Stroke::new(1.0, colors.line));
+                painter.circle_stroke(disc, disc_r * 0.26, Stroke::new(1.0, colors.line));
+                skin::draw_icon(&painter, "note", disc.x, disc.y, colors.logo, colors.panel);
+            }
             let font_id = skin::font(15.0, false);
             let text = skin::elide(
                 &painter,
@@ -4846,7 +5192,9 @@ impl Player {
         let mut actions = Vec::new();
         self.goto_dialog.show(ctx, duration, &mut actions);
         self.url_dialog.show(ctx, &mut actions);
-        self.prefs.show(ctx, &mut actions);
+        let update_available = self.update_available.clone();
+        self.prefs
+            .show(ctx, update_available.as_deref(), &mut actions);
         {
             let mut panel_actions = Vec::new();
             let settings = &mut self.settings;
@@ -4911,6 +5259,9 @@ impl eframe::App for Player {
     #[allow(unsafe_code)]
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         self.closing = true;
+        if let Some(now_playing) = self.now_playing.take() {
+            now_playing.clear();
+        }
         self.remember_position();
         self.sync_playlist_settings();
         self.settings.first_run = false;
