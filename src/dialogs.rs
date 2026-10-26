@@ -870,7 +870,7 @@ impl UrlDialog {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    label(ui, i18n::tr("Loop interval (seconds, 0 = no loop):"));
+                    label(ui, i18n::tr("Loop count (0 = no loop):"));
                     let mut li = self.loop_input.clone();
                     ui.add(
                         TextEdit::singleline(&mut li)
@@ -925,7 +925,7 @@ impl UrlDialog {
                     }
                     _ => {
                         self.error = Some(
-                            i18n::tr("Loop interval must be a whole number from 0 to 86400").into(),
+                            i18n::tr("Loop count must be a whole number from 0 to 86400").into(),
                         );
                     }
                 }
@@ -1155,7 +1155,8 @@ impl ControlPanel {
         });
         row(ui, i18n::tr("Audio volume (%)"), |ui| {
             let mut volume = self.state.audio.primary_volume;
-            if spin(ui, "audio-volume", &mut volume, 1.0, 0.0, 100.0, "%") {
+            let max_volume = settings.volume_max.max(100) as f64;
+            if spin(ui, "audio-volume", &mut volume, 1.0, 0.0, max_volume, "%") {
                 self.state.audio.primary_volume = volume;
                 actions.push(Action::SetVolume(volume.round() as i64));
             }

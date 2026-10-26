@@ -90,6 +90,9 @@ fn fa(key: &str) -> &str {
         "A-B repeat: off" => "تکرار A-B: خاموش",
         "Volume" => "صدا",
         "Could not open media" => "باز کردن رسانه ممکن نشد",
+        "Load command failed" => "فرمان بارگذاری ناموفق بود",
+        "Could not start media load" => "شروع بارگذاری رسانه ممکن نشد",
+        "Could not save the current frame" => "ذخیرهٔ فریم فعلی ممکن نشد",
         // -- dialog chrome -------------------------------------------------------------------------
         "Close" => "بستن",
         "OK" => "تأیید",
@@ -392,6 +395,10 @@ fn fa(key: &str) -> &str {
         "Loop interval (seconds, 0 = no loop):" => "فاصلهٔ تکرار (ثانیه، ۰ = بدون تکرار):",
         "Loop interval must be a whole number from 0 to 86400" => {
             "فاصلهٔ تکرار باید عددی صحیح بین ۰ تا ۸۶۴۰۰ باشد"
+        }
+        "Loop count (0 = no loop):" => "تعداد تکرار (۰ = بدون تکرار):",
+        "Loop count must be a whole number from 0 to 86400" => {
+            "تعداد تکرار باید عددی صحیح بین ۰ تا ۸۶۴۰۰ باشد"
         }
         "Track" => "قطعه",
         "Auto" => "خودکار",

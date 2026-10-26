@@ -10,6 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 /// Rotate when the active log exceeds this size.
 pub const MAX_BYTES: u64 = 512 * 1024;
 
@@ -34,11 +37,17 @@ pub fn append_to(path: &Path, line: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(dir) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        let _ = std::fs::set_permissions(dir, permissions);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let Ok(mut file) = options.open(path) else {
         return;
     };
     let stamp = crate::util::format_unix_time(

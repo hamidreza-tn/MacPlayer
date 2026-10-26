@@ -4,6 +4,20 @@ All notable changes to MacPlayer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.3] - 2026-10-26
+
+### Fixed
+
+- Fixed settings save races and stale background writes.
+- Fixed stale folder-expansion results replacing newer media selections.
+- Fixed thumbnail priority jobs waiting behind FIFO work.
+- Fixed volume boost persistence, loop handling, EQ replacement and visualizer cleanup.
+- Fixed mini-player window restoration and gesture hit testing.
+- Fixed stream option escaping, load failure reporting and screenshot errors.
+- Added libmpv API compatibility checks and safer settings/log file permissions.
+- Prevented folder scans from traversing nested symlinks outside the selected directory.
+- Added XSPF playlist loading and safer M3U export handling.
+
 ## [1.9.2] - 2026-10-26
 
 The interface, packaging and playback pipeline all receive a major polish pass
@@ -43,8 +57,8 @@ for the first public release.
 - Fixed rejected `target-peak=0` and mistyped `sub-margin-y` property writes.
 - Fixed the idle-screen play button losing clicks to the full-window video
   hit target, playlist reveal scrolling to the wrong row when a filter was
-  active, and folder expansion skipping symlinked folders (with symlink-cycle
-  protection).
+  active, and folder expansion traversing symlinked folders outside the
+  selected directory.
 - "Add URL..." from the playlist now appends to it instead of replacing it;
   only "Open URL..." in the File menu starts a fresh list.
 - Playlists larger than the probe queue no longer lose row durations; overflow

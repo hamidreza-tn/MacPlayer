@@ -1060,6 +1060,7 @@ impl Playlist {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_rows(
         &mut self,
         ui: &mut egui::Ui,

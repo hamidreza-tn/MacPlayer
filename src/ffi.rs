@@ -51,6 +51,8 @@ pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 pub const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 pub const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 pub const MPV_RENDER_API_TYPE_OPENGL: &[u8] = b"opengl\0";
+/// The ABI used by the mpv 0.41 headers this crate mirrors.
+pub const MPV_CLIENT_API_VERSION: c_ulong = (2 << 16) | 5;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -266,6 +268,15 @@ pub fn load() -> Result<(&'static Library, Api), String> {
         };
         match unsafe { load_from(&lib) } {
             Ok(api) => {
+                let actual = unsafe { (api.client_api_version)() };
+                let actual_major = actual >> 16;
+                if actual_major != MPV_CLIENT_API_VERSION >> 16 || actual < MPV_CLIENT_API_VERSION {
+                    errors.push(format!(
+                        "{path}: unsupported libmpv client API version {actual:#x} (need at least {MPV_CLIENT_API_VERSION:#x} with major {:#x})",
+                        MPV_CLIENT_API_VERSION >> 16
+                    ));
+                    continue;
+                }
                 let lib: &'static Library = Box::leak(Box::new(lib));
                 return Ok((lib, api));
             }

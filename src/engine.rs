@@ -215,8 +215,17 @@ impl Engine {
             ("input-vo-keyboard", "no".into()),
             ("hwdec", Self::hwdec_value(settings.hwdec).into()),
             ("hr-seek", "yes".into()),
-            ("volume-max", "100".into()),
-            ("volume", settings.volume.clamp(0, 100).to_string()),
+            (
+                "volume-max",
+                settings.volume_max.clamp(100, 200).to_string(),
+            ),
+            (
+                "volume",
+                settings
+                    .volume
+                    .clamp(0, settings.volume_max.clamp(100, 200))
+                    .to_string(),
+            ),
             ("mute", yes_no(settings.mute)),
             ("audio-client-name", "MacPlayer".into()),
             ("screenshot-format", "png".into()),
@@ -244,10 +253,6 @@ impl Engine {
             (
                 "ytdl-format",
                 Self::ytdl_format(&settings.ytdl_quality).into(),
-            ),
-            (
-                "volume-max",
-                settings.volume_max.clamp(100, 200).to_string(),
             ),
             (
                 "audio-pitch-correction",
@@ -327,9 +332,18 @@ impl Engine {
                 return Err(error);
             }
         };
-        if !first_pass && let Err(error) = apply_options(true) {
-            unsafe { (api.terminate_destroy)(mpv) };
-            return Err(error);
+        if !first_pass {
+            let second_pass = match apply_options(true) {
+                Ok(ok) => ok,
+                Err(error) => {
+                    unsafe { (api.terminate_destroy)(mpv) };
+                    return Err(error);
+                }
+            };
+            if !second_pass {
+                unsafe { (api.terminate_destroy)(mpv) };
+                return Err("mpv rejected one or more required startup options".into());
+            }
         }
 
         let log_level = std::env::var("MACPLAYER_LOGLEVEL")
@@ -514,9 +528,19 @@ impl Engine {
                 .get("aid")
                 .map(|value| TrackSelection::from_value(&value))
                 .unwrap_or(TrackSelection::Auto),
-            primary_volume: self.get_f64("volume").clamp(0.0, 100.0),
+            primary_volume: self.get_f64("volume").clamp(0.0, 200.0),
             primary_delay: self.get_f64("audio-delay"),
         }
+    }
+
+    /// Apply stream-related options as properties immediately before a URL load.
+    /// This avoids embedding user-controlled values in mpv's comma-separated
+    /// `loadfile` option list.
+    pub fn set_stream_options(&self, user_agent: &str, headers: &str) -> bool {
+        let mut ok = self.set("user-agent", &Value::Str(user_agent.to_string()));
+        let header_value = http_header_fields(headers);
+        ok &= self.set("http-header-fields", &Value::Str(header_value));
+        ok
     }
 
     pub fn set_audio_track(&self, selection: TrackSelection) -> bool {
@@ -747,14 +771,19 @@ fn yes_no(value: bool) -> String {
     if value { "yes".into() } else { "no".into() }
 }
 
-/// `Key: Value` lines (and/or comma-separated) joined into the single
-/// comma-separated form mpv's `http-header-fields` option expects.
+/// `Key: Value` lines joined into the comma-separated form mpv's
+/// `http-header-fields` option expects. Commas inside a header value are escaped.
 fn http_header_fields(raw: &str) -> String {
-    raw.split(['\n', ','])
+    raw.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && line.contains(':'))
+        .map(escape_option_list_field)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn escape_option_list_field(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(',', "\\,")
 }
 
 /// Render scalar values in the format expected by mpv option and property strings.
@@ -879,7 +908,8 @@ mod tests {
             http_header_fields("Referer: https://x\nCookie: a=b"),
             "Referer: https://x,Cookie: a=b"
         );
-        assert_eq!(http_header_fields("no-colon, "), "");
+        assert_eq!(http_header_fields("Cookie: a,b"), "Cookie: a\\,b");
+        assert_eq!(http_header_fields("no-colon"), "");
     }
 
     #[test]

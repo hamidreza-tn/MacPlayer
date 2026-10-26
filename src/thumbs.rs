@@ -40,6 +40,9 @@ pub struct Thumbnails {
     jobs: Option<Sender<Job>>,
     /// Priority lane: the currently playing file (seek-bar previews).
     priority: Option<Sender<Job>>,
+    /// Wakeup channel shared by both lanes; without it the worker could block
+    /// on the FIFO lane while a priority job waits on the other channel.
+    wake: Option<Sender<()>>,
     results: Receiver<(String, Vec<Option<Vec<u8>>>)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -59,18 +62,20 @@ impl Thumbnails {
     pub fn new() -> Self {
         let (job_tx, job_rx) = channel::<Job>();
         let (priority_tx, priority_rx) = channel::<Job>();
+        let (wake_tx, wake_rx) = channel::<()>();
         let (result_tx, result_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker = which("ffmpeg").and_then(|ffmpeg| {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("thumbs".into())
-                .spawn(move || worker_loop(ffmpeg, job_rx, priority_rx, result_tx, stop))
+                .spawn(move || worker_loop(ffmpeg, job_rx, priority_rx, wake_rx, result_tx, stop))
                 .ok()
         });
         Self {
             jobs: worker.is_some().then_some(job_tx),
             priority: worker.is_some().then_some(priority_tx),
+            wake: worker.is_some().then_some(wake_tx),
             results: result_rx,
             stop,
             worker,
@@ -100,6 +105,9 @@ impl Thumbnails {
                 path: path.to_string(),
                 duration,
             });
+            if let Some(wake) = &self.wake {
+                let _ = wake.send(());
+            }
         }
     }
 
@@ -122,6 +130,9 @@ impl Thumbnails {
             path: path.to_string(),
             duration,
         });
+        if let Some(wake) = &self.wake {
+            let _ = wake.send(());
+        }
     }
 
     /// Take finished preview sets from the worker. Call once per frame.
@@ -197,6 +208,7 @@ impl Drop for Thumbnails {
         // Dropping both senders wakes the worker from `recv()`.
         self.jobs = None;
         self.priority = None;
+        self.wake = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -207,22 +219,27 @@ fn worker_loop(
     ffmpeg: String,
     jobs: Receiver<Job>,
     priority: Receiver<Job>,
+    wake: Receiver<()>,
     results: Sender<(String, Vec<Option<Vec<u8>>>)>,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Acquire) {
         // The priority lane (currently playing file) is drained first so
         // seek-bar previews never queue behind a batch of row jobs.
-        let job = match priority.try_recv() {
-            Ok(job) => Some(job),
-            Err(TryRecvError::Empty) => match jobs.recv() {
-                Ok(job) => Some(job),
-                Err(_) => break,
-            },
-            Err(TryRecvError::Disconnected) => match jobs.recv() {
-                Ok(job) => Some(job),
-                Err(_) => break,
-            },
+        let job = loop {
+            match priority.try_recv() {
+                Ok(job) => break Some(job),
+                Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => {}
+            }
+            match jobs.try_recv() {
+                Ok(job) => break Some(job),
+                Err(TryRecvError::Disconnected) => break None,
+                Err(TryRecvError::Empty) => {}
+            }
+            if wake.recv().is_err() {
+                break None;
+            }
         };
         let Some(job) = job else { break };
         let frames = preview_frames(&ffmpeg, &job.path, job.duration, &stop);

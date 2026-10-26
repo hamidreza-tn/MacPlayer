@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +46,10 @@ const VIDEO_DOUBLE_CLICK_SECS: f64 = 0.30;
 const PLAYLIST_EXT: &[&str] = crate::util::PLAYLIST_EXT;
 const VIDEO_EXT: &[&str] = crate::util::VIDEO_EXT;
 const AUDIO_EXT: &[&str] = crate::util::AUDIO_EXT;
+
+static SAVING: AtomicBool = AtomicBool::new(false);
+static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A single thing the UI wants the player to do. Chrome, menus and dialogs all push into
 /// one queue; it is drained once per frame, after painting.
@@ -109,8 +114,8 @@ pub struct Player {
     startup_error: Option<String>,
     ipc_rx: Receiver<Vec<String>>,
     /// Request/result channels for the off-thread folder expansion worker.
-    expander: Option<Sender<(Vec<String>, bool)>>,
-    expanded_rx: Receiver<(Vec<String>, bool)>,
+    expander: Option<Sender<(u64, Vec<String>, bool)>>,
+    expanded_rx: Receiver<(u64, Vec<String>, bool)>,
     services: Box<dyn Services>,
 
     settings: Settings,
@@ -180,6 +185,7 @@ pub struct Player {
 
     gl_ready: bool,
     pending_open: Vec<(Vec<String>, bool)>,
+    open_generation: u64,
     closing: bool,
     /// Last window title actually sent to the viewport; avoids re-sending it every frame.
     applied_title: String,
@@ -203,6 +209,8 @@ pub struct Player {
     mini_player: bool,
     /// Window size before entering the mini player.
     mini_prev_size: Option<Vec2>,
+    mini_prev_fullscreen: bool,
+    mini_prev_maximized: bool,
     /// (deband, denoise, sharpen) toggle state for the video filter menu.
     video_filters: (bool, bool, bool),
     /// True while the lavfi visualizer filter is installed.
@@ -232,8 +240,8 @@ impl Player {
     ) -> Self {
         // Folder expansion worker: one persistent thread turns open requests
         // into fully expanded path lists without ever blocking the UI.
-        let (expander_tx, expander_rx) = channel::<(Vec<String>, bool)>();
-        let (expanded_tx, expanded_rx) = channel::<(Vec<String>, bool)>();
+        let (expander_tx, expander_rx) = channel::<(u64, Vec<String>, bool)>();
+        let (expanded_tx, expanded_rx) = channel::<(u64, Vec<String>, bool)>();
         let expander_worker = std::thread::Builder::new()
             .name("open-expander".into())
             .spawn(move || expand_worker(expander_rx, expanded_tx))
@@ -323,6 +331,7 @@ impl Player {
             hovered_files: Vec::new(),
             gl_ready: false,
             pending_open: Vec::new(),
+            open_generation: 0,
             closing: false,
             applied_title: String::new(),
             applied_on_top: None,
@@ -338,6 +347,8 @@ impl Player {
             sleep_after_playlist: false,
             mini_player: false,
             mini_prev_size: None,
+            mini_prev_fullscreen: false,
+            mini_prev_maximized: false,
             video_filters: (false, false, false),
             viz_active: false,
             file_is_audio_only: false,
@@ -421,6 +432,11 @@ impl Player {
     }
 
     fn save_settings(&mut self) {
+        SAVE_GENERATION.fetch_add(1, Ordering::AcqRel);
+        let guard = match SAVE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Err(error) = self.settings.try_save() {
             self.settings_error = Some(error.clone());
             self.osd_error(
@@ -430,6 +446,7 @@ impl Player {
         } else {
             self.settings_error = None;
         }
+        drop(guard);
     }
 
     fn set_prop(&self, name: &str, value: impl Into<Value>) {
@@ -766,15 +783,19 @@ impl Player {
         if let Some(path) = self.current_path.clone() {
             self.settings.set_position(&path, None);
         }
-        if self.settings.repeat_mode == "one" {
+        if self.settings.loop_mode == "file" || self.settings.repeat_mode == "one" {
             self.cmd(&["seek", "0", "absolute"]);
             self.set_prop("pause", false);
-        } else if let Some(row) =
-            self.playlist
-                .step(1, &self.settings.repeat_mode, self.settings.shuffle)
-        {
-            self.play_row(row, false);
         } else {
+            let repeat = if self.settings.loop_mode == "playlist" {
+                "all"
+            } else {
+                self.settings.repeat_mode.as_str()
+            };
+            if let Some(row) = self.playlist.step(1, repeat, self.settings.shuffle) {
+                self.play_row(row, false);
+                return;
+            }
             // Playlist exhausted: honor keep-open — stay on the last frame, paused,
             // with a brief replay hint. Space or a video click restarts the file;
             // an explicit Stop (F4) is what returns to the idle screen.
@@ -973,18 +994,33 @@ impl Player {
         // The 10 s autosave must never stall the UI thread on JSON + fsync:
         // persist from a background thread instead (single-flight, so a slow
         // disk cannot pile up writers — the next tick carries newer state).
-        static SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        use std::sync::atomic::Ordering;
         if SAVING.swap(true, Ordering::AcqRel) {
             return;
         }
         let snapshot = self.settings.clone();
+        let generation = SAVE_GENERATION.load(Ordering::Acquire);
+        let file_stamp = std::fs::metadata(crate::settings::config_file())
+            .and_then(|metadata| metadata.modified())
+            .ok();
         let spawned = std::thread::Builder::new()
             .name("settings-save".into())
             .spawn(move || {
-                if let Err(error) = snapshot.try_save() {
+                let guard = match SAVE_LOCK.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                // A synchronous save may have superseded this snapshot while
+                // the worker was being scheduled. Never write stale state last.
+                let current_stamp = std::fs::metadata(crate::settings::config_file())
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                if SAVE_GENERATION.load(Ordering::Acquire) == generation
+                    && current_stamp == file_stamp
+                    && let Err(error) = snapshot.try_save()
+                {
                     crate::logging::write(&format!("settings autosave: {error}"));
                 }
+                drop(guard);
                 SAVING.store(false, Ordering::Release);
             })
             .is_ok();
@@ -1013,15 +1049,17 @@ impl Player {
             self.pending_open.push((paths, append));
             return;
         }
+        self.open_generation = self.open_generation.wrapping_add(1);
+        let generation = self.open_generation;
         // A folder walk can touch tens of thousands of entries: expand off the
         // UI thread and finish when the worker answers. Plain files and URLs
         // stay on the fast synchronous path.
-        if paths.iter().any(|p| !is_url(p) && Path::new(p).is_dir()) {
-            if let Some(expander) = &self.expander {
-                let _ = expander.send((paths, append));
-                self.osd(i18n::tr("Reading folder…"));
-                return;
-            }
+        if paths.iter().any(|p| !is_url(p) && Path::new(p).is_dir())
+            && let Some(expander) = &self.expander
+        {
+            let _ = expander.send((generation, paths, append));
+            self.osd(i18n::tr("Reading folder…"));
+            return;
         }
         let expanded = expand_paths(&paths);
         self.open_expanded(&expanded, append);
@@ -1134,6 +1172,10 @@ impl Player {
         self.seek_target = (0.0, 0.0);
         self.autofit_pending = !is_url(&path);
         self.file_is_audio_only = false;
+        if self.viz_active {
+            self.cmd(&["af", "remove", "@fpviz"]);
+            self.viz_active = false;
+        }
         self.aspect_name = "Default".into();
         self.aspect_value = "-1".into();
         self.seek.reset();
@@ -1145,36 +1187,25 @@ impl Player {
         // Load paused whenever a resume prompt is coming, so the file never
         // audibly starts for a few frames before the dialog pauses it again.
         self.set_prop("pause", self.resumed_at.is_none());
-        if let Some(engine) = self.engine() {
-            // URLs pick up the configured user-agent/headers for this load.
-            let options = if is_url(&path) {
-                self.url_load_options()
-            } else {
-                String::new()
-            };
-            engine.load_with_options(&path, None, &options);
+        let loaded = if let Some(engine) = self.engine() {
+            if is_url(&path) {
+                engine.set_stream_options(
+                    &self.settings.http_user_agent,
+                    &self.settings.http_headers,
+                );
+            }
+            engine.load_with_options(&path, None, "")
+        } else {
+            false
+        };
+        if !loaded {
+            self.playlist.set_status(
+                &path,
+                MediaStatus::Failed(i18n::tr("Load command failed").into()),
+            );
+            self.osd_error(i18n::tr("Could not start media load"), 3500);
         }
         self.update_title();
-    }
-
-    /// mpv loadfile options carrying the HTTP settings to remote streams.
-    fn url_load_options(&self) -> String {
-        let mut options: Vec<String> = Vec::new();
-        if !self.settings.http_user_agent.is_empty() {
-            options.push(format!("user-agent={}", self.settings.http_user_agent));
-        }
-        let headers = self
-            .settings
-            .http_headers
-            .split(['\n', ','])
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && line.contains(':'))
-            .collect::<Vec<_>>()
-            .join(",");
-        if !headers.is_empty() {
-            options.push(format!("http-header-fields={headers}"));
-        }
-        options.join(",")
     }
 
     fn add_subtitles(&mut self, paths: &[String]) {
@@ -1865,6 +1896,10 @@ impl Player {
             .filter(|(_, g)| **g != 0.0)
             .map(|(f, g)| (*f, *g))
             .collect();
+        if self.eq_active {
+            self.cmd(&["af", "remove", "@fpeq"]);
+            self.eq_active = false;
+        }
         if self.settings.eq_enabled && !bands.is_empty() {
             let chain: Vec<String> = bands
                 .iter()
@@ -1873,9 +1908,6 @@ impl Player {
             let spec = format!("@fpeq:lavfi=[{}]", chain.join(","));
             self.cmd(&["af", "add", &spec]);
             self.eq_active = true;
-        } else if self.eq_active {
-            self.cmd(&["af", "remove", "@fpeq"]);
-            self.eq_active = false;
         }
     }
 
@@ -1954,7 +1986,15 @@ impl Player {
             counter += 1;
             path = format!("{folder}/{base}_{counter}.png");
         }
-        self.cmd(&["screenshot-to-file", &path, mode]);
+        let captured = self
+            .engine()
+            .and_then(|engine| engine.cmd_sync(&["screenshot-to-file", &path, mode]))
+            .is_some()
+            && Path::new(&path).is_file();
+        if !captured {
+            self.osd_error(i18n::tr("Could not save the current frame"), 3000);
+            return;
+        }
         let name = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2102,7 +2142,7 @@ impl Player {
 
     fn set_on_top(&mut self, mode: &str) {
         self.settings.on_top = mode.to_string();
-        self.on_top = mode != "never";
+        self.on_top = mode == "always" || (mode == "playing" && self.is_playing());
         self.osd(match mode {
             "never" => i18n::tr("On top: never"),
             "always" => i18n::tr("On top: always"),
@@ -2124,7 +2164,7 @@ impl Player {
     fn apply_on_top(&mut self) {
         let mode = self.settings.on_top.clone();
         let want = mode == "always" || (mode == "playing" && self.is_playing());
-        if want != self.on_top && !self.fullscreen {
+        if want != self.on_top {
             self.on_top = want;
         }
     }
@@ -2383,20 +2423,10 @@ impl Player {
         if s.volume_max >= 100 {
             self.volume.max = s.volume_max;
         }
-        self.set_prop(
-            "loop-file",
-            match s.loop_mode.as_str() {
-                "file" => "inf",
-                _ => "no",
-            },
-        );
-        self.set_prop(
-            "loop-playlist",
-            match s.loop_mode.as_str() {
-                "playlist" => "inf",
-                _ => "no",
-            },
-        );
+        // Looping is owned by the app playlist. mpv only ever contains the
+        // currently loaded entry because every file is loaded with `replace`.
+        self.set_prop("loop-file", "no");
+        self.set_prop("loop-playlist", "no");
         self.set_prop("audio-pitch-correction", s.audio_pitch_correction);
         self.set_prop("audio-channels", s.audio_channels.as_str());
         self.set_prop(
@@ -2430,20 +2460,6 @@ impl Player {
     /// mpv loop options from the "none" | "file" | "playlist" setting.
     fn set_loop_mode(&mut self, mode: &str) {
         self.settings.loop_mode = mode.to_string();
-        match mode {
-            "file" => {
-                self.set_prop("loop-file", "inf");
-                self.set_prop("loop-playlist", "no");
-            }
-            "playlist" => {
-                self.set_prop("loop-file", "no");
-                self.set_prop("loop-playlist", "inf");
-            }
-            _ => {
-                self.set_prop("loop-file", "no");
-                self.set_prop("loop-playlist", "no");
-            }
-        }
         self.save_settings();
         self.osd(match mode {
             "file" => i18n::tr("Loop: current file"),
@@ -2556,9 +2572,15 @@ impl Player {
         if self.mini_player {
             let size = ctx.content_rect().size();
             self.mini_prev_size = Some(size);
+            self.mini_prev_fullscreen = self.fullscreen;
+            self.mini_prev_maximized = self.maximized;
             if self.playlist_visible {
                 self.toggle_playlist(ctx);
             }
+            self.fullscreen = false;
+            self.maximized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(480.0, 300.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -2566,12 +2588,15 @@ impl Player {
             ));
             self.applied_on_top = Some(true);
         } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            self.fullscreen = self.mini_prev_fullscreen;
+            self.maximized = self.mini_prev_maximized;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.fullscreen));
             if let Some(size) = self.mini_prev_size {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
             // Re-sync the level with the on-top preference.
             self.applied_on_top = None;
+            self.request_window_mode(ctx);
         }
         self.schedule_chrome_hide();
         ctx.request_repaint();
@@ -2588,24 +2613,40 @@ impl Player {
             self.osd_error(i18n::tr("Not a disc folder (VIDEO_TS / BDMV)"), 3500);
             return;
         }
-        let (url, options) = if is_dvd {
-            ("dvd://".to_string(), format!("dvd-device={folder}"))
+        let url = if is_dvd {
+            "dvd://".to_string()
         } else {
-            ("bluray://".to_string(), format!("bluray-device={folder}"))
+            "bluray://".to_string()
         };
-        self.settings.last_dir = folder;
+        self.settings.last_dir = folder.clone();
         // Disc titles are not regular files; hand them straight to mpv.
         self.current_path = Some(url.clone());
         self.playlist.set_items(std::slice::from_ref(&url));
         self.playlist.set_current(Some(0));
+        self.playlist.set_status(&url, MediaStatus::Loading);
         self.file_ready = false;
         self.last_pos = 0.0;
         self.autofit_pending = false;
         self.file_is_audio_only = false;
         self.seek.reset();
         self.set_prop("pause", false);
-        if let Some(engine) = self.engine() {
-            engine.load_with_options(&url, None, &options);
+        let loaded = if let Some(engine) = self.engine() {
+            let device = Value::Str(folder.clone());
+            if is_dvd {
+                engine.set("dvd-device", &device);
+            } else {
+                engine.set("bluray-device", &device);
+            }
+            engine.load_with_options(&url, None, "")
+        } else {
+            false
+        };
+        if !loaded {
+            self.playlist.set_status(
+                &url,
+                MediaStatus::Failed(i18n::tr("Load command failed").into()),
+            );
+            self.osd_error(i18n::tr("Could not start media load"), 3500);
         }
         self.update_title();
     }
@@ -2638,10 +2679,19 @@ impl Player {
     }
 
     /// Trackpad pinch → fullscreen; two-finger horizontal scroll over the video → seek.
-    fn handle_gestures(&mut self, ctx: &Context, video: Rect) {
-        let over_video = ctx
-            .pointer_hover_pos()
-            .is_some_and(|pos| video.contains(pos));
+    fn handle_gestures(&mut self, ctx: &Context, layout: &Layout) {
+        let over_video = ctx.pointer_hover_pos().is_some_and(|pos| {
+            layout.video.contains(pos)
+                && !layout.playlist.is_some_and(|rect| rect.contains(pos))
+                && !layout.controls.is_some_and(|rect| rect.contains(pos))
+                && !layout.top_actions.is_some_and(|rect| rect.contains(pos))
+                && !self.playlist_visible
+                && !self.settings_pop.open
+                && !self.menu.is_open()
+                && !self.playlist.menu_open()
+                && !self.any_dialog_open()
+                && !self.palette.open
+        });
 
         // Pinch-to-fullscreen reads only `Zoom` events (trackpad pinch). The
         // ctrl+scroll wheel path below means video zoom instead — `zoom_delta()`
@@ -3390,8 +3440,10 @@ impl Player {
         }
 
         // Folder-expansion answers from the worker thread.
-        while let Ok((expanded, append)) = self.expanded_rx.try_recv() {
-            self.open_expanded(&expanded, append);
+        while let Ok((generation, expanded, append)) = self.expanded_rx.try_recv() {
+            if generation == self.open_generation {
+                self.open_expanded(&expanded, append);
+            }
         }
 
         // Control panel refresh timer.
@@ -3443,7 +3495,7 @@ impl Player {
 
         let window = ctx.content_rect();
         let layout = self.layout(window);
-        self.handle_gestures(ctx, layout.video);
+        self.handle_gestures(ctx, &layout);
         self.remember_window_geometry(ctx);
 
         // The video fills the window; chrome, drawer and panels float above it.
@@ -3467,7 +3519,7 @@ impl Player {
 
         // Keep the window level in sync — but only send the viewport command when the
         // value actually changed, so winit does not re-apply the level every frame.
-        let want_on_top = self.on_top && !self.fullscreen;
+        let want_on_top = self.mini_player || (self.on_top && !self.fullscreen);
         if self.applied_on_top != Some(want_on_top) {
             self.applied_on_top = Some(want_on_top);
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if want_on_top {
@@ -4844,7 +4896,7 @@ fn repaint_interval_ms(playing: bool, buffering: bool, message_remaining_ms: Opt
     } else if buffering {
         33
     } else if let Some(remaining) = message_remaining_ms {
-        remaining.min(33).max(1)
+        remaining.clamp(1, 33)
     } else {
         250
     }
@@ -4878,10 +4930,13 @@ fn home_dir() -> Option<String> {
 
 /// Body of the open-expander thread: expand request paths (following folders
 /// recursively) and hand the result back to the UI thread.
-fn expand_worker(requests: Receiver<(Vec<String>, bool)>, results: Sender<(Vec<String>, bool)>) {
-    while let Ok((paths, append)) = requests.recv() {
+fn expand_worker(
+    requests: Receiver<(u64, Vec<String>, bool)>,
+    results: Sender<(u64, Vec<String>, bool)>,
+) {
+    while let Ok((generation, paths, append)) = requests.recv() {
         let expanded = crate::util::expand_paths(&paths);
-        if results.send((expanded, append)).is_err() {
+        if results.send((generation, expanded, append)).is_err() {
             break;
         }
     }
@@ -4945,7 +5000,7 @@ fn escape_target(
 mod tests {
     use super::{
         ControlCluster, EscapeTarget, control_cluster, escape_target, expand_worker,
-        normalize_speed, repaint_interval_ms,
+        normalize_speed,
     };
 
     #[test]
@@ -4957,11 +5012,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("clip.mkv"), b"x").unwrap();
         req_tx
-            .send((vec![dir.to_string_lossy().into_owned()], true))
+            .send((7, vec![dir.to_string_lossy().into_owned()], true))
             .unwrap();
-        let (expanded, append) = res_rx
+        let (generation, expanded, append) = res_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
+        assert_eq!(generation, 7);
         assert!(append);
         assert_eq!(expanded.len(), 1);
         assert!(expanded[0].ends_with("clip.mkv"));

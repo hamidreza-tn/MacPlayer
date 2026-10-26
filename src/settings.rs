@@ -7,6 +7,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
@@ -16,6 +21,34 @@ pub const MAX_BOOKMARK_TITLE_LEN: usize = 512;
 pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 /// Upper bound for a stored fullscreen monitor index; the UI offers 0..=8.
 const MAX_FULLSCREEN_MONITOR: usize = 64;
+
+#[cfg(unix)]
+struct SaveFileLock(std::fs::File);
+
+#[cfg(unix)]
+impl Drop for SaveFileLock {
+    fn drop(&mut self) {
+        unlock_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn lock_file(file: &std::fs::File) -> bool {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    unsafe { flock(file.as_raw_fd(), 2) == 0 }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unlock_file(file: &std::fs::File) {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    let _ = unsafe { flock(file.as_raw_fd(), 8) };
+}
 
 fn default_schema_version() -> u32 {
     SETTINGS_SCHEMA_VERSION
@@ -386,14 +419,34 @@ impl Settings {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(dir)
             .map_err(|error| format!("could not create settings directory: {error}"))?;
+        #[cfg(unix)]
+        if let Ok(metadata) = fs::metadata(dir) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            let _ = fs::set_permissions(dir, permissions);
+        }
+        #[cfg(unix)]
+        let _save_lock = {
+            let lock_path = dir.join(".settings.lock");
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            options.mode(0o600);
+            let lock_handle = options
+                .open(&lock_path)
+                .map_err(|error| format!("could not open settings lock: {error}"))?;
+            if !lock_file(&lock_handle) {
+                return Err("could not lock settings file".into());
+            }
+            SaveFileLock(lock_handle)
+        };
         let (tmp, mut file) = loop {
             let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let candidate = dir.join(format!(".settings-{}-{id}.tmp", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&candidate) {
                 Ok(file) => break (candidate, file),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -585,7 +638,8 @@ impl Settings {
 
     fn normalize(&mut self) {
         self.schema_version = SETTINGS_SCHEMA_VERSION;
-        self.volume = self.volume.clamp(0, 100);
+        self.volume_max = self.volume_max.clamp(100, 200);
+        self.volume = self.volume.clamp(0, self.volume_max);
         self.window_w = sane_float(self.window_w, 1100.0, 320.0, 10000.0);
         self.window_h = sane_float(self.window_h, 680.0, 200.0, 10000.0);
         self.window_x = self.window_x.filter(|value| value.is_finite());
@@ -658,7 +712,6 @@ impl Settings {
         if !matches!(self.language.as_str(), "en" | "fa") {
             self.language = "en".into();
         }
-        self.volume_max = self.volume_max.clamp(100, 200);
         if !matches!(self.loop_mode.as_str(), "none" | "file" | "playlist") {
             self.loop_mode = "none".into();
         }
@@ -942,6 +995,18 @@ mod tests {
         assert_eq!(settings.sub_color, "#ffffff");
         assert_eq!(settings.cache_secs, 600);
         assert_eq!(settings.http_headers, "Referer: x, Cookie: y");
+    }
+
+    #[test]
+    fn volume_boost_is_preserved_within_the_configured_ceiling() {
+        let mut settings = Settings {
+            volume: 175,
+            volume_max: 200,
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.volume, 175);
+        assert_eq!(settings.volume_max, 200);
     }
 
     #[test]

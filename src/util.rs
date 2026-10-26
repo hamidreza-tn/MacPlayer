@@ -19,7 +19,7 @@ pub const SUB_EXT: &[&str] = &[
     ".srt", ".ass", ".ssa", ".sub", ".vtt", ".smi", ".idx", ".sup", ".txt", ".lrc", ".ttml",
 ];
 
-pub const PLAYLIST_EXT: &[&str] = &[".m3u", ".m3u8", ".pls", ".cue"];
+pub const PLAYLIST_EXT: &[&str] = &[".m3u", ".m3u8", ".pls", ".cue", ".xspf"];
 
 /// Lower-cased extension **with** the leading dot.
 pub fn ext(path: &str) -> String {
@@ -175,8 +175,9 @@ pub fn title_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Folders become their media files (recursively, following symlinked folders);
-/// files and URLs pass through.
+/// Folders become their media files recursively; nested symlinked folders are
+/// deliberately skipped so selecting a directory cannot unexpectedly traverse
+/// outside it or recurse through a large external volume.
 pub fn expand_paths(paths: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for path in paths {
@@ -216,9 +217,9 @@ fn collect_media_recursive(
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
-        // `path.is_dir()` follows symlinks, so linked folders are walked like
-        // real ones; broken symlinks fall through to the file branch and are
-        // dropped by the media-extension filter.
+        if path.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             directories.push((name, path));
         } else {
@@ -359,6 +360,24 @@ pub fn read_playlist_file(path: &str) -> Vec<String> {
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let is_pls = ext(path) == ".pls";
+    let is_xspf = ext(path) == ".xspf";
+    if is_xspf {
+        for location in text.split("<location>").skip(1) {
+            let Some((location, _)) = location.split_once("</location>") else {
+                continue;
+            };
+            let line = xml_unescape(location.trim());
+            if line.is_empty() {
+                continue;
+            }
+            if !is_url(&line) && !Path::new(&line).is_absolute() {
+                entries.push(base.join(&line).to_string_lossy().into_owned());
+            } else {
+                entries.push(line);
+            }
+        }
+        return entries;
+    }
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
@@ -384,18 +403,29 @@ pub fn read_playlist_file(path: &str) -> Vec<String> {
     entries
 }
 
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// Render an extended `.m3u8` playlist: one `#EXTINF` line (duration + title)
 /// per item, then the path. Returns the number of bytes written.
 pub fn write_m3u(path: &str, items: &[(String, String, Option<f64>)]) -> Result<usize, String> {
     let mut text = String::from("#EXTM3U\n");
     for (item_path, title, duration) in items {
+        let safe_title = title.replace(['\r', '\n'], " ");
+        let safe_path = item_path.replace(['\r', '\n'], " ");
         match duration {
             Some(seconds) if seconds.is_finite() && *seconds > 0.0 => {
-                text.push_str(&format!("#EXTINF:{:.0},{}\n", seconds, title));
+                text.push_str(&format!("#EXTINF:{:.0},{}\n", seconds, safe_title));
             }
-            _ => text.push_str(&format!("#EXTINF:-1,{}\n", title)),
+            _ => text.push_str(&format!("#EXTINF:-1,{}\n", safe_title)),
         }
-        text.push_str(item_path);
+        text.push_str(&safe_path);
         text.push('\n');
     }
     std::fs::write(path, text.as_bytes())
@@ -408,6 +438,14 @@ pub fn format_unix_time(secs: i64) -> String {
     if secs <= 0 {
         return "—".into();
     }
+    #[cfg(unix)]
+    if let Some((year, month, day, hour, minute)) = local_components(secs) {
+        return format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}");
+    }
+    format_unix_time_utc(secs)
+}
+
+fn format_unix_time_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -416,6 +454,56 @@ pub fn format_unix_time(secs: i64) -> String {
         rem / 3600,
         (rem % 3600) / 60
     )
+}
+
+#[cfg(unix)]
+#[repr(C)]
+struct NativeTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: isize,
+    tm_zone: *const std::os::raw::c_char,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn local_components(secs: i64) -> Option<(i64, u32, u32, u32, u32)> {
+    unsafe extern "C" {
+        fn localtime_r(timep: *const i64, result: *mut NativeTm) -> *mut NativeTm;
+    }
+    let mut tm = NativeTm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    let result = unsafe { localtime_r(&secs, &mut tm) };
+    (!result.is_null()
+        && (1..=12).contains(&(tm.tm_mon + 1))
+        && (1..=31).contains(&tm.tm_mday)
+        && (0..=23).contains(&tm.tm_hour)
+        && (0..=59).contains(&tm.tm_min))
+    .then_some((
+        i64::from(tm.tm_year) + 1900,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+    ))
 }
 
 /// Locate an executable on PATH, if it exists as a regular file.
@@ -468,12 +556,47 @@ mod tests {
     }
 
     #[test]
+    fn xspf_locations_are_loaded_relative_to_the_playlist() {
+        let dir = std::env::temp_dir().join(format!("macplayer-xspf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("list.xspf");
+        std::fs::write(
+            &path,
+            br#"<playlist><trackList><track><location>clip&amp;one.mkv</location></track></trackList></playlist>"#,
+        )
+        .unwrap();
+        let entries = read_playlist_file(&path.to_string_lossy());
+        assert_eq!(
+            entries,
+            vec![dir.join("clip&one.mkv").to_string_lossy().into_owned()]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn m3u_export_keeps_one_record_per_item() {
+        let dir = std::env::temp_dir().join(format!("macplayer-m3u-safe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.m3u8");
+        write_m3u(
+            &path.to_string_lossy(),
+            &[("/tmp/a\nb.mkv".into(), "title\r\nnext".into(), None)],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("title\nnext"));
+        assert!(!text.contains("/tmp/a\nb.mkv"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unix_time_formats_as_civil_datetime() {
         assert_eq!(format_unix_time(0), "—");
         // 1792800000 = 2026-10-24 00:00 UTC (a whole number of days).
-        assert_eq!(format_unix_time(1_792_800_000), "2026-10-24 00:00");
+        assert_eq!(format_unix_time_utc(1_792_800_000), "2026-10-24 00:00");
         // Leap day: 2000-02-29 12:34 UTC.
-        assert_eq!(format_unix_time(951_827_640), "2000-02-29 12:34");
+        assert_eq!(format_unix_time_utc(951_827_640), "2000-02-29 12:34");
+        assert_eq!(format_unix_time(1_792_800_000).len(), 16);
     }
 
     #[cfg(unix)]
@@ -486,9 +609,9 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(dir.join("root.mkv"), b"x").unwrap();
         std::fs::write(nested.join("inner.mp4"), b"x").unwrap();
-        // A symlinked folder must be walked like a real one...
+        // Nested symlinked folders are intentionally skipped...
         symlink(&nested, dir.join("link")).unwrap();
-        // ...and a cycle pointing back at the parent must terminate the walk.
+        // ...including cycles pointing back at the parent.
         symlink(&dir, nested.join("loop")).unwrap();
 
         let mut found = expand_paths(&[dir.to_string_lossy().into_owned()]);
