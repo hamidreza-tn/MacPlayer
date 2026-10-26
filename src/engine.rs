@@ -12,17 +12,14 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use crate::ffi::{
-    self, Api, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_LOG_MESSAGE, MPV_EVENT_NONE,
-    MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN, MPV_FORMAT_NODE, MPV_FORMAT_NONE, mpv_event,
-    mpv_event_end_file, mpv_event_log_message, mpv_event_property, mpv_handle, mpv_node,
+    self, Api, MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED,
+    MPV_EVENT_LOG_MESSAGE, MPV_EVENT_NONE, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
+    MPV_FORMAT_NODE, MPV_FORMAT_NONE, mpv_event, mpv_event_end_file, mpv_event_log_message,
+    mpv_event_property, mpv_handle, mpv_node,
 };
 use crate::value::Value;
 
 const EVENT_WAIT_TIMEOUT_SECS: f64 = 0.1;
-
-fn claim_shutdown(alive: &AtomicBool) -> bool {
-    alive.swap(false, Ordering::AcqRel)
-}
 
 /// Properties the UI subscribes to.
 pub const OBSERVED: &[&str] = &[
@@ -170,6 +167,9 @@ pub struct Engine {
     rx: Receiver<EngineMsg>,
     log_lines: Arc<Mutex<VecDeque<String>>>,
     alive: Arc<AtomicBool>,
+    /// Set once `terminate_destroy` ran; the mpv-side `MPV_EVENT_SHUTDOWN` also
+    /// clears `alive`, so this separate flag is what guards double destruction.
+    destroyed: bool,
     _event_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -410,6 +410,7 @@ impl Engine {
             rx,
             log_lines,
             alive,
+            destroyed: false,
             _event_thread: Some(event_thread),
         })
     }
@@ -751,9 +752,11 @@ impl Engine {
     pub fn shutdown(&mut self) {
         // `Player::on_exit` shuts the engine down explicitly, and `Engine::drop` calls this
         // method as a final guard.  Do not destroy the mpv handle twice.
-        if !claim_shutdown(&self.alive) {
+        if self.destroyed {
             return;
         }
+        self.destroyed = true;
+        self.alive.store(false, Ordering::Release);
         if let Some(handle) = self._event_thread.take() {
             let _ = handle.join();
         }
@@ -858,6 +861,22 @@ fn event_loop(
                 }
                 crate::logging::write(&line);
             }
+            MPV_EVENT_COMMAND_REPLY if event.error < 0 => {
+                let msg = unsafe { CStr::from_ptr((api.error_string)(event.error)) }
+                    .to_string_lossy()
+                    .into_owned();
+                let line = format!("[cmd-reply] async command failed: {msg}");
+                if let Ok(mut lines) = log_lines.lock() {
+                    if lines.len() >= 200 {
+                        lines.pop_front();
+                    }
+                    lines.push_back(line.clone());
+                }
+                if verbose {
+                    eprintln!("{line}");
+                }
+                crate::logging::write(&line);
+            }
             _ => {}
         }
     }
@@ -910,13 +929,6 @@ mod tests {
         );
         assert_eq!(http_header_fields("Cookie: a,b"), "Cookie: a\\,b");
         assert_eq!(http_header_fields("no-colon"), "");
-    }
-
-    #[test]
-    fn shutdown_state_can_only_be_claimed_once() {
-        let alive = AtomicBool::new(true);
-        assert!(claim_shutdown(&alive));
-        assert!(!claim_shutdown(&alive));
     }
 
     #[test]

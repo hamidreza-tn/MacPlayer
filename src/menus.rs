@@ -1618,13 +1618,16 @@ fn panel_width(ctx: &Context, entries: &[Entry]) -> f32 {
 }
 
 fn panel_height(entries: &[Entry]) -> f32 {
-    entries
+    // Items start 3 px below the panel top (the `y = 3.0` offset in `panel`),
+    // so the height must include that padding or the last row is clipped and
+    // a stray 3 px strip outside the drawn panel stays clickable.
+    3.0 + entries
         .iter()
         .map(|entry| match entry {
             Entry::Sep => SEP_H,
             _ => ITEM_H,
         })
-        .sum()
+        .sum::<f32>()
 }
 
 struct PanelOut {

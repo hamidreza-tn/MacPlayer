@@ -4,6 +4,65 @@ All notable changes to MacPlayer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.4] - 2026-10-26
+
+Full-codebase audit: 24 defects found and fixed (8 major, 16 minor).
+
+### Fixed
+
+- Quitting after adding a large playlist can no longer deadlock the probe
+  worker; results are delivered without blocking and teardown always frees
+  the ffprobe thread.
+- The playlist drawer can no longer overlap the floating transport buttons
+  on narrow windows (drawer resize and layout are both bounded by the chrome
+  the controls need).
+- The mini player's 480x300 window size is no longer persisted as the app's
+  window size; the pre-mini geometry survives restarts.
+- A URL "loop count" no longer leaks into later playback: it is cleared for
+  local files and explicitly reset when the count is 0.
+- Subtitles keep their margin when the window is resized or fullscreen
+  changes (the mpv margin is re-derived from the live viewport height).
+- Engine/renderer teardown order is safe on unwind paths too: the render
+  context is freed before the mpv core in every drop path (mpv render.h
+  requires this; undefined behavior otherwise).
+- Playlist row previews beyond the sixth no longer stay as placeholders —
+  the per-frame decode budget charges only first-use decodes, never cached
+  textures.
+- Tab strips in the Go to / Control Panel / Preferences dialogs use scoped
+  ids, so clicking a tab in one dialog can no longer affect another dialog
+  open at the same time.
+- Control Panel sliders for subtitle size/position and playback speed no
+  longer snap back mid-drag from the periodic refresh.
+- Numeric fields with fractional steps (audio sync 0.05 s, subtitle sync
+  0.5 s, border/shadow) display their decimals instead of "0".
+- Rapidly switching files no longer queues stale priority thumbnail jobs
+  ahead of the current file, and cached files are not re-decoded.
+- Old-generation probe backlog entries are discarded instead of pinning
+  queue capacity forever.
+- Menu panels include their top padding: the last item is no longer clipped
+  and the stray clickable strip outside the panel is gone.
+- Undo re-resolves the playing row by path, so the progress marker cannot
+  desync from the file mpv is actually playing.
+- Dragging media plus subtitles onto the playlist while playing now loads
+  the subtitles on the current file instead of dropping them.
+- The idle-screen play button no longer triggers a second file dialog from
+  the deferred full-window click.
+- Paused seeks chain correctly even when mpv takes longer than 0.6 s to
+  report the new position.
+- The play/pause flash fades smoothly when paused (covered by the repaint
+  cadence).
+- Folder opening routes through the background worker for every batch, so
+  even the routing stat of a stalled network mount cannot block the UI; the
+  "Reading folder..." notice appears only after a short delay.
+- While the resume dialog is visible, transport clicks are kept for the next
+  frame instead of being discarded.
+- mpv-side engine shutdown no longer skips core teardown, and failed async
+  commands (e.g. a corrupt subtitle passed to sub-add) are logged instead of
+  vanishing.
+- The single-instance handoff only acknowledges files the player actually
+  received, and `~/file.mp4` passed quoted on the command line expands to
+  the home directory.
+
 ## [1.9.3] - 2026-10-26
 
 ### Fixed

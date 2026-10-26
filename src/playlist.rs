@@ -62,6 +62,9 @@ pub struct Item {
 struct PlaylistSnapshot {
     items: Vec<Item>,
     current: Option<usize>,
+    /// Path of the playing row at snapshot time; `restore` re-resolves the
+    /// playback pointer by path so undo cannot desync it from mpv.
+    playing_path: Option<String>,
     selected: Vec<usize>,
 }
 
@@ -82,7 +85,6 @@ pub struct PlaylistOut {
 
 enum Job {
     Probe { generation: u64, path: String },
-    Stop,
 }
 
 /// Fills in durations with ffprobe in the background (skipped when ffprobe is missing).
@@ -112,12 +114,21 @@ impl DurationProber {
                                 break;
                             }
                             match job {
-                                Job::Stop => break,
                                 Job::Probe { generation, path } => {
-                                    if let Some(duration) = probe(&ffprobe, &path, &worker_stop)
-                                        && result_tx.send((generation, path, duration)).is_err()
-                                    {
-                                        break;
+                                    if let Some(duration) = probe(&ffprobe, &path, &worker_stop) {
+                                        // try_send: with the drawer closed nothing
+                                        // drains the bounded channel, and a blocking
+                                        // send here would deadlock `Drop` on quit.
+                                        // A dropped duration only leaves that row's
+                                        // readout as "unavailable".
+                                        let result = (generation, path, duration);
+                                        match result_tx.try_send(result) {
+                                            Ok(()) => {}
+                                            // Full: drawer closed, nothing drains —
+                                            // drop this duration and keep going.
+                                            Err(TrySendError::Full(_)) => {}
+                                            Err(TrySendError::Disconnected(_)) => break,
+                                        }
                                     }
                                 }
                             }
@@ -186,8 +197,12 @@ impl DurationProber {
             let mut sent = 0usize;
             let mut kept: Vec<(u64, String)> = Vec::new();
             for (job_generation, path) in backlog.drain(..) {
+                if job_generation != generation {
+                    // Stale generation: that playlist is gone — free the slot
+                    // instead of pinning capacity forever.
+                    continue;
+                }
                 if sent < 32
-                    && job_generation == generation
                     && jobs
                         .try_send(Job::Probe {
                             generation: job_generation,
@@ -208,9 +223,10 @@ impl DurationProber {
 impl Drop for DurationProber {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(Job::Stop);
-        }
+        // Dropping the sender wakes a recv-blocked worker; a blocking
+        // `send(Job::Stop)` here could wait on the worker itself (deadlock
+        // when the results channel filled up with the drawer closed).
+        self.jobs = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -368,6 +384,10 @@ impl Playlist {
         PlaylistSnapshot {
             items: self.items.clone(),
             current: self.current,
+            playing_path: self
+                .current
+                .and_then(|row| self.items.get(row))
+                .map(|item| item.path.clone()),
             selected: self.selected.clone(),
         }
     }
@@ -382,7 +402,13 @@ impl Playlist {
 
     fn restore(&mut self, snapshot: PlaylistSnapshot) {
         self.items = snapshot.items;
-        self.current = snapshot.current.filter(|row| *row < self.items.len());
+        // The file mpv is playing right now outranks the snapshot's row index:
+        // point `current` at it when it survives the restore.
+        self.current = snapshot
+            .playing_path
+            .as_deref()
+            .and_then(|playing| self.items.iter().position(|item| item.path == playing))
+            .or(snapshot.current.filter(|row| *row < self.items.len()));
         self.selected = snapshot
             .selected
             .into_iter()
@@ -1166,10 +1192,12 @@ impl Playlist {
                 && item_duration > 1.0
             {
                 let path = &self.items[row].path;
-                // Budgeted decode: first-use PNG uploads stop after a few per
-                // frame so a freshly opened drawer never hitches on one frame.
-                if *texture_budget > 0
-                    && let Some(handle) =
+                // Budgeted decode: the budget charges only first-use PNG
+                // uploads, so a freshly opened drawer never hitches while rows
+                // whose textures are already uploaded always draw.
+                let cached = thumbs.peek_ready(path, item_duration * 0.5, item_duration);
+                if (cached || *texture_budget > 0)
+                    && let Some((handle, _fresh)) =
                         thumbs.texture(ctx, path, item_duration * 0.5, item_duration)
                 {
                     // Aspect-fit the frame inside the slot (letterboxed by the fill).
@@ -1182,7 +1210,9 @@ impl Playlist {
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     painter.image(handle.id(), draw_rect, uv, Color32::WHITE);
                     drew_frame = true;
-                    *texture_budget -= 1;
+                    if !cached {
+                        *texture_budget = texture_budget.saturating_sub(1);
+                    }
                 } else {
                     // Queue once; the worker fills it while the row stays visible.
                     thumbs.ensure(path, item_duration);

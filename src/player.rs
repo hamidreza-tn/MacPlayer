@@ -38,8 +38,18 @@ use crate::widgets::{
 const CHROME_HIDE_SECS: f64 = 2.2;
 /// How long the big play/pause flash stays on the video.
 const FLASH_SECS: f64 = 0.55;
+/// Chrome the floating transport cluster needs to stay clickable to the left
+/// of the drawer (back+play+fwd + fullscreen, from the compaction test).
+const MIN_CHROME_W: f32 = 172.0;
+
 /// Widest playlist drawer.
 const DRAWER_MAX_W: f32 = 420.0;
+
+/// Drawer width cap for a given window width: never let the drawer swallow the
+/// transport cluster, whatever `playlist_width` says.
+fn max_drawer_width(window_width: f32) -> f32 {
+    DRAWER_MAX_W.min(MIN_PLAYLIST_W.max(window_width - MIN_CHROME_W))
+}
 /// Window in which a second stage click upgrades to a double-click, so a plain
 /// click-to-pause never also triggers full screen.
 const VIDEO_DOUBLE_CLICK_SECS: f64 = 0.30;
@@ -109,8 +119,12 @@ impl CommandPalette {
 }
 
 pub struct Player {
-    engine: Option<Engine>,
+    // `renderer` is declared before `engine` on purpose: fields drop in
+    // declaration order and mpv requires mpv_render_context_free to run
+    // before mpv_terminate_destroy (mpv render.h: UB otherwise). The normal
+    // path frees both explicitly in `on_exit`; this order guards unwind drops.
     renderer: Option<Arc<Mutex<Renderer>>>,
+    engine: Option<Engine>,
     startup_error: Option<String>,
     ipc_rx: Receiver<Vec<String>>,
     /// Request/result channels for the off-thread folder expansion worker.
@@ -127,6 +141,8 @@ pub struct Player {
     file_ready: bool,
     last_pos: f64,
     seek_target: (f64, f64),
+    /// True while a paused seek is still awaiting its time-pos report.
+    seek_target_pending: bool,
     fail_count: usize,
     autofit_pending: bool,
     resumed_at: Option<f64>,
@@ -186,6 +202,8 @@ pub struct Player {
     gl_ready: bool,
     pending_open: Vec<(Vec<String>, bool)>,
     open_generation: u64,
+    /// Outstanding expander request: (generation, started_at, osd shown).
+    expander_pending: Option<(u64, f64, bool)>,
     closing: bool,
     /// Last window title actually sent to the viewport; avoids re-sending it every frame.
     applied_title: String,
@@ -283,6 +301,7 @@ impl Player {
             file_ready: false,
             last_pos: 0.0,
             seek_target: (0.0, 0.0),
+            seek_target_pending: false,
             fail_count: 0,
             autofit_pending: false,
             resumed_at: None,
@@ -332,6 +351,7 @@ impl Player {
             gl_ready: false,
             pending_open: Vec::new(),
             open_generation: 0,
+            expander_pending: None,
             closing: false,
             applied_title: String::new(),
             applied_on_top: None,
@@ -604,7 +624,7 @@ impl Player {
         if self.drawer_slide > 0.001 {
             let width = (self.settings.playlist_width as f32)
                 .clamp(MIN_PLAYLIST_W, DRAWER_MAX_W)
-                .min(window.width().max(MIN_PLAYLIST_W));
+                .min(max_drawer_width(window.width()));
             let left = (window.right() - width * self.drawer_slide).max(window.left());
             l.playlist = Some(Rect::from_min_max(
                 pos2(left, window.top()),
@@ -670,7 +690,7 @@ impl Player {
     }
 
     fn remember_window_geometry(&mut self, ctx: &Context) {
-        if self.fullscreen || self.maximized {
+        if self.fullscreen || self.maximized || self.mini_player {
             return;
         }
         let size = ctx.content_rect().size();
@@ -700,6 +720,10 @@ impl Player {
                 if let Some(v) = value.as_f64() {
                     self.last_pos = v;
                     self.seek.position = v;
+                    // A paused seek is settled once mpv reports its target.
+                    if self.seek_target_pending && (v - self.seek_target.1).abs() <= 1.0 {
+                        self.seek_target_pending = false;
+                    }
                 }
             }
             "duration" => {
@@ -1051,15 +1075,16 @@ impl Player {
         }
         self.open_generation = self.open_generation.wrapping_add(1);
         let generation = self.open_generation;
-        // A folder walk can touch tens of thousands of entries: expand off the
-        // UI thread and finish when the worker answers. Plain files and URLs
-        // stay on the fast synchronous path.
-        if paths.iter().any(|p| !is_url(p) && Path::new(p).is_dir())
-            && let Some(expander) = &self.expander
-        {
-            let _ = expander.send((generation, paths, append));
-            self.osd(i18n::tr("Reading folder…"));
-            return;
+        // A folder walk can touch tens of thousands of entries, and even the
+        // routing stat of a stalled network mount can block for seconds: hand
+        // the whole batch to the expander thread. Results usually come back
+        // within a frame; the "Reading folder…" OSD appears only after 150 ms
+        // so plain file opens never flash it.
+        if let Some(expander) = &self.expander {
+            if expander.send((generation, paths.clone(), append)).is_ok() {
+                self.expander_pending = Some((generation, self.now, false));
+                return;
+            }
         }
         let expanded = expand_paths(&paths);
         self.open_expanded(&expanded, append);
@@ -1100,6 +1125,11 @@ impl Player {
                 self.pending_subs = subs;
                 self.play_row(first, true);
             } else {
+                // Playing already: appended media cannot take the subs with it,
+                // so load them on the current file instead of losing them.
+                if !subs.is_empty() {
+                    self.add_subtitles(&subs);
+                }
                 let n = media.len();
                 self.osd(format!(
                     "{} {n} {}",
@@ -1170,6 +1200,7 @@ impl Player {
         self.file_ready = false;
         self.last_pos = 0.0;
         self.seek_target = (0.0, 0.0);
+        self.seek_target_pending = false;
         self.autofit_pending = !is_url(&path);
         self.file_is_audio_only = false;
         if self.viz_active {
@@ -1179,6 +1210,12 @@ impl Player {
         self.aspect_name = "Default".into();
         self.aspect_value = "-1".into();
         self.seek.reset();
+        // The URL dialog's loop count is armed only for that request; a local
+        // file must never inherit it (mpv would replay the single-entry
+        // playlist behind our back and race `on_eof`).
+        if !is_url(&path) {
+            self.set_prop("loop-playlist", "no");
+        }
         self.resumed_at = if self.settings.resume {
             self.settings.get_position(&path)
         } else {
@@ -1296,7 +1333,17 @@ impl Player {
         if !self.has_file() || !self.file_ready {
             return;
         }
-        let base = if self.now - self.seek_target.0 < 0.6 {
+        // While paused, mpv reports the new position only after the seek
+        // completes — which can outlive the 0.6 s freshness window. Keep
+        // chaining from the pending target until `on_prop` sees it land.
+        let paused = self
+            .state
+            .get("pause")
+            .map(|v| v.as_bool())
+            .unwrap_or(false);
+        let fresh = self.now - self.seek_target.0 < 0.6;
+        let pending_paused = paused && self.seek_target_pending;
+        let base = if fresh || pending_paused {
             self.seek_target.1
         } else {
             self.last_pos
@@ -1307,6 +1354,7 @@ impl Player {
             target = target.min(dur);
         }
         self.seek_target = (self.now, target);
+        self.seek_target_pending = true;
         self.cmd(&["seek", &format!("{amount}"), "relative"]);
         self.seek_osd(target);
     }
@@ -3043,8 +3091,11 @@ impl Player {
                 loop_s,
                 append,
             } => {
+                // Arm (or clear) the repeat count for exactly this request.
                 if loop_s > 0 {
                     self.set_prop("loop-playlist", loop_s);
+                } else {
+                    self.set_prop("loop-playlist", "no");
                 }
                 self.pending.open_paths(vec![url], append);
             }
@@ -3426,7 +3477,26 @@ impl Player {
             if let Some(choice) = keyboard.or_else(|| self.resume_dialog.show(ctx)) {
                 self.apply_resume_choice(choice);
             }
-            self.pending = Pending::new();
+            // The chrome is still painted and clickable behind this dialog:
+            // keep playback-relevant clicks for the next frame, drop the rest
+            // (file opens etc. would race the resume choice).
+            let pending = std::mem::take(&mut self.pending);
+            for action in pending.actions {
+                if matches!(
+                    action,
+                    Action::TogglePause
+                        | Action::SeekRel(_)
+                        | Action::SeekAbs(_)
+                        | Action::SeekBar(..)
+                        | Action::VolumeStep(_)
+                        | Action::SetVolume(_)
+                        | Action::ToggleMute
+                        | Action::FrameStep(_)
+                        | Action::ToggleRemaining
+                ) {
+                    self.pending.actions.push(action);
+                }
+            }
             ctx.request_repaint_after(Duration::from_millis(80));
             return;
         }
@@ -3442,7 +3512,19 @@ impl Player {
         // Folder-expansion answers from the worker thread.
         while let Ok((generation, expanded, append)) = self.expanded_rx.try_recv() {
             if generation == self.open_generation {
+                self.expander_pending = None;
                 self.open_expanded(&expanded, append);
+            }
+        }
+        // Still waiting on the expander? Announce it once, after a beat.
+        if let Some((generation, started, shown)) = self.expander_pending {
+            if !shown && self.now - started > 0.15 {
+                if let Some((_, _, shown_ref)) = self.expander_pending.as_mut() {
+                    *shown_ref = true;
+                }
+                if generation == self.open_generation {
+                    self.osd(i18n::tr("Reading folder…"));
+                }
             }
         }
 
@@ -3463,7 +3545,11 @@ impl Player {
         }
         self.sleep_timer_tick();
         self.thumbs.drain();
-        self.viewport_h = ctx.content_rect().height().max(1.0);
+        let new_viewport_h = ctx.content_rect().height().max(1.0);
+        if (self.viewport_h - new_viewport_h).abs() > 0.5 {
+            self.viewport_h = new_viewport_h;
+            self.update_sub_margin_for_height(new_viewport_h);
+        }
         if self.info_visible && self.now >= self.next_info {
             self.next_info = self.now + 0.4;
             let text = self.info_text(true);
@@ -3561,7 +3647,14 @@ impl Player {
             .osd
             .message_until
             .map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64);
-        let interval = repaint_interval_ms(self.is_playing(), buffering, message_remaining_ms);
+        let flash_remaining_ms = (self.flash_until > self.now)
+            .then(|| ((self.flash_until - self.now) * 1000.0).max(1.0) as u64);
+        let interval = repaint_interval_ms(
+            self.is_playing(),
+            buffering,
+            message_remaining_ms,
+            flash_remaining_ms,
+        );
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
@@ -3930,7 +4023,7 @@ impl Player {
                 .as_deref()
                 .filter(|path| !is_url(path))
                 .and_then(|path| self.thumbs.texture(&ctx, path, seconds, duration))
-                .map(|handle| {
+                .map(|(handle, _)| {
                     let size = handle.size_vec2();
                     let scale = 128.0 / size.x.max(1.0);
                     (handle.id(), vec2(size.x * scale, size.y * scale))
@@ -4194,7 +4287,9 @@ impl Player {
             && let Some(pos) = resize.interact_pointer_pos()
         {
             let window = ctx.content_rect();
-            let width = (window.right() - pos.x).clamp(MIN_PLAYLIST_W, DRAWER_MAX_W);
+            let width = (window.right() - pos.x)
+                .clamp(MIN_PLAYLIST_W, DRAWER_MAX_W)
+                .min(max_drawer_width(window.width()));
             self.settings.playlist_width = width as f64;
         }
         if resize.hovered() || resize.dragged() {
@@ -4346,6 +4441,7 @@ impl Player {
                 Stroke::NONE,
             ));
             if response.clicked() {
+                self.video_click_at = None;
                 self.pending.push(Action::OpenFiles { append: false });
             }
             painter.text(
@@ -4890,12 +4986,21 @@ fn normalize_speed(value: f64) -> f64 {
 /// * OSD message pending: repaint fast enough for the 300 ms fade-out, never
 ///   past the deadline itself.
 /// * Otherwise (paused / idle): the UI is static — a coarse 250 ms keepalive.
-fn repaint_interval_ms(playing: bool, buffering: bool, message_remaining_ms: Option<u64>) -> u64 {
+fn repaint_interval_ms(
+    playing: bool,
+    buffering: bool,
+    message_remaining_ms: Option<u64>,
+    flash_remaining_ms: Option<u64>,
+) -> u64 {
     if playing {
         200
     } else if buffering {
         33
     } else if let Some(remaining) = message_remaining_ms {
+        remaining.clamp(1, 33)
+    } else if let Some(remaining) = flash_remaining_ms {
+        // The big play/pause flash fades over 0.55 s — keep it smooth when
+        // the surrounding UI is at the paused keepalive rate.
         remaining.clamp(1, 33)
     } else {
         250
@@ -5106,18 +5211,32 @@ mod tests {
     }
 
     #[test]
+    fn drawer_width_never_swallows_the_transport_cluster() {
+        use super::max_drawer_width;
+        // Wide window: the full maximum is fine.
+        assert_eq!(max_drawer_width(1920.0), 420.0);
+        // 480 px window: capped so ~172 px of chrome stays clickable.
+        assert_eq!(max_drawer_width(480.0), 308.0);
+        // Smaller still: chrome wins, the drawer shrinks below its minimum.
+        assert_eq!(max_drawer_width(400.0), 292.0);
+    }
+
+    #[test]
     fn repaint_cadence_minimizes_work_per_state() {
         use super::repaint_interval_ms;
         // Playing: mpv's frame callback drives the real cadence; 200 ms is a net.
-        assert_eq!(repaint_interval_ms(true, false, None), 200);
-        assert_eq!(repaint_interval_ms(true, false, Some(10)), 200);
+        assert_eq!(repaint_interval_ms(true, false, None, None), 200);
+        assert_eq!(repaint_interval_ms(true, false, Some(10), None), 200);
         // Buffering: smooth percentage ticking.
-        assert_eq!(repaint_interval_ms(false, true, None), 33);
+        assert_eq!(repaint_interval_ms(false, true, None, None), 33);
         // OSD message: repaint at fade rate, capped by the remaining time.
-        assert_eq!(repaint_interval_ms(false, false, Some(2_000)), 33);
-        assert_eq!(repaint_interval_ms(false, false, Some(8)), 8);
-        assert_eq!(repaint_interval_ms(false, false, Some(0)), 1);
+        assert_eq!(repaint_interval_ms(false, false, Some(2_000), None), 33);
+        assert_eq!(repaint_interval_ms(false, false, Some(8), None), 8);
+        assert_eq!(repaint_interval_ms(false, false, Some(0), None), 1);
+        // Play/pause flash: smooth fade while the UI is otherwise paused.
+        assert_eq!(repaint_interval_ms(false, false, None, Some(400)), 33);
+        assert_eq!(repaint_interval_ms(false, false, None, Some(9)), 9);
         // Static UI: coarse keepalive.
-        assert_eq!(repaint_interval_ms(false, false, None), 250);
+        assert_eq!(repaint_interval_ms(false, false, None, None), 250);
     }
 }

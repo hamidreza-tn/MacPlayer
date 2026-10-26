@@ -27,7 +27,7 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// of playlist rows without regenerating on every scroll).
 const CACHE_FILES: usize = 24;
 /// Cap on the `requested` dedupe set; clearing it merely allows regeneration.
-const MAX_REQUESTED: usize = 512;
+const MAX_REQUESTED: usize = 8192;
 
 struct Job {
     path: String,
@@ -101,6 +101,11 @@ impl Thumbnails {
         {
             self.active = path.to_string();
             self.requested.insert(path.to_string());
+            // Frames still in cache decode on demand via `texture()` —
+            // re-queueing would redo the ffmpeg passes for nothing.
+            if self.frames.contains_key(path) {
+                return;
+            }
             let _ = priority.send(Job {
                 path: path.to_string(),
                 duration,
@@ -167,7 +172,7 @@ impl Thumbnails {
         path: &str,
         seconds: f64,
         duration: f64,
-    ) -> Option<&TextureHandle> {
+    ) -> Option<(&TextureHandle, bool)> {
         let frames = self.frames.get(path)?;
         if frames.is_empty() || duration <= 0.0 || !seconds.is_finite() {
             return None;
@@ -177,6 +182,7 @@ impl Thumbnails {
         if frames.get(slot)?.is_none() {
             return None;
         }
+        let mut fresh = false;
         if self
             .textures
             .get(path)
@@ -197,8 +203,26 @@ impl Thumbnails {
             if slot < slots.len() {
                 slots[slot] = Some(handle);
             }
+            fresh = true;
         }
-        self.textures.get(path)?.get(slot)?.as_ref()
+        let handle = self.textures.get(path)?.get(slot)?.as_ref()?;
+        Some((handle, fresh))
+    }
+
+    /// Cheap pre-check: is a texture already uploaded for this slot? Lets
+    /// callers draw cached previews without charging a decode budget.
+    pub fn peek_ready(&self, path: &str, seconds: f64, duration: f64) -> bool {
+        self.frames.get(path).is_some_and(|frames| {
+            if frames.is_empty() || duration <= 0.0 || !seconds.is_finite() {
+                return false;
+            }
+            let slot = ((seconds / duration).clamp(0.0, 0.999) * THUMB_COUNT as f64) as usize;
+            let slot = slot.min(frames.len() - 1);
+            self.textures
+                .get(path)
+                .and_then(|slots| slots.get(slot))
+                .is_some_and(|handle| handle.is_some())
+        })
     }
 }
 
@@ -225,10 +249,18 @@ fn worker_loop(
 ) {
     while !stop.load(Ordering::Acquire) {
         // The priority lane (currently playing file) is drained first so
-        // seek-bar previews never queue behind a batch of row jobs.
+        // seek-bar previews never queue behind a batch of row jobs, and it is
+        // coalesced to its newest entry: rapid file switches must not make the
+        // current file wait behind stale decodes.
         let job = loop {
             match priority.try_recv() {
-                Ok(job) => break Some(job),
+                Ok(first) => {
+                    let mut newest = first;
+                    while let Ok(newer) = priority.try_recv() {
+                        newest = newer;
+                    }
+                    break Some(newest);
+                }
                 Err(TryRecvError::Disconnected) => {}
                 Err(TryRecvError::Empty) => {}
             }

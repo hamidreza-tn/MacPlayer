@@ -184,13 +184,28 @@ fn normalize_cli_path(path: &str) -> String {
     if crate::util::is_url(path) {
         return path.to_string();
     }
-    let path = std::path::Path::new(path);
+    let expanded = expand_tilde(path, std::env::var("HOME").ok().as_deref());
+    let path = std::path::Path::new(&expanded);
     if path.is_absolute() {
         return path.to_string_lossy().into_owned();
     }
     std::env::current_dir()
         .map(|cwd| cwd.join(path).to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+/// Expand a leading `~/` (or bare `~`) against `home`. Quoted tilde paths from
+/// launchers that never glob would otherwise become `<cwd>/~/...` silently.
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    if let Some(home) = home {
+        if let Some(rest) = path.strip_prefix("~/") {
+            return format!("{home}/{rest}");
+        }
+        if path == "~" {
+            return home.to_string();
+        }
+    }
+    path.to_string()
 }
 
 fn ipc_path() -> std::path::PathBuf {
@@ -333,10 +348,13 @@ fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<Atom
                     .is_ok()
                     && payload.len() <= MAX_IPC_BYTES;
                 let paths = valid.then(|| decode_ipc_payload(&payload)).flatten();
-                let accepted = paths.is_some();
-                if let Some(paths) = paths {
-                    let _ = tx.send(paths);
-                }
+                // Ack success only when the channel accepted the handoff —
+                // during teardown the receiver may already be gone, and a
+                // false ack silently loses the file.
+                let accepted = paths
+                    .as_ref()
+                    .is_some_and(|paths| tx.send(paths.clone()).is_ok());
+                drop(paths);
                 let _ = stream.write_all(&[u8::from(accepted)]);
                 let _ = stream.flush();
             }
@@ -363,7 +381,17 @@ fn decode_ipc_payload(payload: &[u8]) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, decode_ipc_payload, normalize_cli_path};
+    use super::{Cli, decode_ipc_payload, expand_tilde, normalize_cli_path};
+
+    #[test]
+    fn tilde_paths_expand_against_home() {
+        assert_eq!(expand_tilde("~/a.mkv", Some("/Users/x")), "/Users/x/a.mkv");
+        assert_eq!(expand_tilde("~", Some("/Users/x")), "/Users/x");
+        // No home or no tilde: pass through untouched.
+        assert_eq!(expand_tilde("~/a.mkv", None), "~/a.mkv");
+        assert_eq!(expand_tilde("/abs/a.mkv", Some("/Users/x")), "/abs/a.mkv");
+        assert_eq!(expand_tilde("not~home", Some("/Users/x")), "not~home");
+    }
 
     #[test]
     fn ipc_payload_accepts_only_string_paths() {

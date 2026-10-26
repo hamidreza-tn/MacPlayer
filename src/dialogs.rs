@@ -199,10 +199,19 @@ fn spin(
 ) -> bool {
     let mut changed = false;
     let text_id = Id::new(("spin-text", id));
+    // Fractional steps must stay visible: 0.05 steps rendering as "0" makes
+    // the arrows look dead.
+    let decimals = if step < 0.1 {
+        2
+    } else if step < 1.0 {
+        1
+    } else {
+        0
+    };
     let mut text = ui
         .ctx()
         .data(|data| data.get_temp::<String>(text_id))
-        .unwrap_or_else(|| format!("{value:.0}"));
+        .unwrap_or_else(|| format!("{value:.decimals$}"));
     let r = ui.add(
         TextEdit::singleline(&mut text)
             .desired_width(64.0)
@@ -406,7 +415,7 @@ fn dialog_footer(ui: &mut egui::Ui, ok: bool, cancel: bool, apply: bool) -> (boo
 
 /// Segmented control over `names`; the selected segment gets a raised fill and an
 /// accent outline. Used for dialog tab strips and small mode switches.
-fn tabs(ui: &mut egui::Ui, names: &[&str], current: &mut usize) {
+fn tabs(ui: &mut egui::Ui, scope: &str, names: &[&str], current: &mut usize) {
     let colors = active_colors();
     let item_h = 26.0;
     let pad_x = 12.0;
@@ -427,7 +436,7 @@ fn tabs(ui: &mut egui::Ui, names: &[&str], current: &mut usize) {
             pos2(x, container.top() + 3.0),
             vec2(widths[i], item_h - 6.0),
         );
-        let resp = ui.interact(rect, Id::new(("tab", i)), Sense::click());
+        let resp = ui.interact(rect, Id::new(("tab", scope, i)), Sense::click());
         let sel = i == *current;
         if sel {
             p.rect_filled(rect, 5.0, colors.tab_sel);
@@ -607,7 +616,12 @@ impl GoToDialog {
                     GoToMode::Time => 0,
                     GoToMode::Percent => 1,
                 };
-                tabs(ui, &[i18n::tr("Time"), i18n::tr("Percent")], &mut mode_tab);
+                tabs(
+                    ui,
+                    "goto",
+                    &[i18n::tr("Time"), i18n::tr("Percent")],
+                    &mut mode_tab,
+                );
                 self.mode = match mode_tab {
                     1 => GoToMode::Percent,
                     _ => GoToMode::Time,
@@ -1086,6 +1100,7 @@ impl ControlPanel {
                 }
                 tabs(
                     ui,
+                    "control-panel",
                     &[
                         i18n::tr("Audio"),
                         i18n::tr("Video"),
@@ -1346,6 +1361,12 @@ impl ControlPanel {
                     .fixed_decimals(0)
                     .show_value(false),
             );
+            if r.dragged() {
+                self.loading = true;
+            }
+            if r.drag_stopped() {
+                self.loading = false;
+            }
             if r.changed() {
                 actions.push(Action::SetSubScale(v / 100.0));
                 self.state.sub_scale = v / 100.0;
@@ -1358,6 +1379,12 @@ impl ControlPanel {
                     .fixed_decimals(0)
                     .show_value(false),
             );
+            if r.dragged() {
+                self.loading = true;
+            }
+            if r.drag_stopped() {
+                self.loading = false;
+            }
             if r.changed() {
                 actions.push(Action::SetSubPos(v));
                 self.state.sub_pos = v;
@@ -1383,6 +1410,12 @@ impl ControlPanel {
                     .fixed_decimals(0)
                     .show_value(false),
             );
+            if r.dragged() {
+                self.loading = true;
+            }
+            if r.drag_stopped() {
+                self.loading = false;
+            }
             if r.changed() {
                 actions.push(Action::SetSpeed(v / 100.0));
                 self.state.speed = v / 100.0;
@@ -1488,6 +1521,7 @@ impl PreferencesDialog {
                 }
                 tabs(
                     ui,
+                    "preferences",
                     &[
                         i18n::tr("General"),
                         i18n::tr("Playback"),
