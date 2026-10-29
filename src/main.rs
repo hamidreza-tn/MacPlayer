@@ -35,10 +35,26 @@ use std::time::Duration;
 use player::Player;
 
 fn main() {
-    // Headless CLI: `macplayer --cli <command>` never opens a window.
+    // Headless CLI: `macplayer --cli <command>` never opens a window. The
+    // `--` separator ends option scanning, so a file literally named `--cli`
+    // still opens as media.
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(position) = raw_args.iter().position(|arg| arg == "--cli") {
-        let code = cli::run(&raw_args[position + 1..]);
+    let option_end = raw_args.iter().position(|arg| arg == "--");
+    let scan_end = option_end.unwrap_or(raw_args.len());
+    if let Some(position) = raw_args[..scan_end]
+        .iter()
+        .position(|arg| arg == "--cli" || arg.starts_with("--cli="))
+    {
+        let rest = &raw_args[position..];
+        let cli_args: Vec<String> = if rest[0] == "--cli" {
+            rest[1..].to_vec()
+        } else {
+            rest[0]
+                .strip_prefix("--cli=")
+                .map(|cmd| cmd.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let code = cli::run(&cli_args);
         std::process::exit(code);
     }
 
@@ -70,8 +86,7 @@ fn main() {
     if !cli.new_instance && send_to_running(&args) {
         return;
     }
-    let (ipc_server, ipc_rx): (Option<InstanceServer>, Receiver<Vec<String>>) = if cli.new_instance
-    {
+    let (ipc_server, ipc_rx): (Option<InstanceServer>, Receiver<IpcMessage>) = if cli.new_instance {
         let (_tx, rx) = channel();
         (None, rx)
     } else {
@@ -190,7 +205,7 @@ Options:
     }
 }
 
-fn normalize_cli_path(path: &str) -> String {
+pub(crate) fn normalize_cli_path(path: &str) -> String {
     if crate::util::is_url(path) {
         return path.to_string();
     }
@@ -237,41 +252,61 @@ fn libc_getuid() -> u32 {
     0
 }
 
-/// Try to hand `paths` to an already-running instance over a Unix socket.
-pub(crate) fn send_to_running(paths: &[String]) -> bool {
-    let path = ipc_path();
-    let mut stream = match UnixStream::connect(&path) {
-        Ok(stream) => stream,
+/// Outcome of handing one message to the running instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handoff {
+    /// The running instance queued the message.
+    Acked,
+    /// An instance owns the socket but did not acknowledge (quitting or hung).
+    NotAcked,
+    /// No instance is listening.
+    NoInstance,
+}
+
+/// Send one already-built IPC message to the running instance.
+pub(crate) fn send_ipc_message(message: &IpcMessage) -> Handoff {
+    let payload = serde_json::to_string(message).unwrap_or_default();
+    let mut stream = match UnixStream::connect(ipc_path()) {
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            return false;
+            return Handoff::NoInstance;
         }
         Err(error) => {
             eprintln!("could not contact the existing MacPlayer instance: {error}");
-            return true;
+            return Handoff::NotAcked;
         }
+        Ok(stream) => stream,
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let payload = serde_json::json!({ "paths": paths }).to_string();
     if stream.write_all(payload.as_bytes()).is_err() {
-        return true;
+        return Handoff::NotAcked;
     }
     let _ = stream.flush();
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut ack = [0u8; 1];
-    if stream.read_exact(&mut ack).is_err() {
-        eprintln!("the existing MacPlayer instance did not acknowledge the request");
-    } else if ack[0] != 1 {
-        eprintln!("the existing MacPlayer instance rejected the request");
+    match stream.read_exact(&mut ack) {
+        Err(_) => {
+            eprintln!("the existing MacPlayer instance did not acknowledge the request");
+            Handoff::NotAcked
+        }
+        Ok(_) if ack[0] == 1 => Handoff::Acked,
+        Ok(_) => {
+            eprintln!("the existing MacPlayer instance rejected the request");
+            Handoff::NotAcked
+        }
     }
-    // A successful connect proves that another instance owns the socket.  Do not
-    // start a second player merely because the request was rejected or timed out.
-    true
+}
+
+/// Files handoff for GUI startup: any connect-success proves an instance owns
+/// the socket, so a second player must not start even if the ack was lost.
+pub(crate) fn send_to_running(paths: &[String]) -> bool {
+    let message = IpcMessage::Open(paths.to_vec());
+    !matches!(send_ipc_message(&message), Handoff::NoInstance)
 }
 
 const MAX_IPC_BYTES: usize = 64 * 1024;
@@ -283,7 +318,7 @@ struct InstanceServer {
 }
 
 impl InstanceServer {
-    fn start() -> Result<(Self, Receiver<Vec<String>>), String> {
+    fn start() -> Result<(Self, Receiver<IpcMessage>), String> {
         let path = ipc_path();
         let listener = match UnixListener::bind(&path) {
             Ok(listener) => listener,
@@ -316,7 +351,7 @@ impl InstanceServer {
             .set_nonblocking(true)
             .map_err(|error| format!("set listener nonblocking: {error}"))?;
 
-        let (tx, rx) = channel();
+        let (tx, rx) = channel::<IpcMessage>();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
@@ -345,7 +380,7 @@ impl Drop for InstanceServer {
     }
 }
 
-fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<AtomicBool>) {
+fn instance_loop(listener: UnixListener, tx: Sender<IpcMessage>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -357,14 +392,14 @@ fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<Atom
                     .read_to_end(&mut payload)
                     .is_ok()
                     && payload.len() <= MAX_IPC_BYTES;
-                let paths = valid.then(|| decode_ipc_payload(&payload)).flatten();
+                let message = valid.then(|| decode_ipc_payload(&payload)).flatten();
                 // Ack success only when the channel accepted the handoff —
                 // during teardown the receiver may already be gone, and a
                 // false ack silently loses the file.
-                let accepted = paths
+                let accepted = message
                     .as_ref()
-                    .is_some_and(|paths| tx.send(paths.clone()).is_ok());
-                drop(paths);
+                    .is_some_and(|message| tx.send(message.clone()).is_ok());
+                drop(message);
                 let _ = stream.write_all(&[u8::from(accepted)]);
                 let _ = stream.flush();
             }
@@ -380,13 +415,44 @@ fn instance_loop(listener: UnixListener, tx: Sender<Vec<String>>, stop: Arc<Atom
     }
 }
 
-fn decode_ipc_payload(payload: &[u8]) -> Option<Vec<String>> {
+/// A message handed over the single-instance socket.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) enum IpcMessage {
+    /// Open (or queue) these files/URLs.
+    Open(Vec<String>),
+    /// Apply one settings mutation inside the running GUI, so the GUI stays
+    /// the single settings writer (CLI edits cannot be reverted by autosave).
+    SetSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Clear one stored collection: "history" | "recent" | "positions" |
+    /// "bookmarks" | "playlist".
+    Clear(String),
+    /// Restore defaults inside the running GUI (single-writer discipline).
+    ResetSettings,
+}
+
+fn decode_ipc_payload(payload: &[u8]) -> Option<IpcMessage> {
     let object: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    let paths = object.get("paths")?.as_array()?;
-    paths
-        .iter()
-        .map(|path| path.as_str().map(str::to_owned))
-        .collect()
+    if let Some(paths) = object.get("paths").and_then(|v| v.as_array()) {
+        let paths: Option<Vec<String>> = paths
+            .iter()
+            .map(|path| path.as_str().map(str::to_owned))
+            .collect();
+        return paths.map(IpcMessage::Open);
+    }
+    if let Some(entry) = object.get("settings").and_then(|v| v.as_object()) {
+        let (key, value) = entry.into_iter().next()?;
+        return Some(IpcMessage::SetSetting {
+            key: key.clone(),
+            value: value.clone(),
+        });
+    }
+    if let Some(command) = object.get("clear").and_then(|v| v.as_str()) {
+        return Some(IpcMessage::Clear(command.to_string()));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -405,12 +471,34 @@ mod tests {
 
     #[test]
     fn ipc_payload_accepts_only_string_paths() {
-        assert_eq!(
-            decode_ipc_payload(br#"{"paths":["/tmp/a.mp4","https://example.test/v"]}"#),
-            Some(vec!["/tmp/a.mp4".into(), "https://example.test/v".into()])
+        assert!(
+            matches!(
+                decode_ipc_payload(br#"{"paths":["/tmp/a.mp4","https://example.test/v"]}"#),
+                Some(crate::IpcMessage::Open(paths))
+                    if paths == vec!["/tmp/a.mp4".to_string(), "https://example.test/v".to_string()]
+            ),
+            "string path arrays decode as Open"
         );
         assert_eq!(decode_ipc_payload(br#"{"paths":[42]}"#), None);
         assert_eq!(decode_ipc_payload(br#"{}"#), None);
+    }
+
+    #[test]
+    fn ipc_payload_decodes_settings_and_clear() {
+        assert!(matches!(
+            decode_ipc_payload(br#"{"settings":{"volume":37}}"#),
+            Some(crate::IpcMessage::SetSetting { key, value })
+                if key == "volume" && value == serde_json::json!(37)
+        ));
+        assert!(matches!(
+            decode_ipc_payload(br#"{"clear":"history"}"#),
+            Some(crate::IpcMessage::Clear(what)) if what == "history"
+        ));
+        assert_eq!(
+            decode_ipc_payload(br#"{"unknown":true}"#),
+            None,
+            "unrecognized payloads fail closed"
+        );
     }
 
     #[test]

@@ -4,6 +4,54 @@ All notable changes to MacPlayer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.1] - 2026-10-27
+
+Second full-codebase audit: 19 defects found and fixed, plus quality and
+storage improvements.
+
+### Fixed
+
+- **CLI/GUI settings race (major):** with the GUI running, every mutating CLI
+  command (`settings set/reset`, `history clear`, `playlist add/clear`, …)
+  is now delegated over the instance socket and applied to the GUI's
+  in-memory state, so the autosave can no longer revert it. With no GUI
+  running, the CLI writes the file directly.
+- **Theme "auto" (major):** the resolved system appearance is reconciled
+  every frame, so the hand-drawn chrome and the egui dialogs can no longer
+  show mismatched palettes.
+- **`settings set` (major):** values the app canonicalizes (`#FFFFFF`,
+  `+1256`, `ac3, dts`) are accepted; multi-word values (`sub_font DejaVu
+  Sans`) are joined; bare numbers for string keys and integer-valued floats
+  are coerced; the applied value is echoed back.
+- **`open` (major):** honest exit codes — rejected/timed-out handoffs exit 1;
+  paths are normalized (`~`, relative) like the GUI launch path.
+- The thumbnail worker is skipped entirely when both hover thumbnails and
+  continue watching are disabled.
+- The update-available pill no longer overlaps the continue-watching row,
+  and the card row clamps to the window width.
+- Cover-art cache is LRU-bounded (64 files) instead of growing for the whole
+  session.
+- `update-check` distinguishes offline from up-to-date, and pre-release tags
+  (`v2.0.0-rc1`) count as newer.
+- `extract_tag` parses the release JSON properly instead of substring
+  matching.
+- The non-macOS Now Playing stub compiles again (Linux builds).
+- `open`/`reveal` children are reaped (no zombie processes).
+- The `--` separator is honored before `--cli` scanning, and `--cli=info`
+  works.
+- The Now Playing card is wiped once, not once per second, while idle.
+
+### Improved
+
+- **Disk thumbnail cache:** preview frames are cached under
+  `~/Library/Caches/MacPlayer/thumbs` keyed by a stable path hash with
+  media-mtime validation — reopening a file from a previous session shows
+  previews instantly, with no ffmpeg passes.
+- **AccessKit:** the UI is now exposed to assistive technology (VoiceOver)
+  via eframe's accesskit feature.
+- **ARCHITECTURE.md:** a contributor map of the frame loop, threads,
+  settings ownership and packaging.
+
 ## [1.10.0] - 2026-10-26
 
 The feature release: five headline features, every one of them with an

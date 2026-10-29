@@ -28,6 +28,8 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_FILES: usize = 24;
 /// Cap on the `requested` dedupe set; clearing it merely allows regeneration.
 const MAX_REQUESTED: usize = 8192;
+/// Cover-art sets kept in memory (one small PNG + one texture each).
+const COVER_CACHE_FILES: usize = 64;
 
 struct Job {
     path: String,
@@ -63,6 +65,8 @@ pub struct Thumbnails {
     cover_stop: Arc<AtomicBool>,
     /// Extracted cover PNG per file (one 256 px frame).
     covers: HashMap<String, Vec<u8>>,
+    /// Insertion order of `covers` keys for the small LRU.
+    cover_order: Vec<String>,
     /// Paths whose extraction was attempted (success or not).
     covers_tried: HashSet<String>,
     cover_textures: HashMap<String, TextureHandle>,
@@ -79,7 +83,18 @@ impl Thumbnails {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("thumbs".into())
-                .spawn(move || worker_loop(ffmpeg, job_rx, priority_rx, wake_rx, result_tx, stop))
+                .spawn(move || {
+                    let cache_dir = crate::settings::config_dir().join("Caches").join("thumbs");
+                    worker_loop(
+                        ffmpeg,
+                        job_rx,
+                        priority_rx,
+                        wake_rx,
+                        result_tx,
+                        stop,
+                        Some(cache_dir),
+                    )
+                })
                 .ok()
         });
         // Cover-art extraction thread (audio files; single small ffmpeg pass).
@@ -120,6 +135,7 @@ impl Thumbnails {
             cover_worker,
             cover_stop,
             covers: HashMap::new(),
+            cover_order: Vec::new(),
             covers_tried: HashSet::new(),
             cover_textures: HashMap::new(),
         }
@@ -186,6 +202,14 @@ impl Thumbnails {
         while let Ok((path, art)) = self.cover_results.try_recv() {
             self.covers_tried.insert(path.clone());
             if let Some(png) = art.filter(|png| !png.is_empty()) {
+                self.cover_order.retain(|p| p != &path);
+                self.cover_order.push(path.clone());
+                while self.cover_order.len() > COVER_CACHE_FILES {
+                    let evict = self.cover_order.remove(0);
+                    self.covers.remove(&evict);
+                    self.cover_textures.remove(&evict);
+                    self.covers_tried.remove(&evict);
+                }
                 self.covers.insert(path, png);
             }
         }
@@ -320,6 +344,7 @@ fn worker_loop(
     wake: Receiver<()>,
     results: Sender<(String, Vec<Option<Vec<u8>>>)>,
     stop: Arc<AtomicBool>,
+    cache_dir: Option<std::path::PathBuf>,
 ) {
     while !stop.load(Ordering::Acquire) {
         // The priority lane (currently playing file) is drained first so
@@ -348,26 +373,76 @@ fn worker_loop(
             }
         };
         let Some(job) = job else { break };
-        let frames = preview_frames(&ffmpeg, &job.path, job.duration, &stop);
+        let frames = preview_frames(
+            &ffmpeg,
+            &job.path,
+            job.duration,
+            &stop,
+            cache_dir.as_deref(),
+        );
         if results.send((job.path, frames)).is_err() {
             break;
         }
     }
 }
 
-/// Decode `THUMB_COUNT` frames spread evenly across the file.
+/// Decode `THUMB_COUNT` frames spread evenly across the file, with a
+/// read-through disk cache keyed by a stable path hash: a file visited in a
+/// previous session comes back without any ffmpeg pass.
 fn preview_frames(
     ffmpeg: &str,
     path: &str,
     duration: f64,
     stop: &AtomicBool,
+    cache_dir: Option<&std::path::Path>,
 ) -> Vec<Option<Vec<u8>>> {
     (0..THUMB_COUNT)
         .map(|index| {
             let at = duration * (index as f64 + 0.5) / THUMB_COUNT as f64;
+            if let Some(dir) = cache_dir {
+                let cache_file = thumb_cache_file(dir, path, index);
+                if let Some(bytes) = read_thumb_cache(&cache_file, path) {
+                    return Some(bytes);
+                }
+                let decoded = decode_frame(ffmpeg, path, at, stop);
+                if let Some(bytes) = &decoded {
+                    let _ = write_thumb_cache(&cache_file, bytes);
+                }
+                return decoded;
+            }
             decode_frame(ffmpeg, path, at, stop)
         })
         .collect()
+}
+
+/// Stable, collision-resistant cache file name: FNV-1a of the path plus the
+/// slot index (std's DefaultHasher is seeded per process and would not be
+/// stable across runs).
+fn thumb_cache_file(dir: &std::path::Path, path: &str, slot: usize) -> std::path::PathBuf {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    dir.join(format!("{hash:016x}-{slot}.png"))
+}
+
+fn read_thumb_cache(cache_file: &std::path::Path, source: &str) -> Option<Vec<u8>> {
+    // The cache is valid only while the media file is unchanged.
+    let media_meta = std::fs::metadata(source).ok()?;
+    let cache_meta = std::fs::metadata(cache_file).ok()?;
+    (cache_meta.modified().ok()? >= media_meta.modified().ok()?)
+        .then(|| std::fs::read(cache_file).ok())
+        .flatten()
+}
+
+fn write_thumb_cache(cache_file: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    if let Some(parent) = cache_file.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let tmp = cache_file.with_extension("tmp");
+    std::fs::write(&tmp, bytes).ok()?;
+    std::fs::rename(&tmp, cache_file).ok()
 }
 
 fn decode_frame(ffmpeg: &str, path: &str, at: f64, stop: &AtomicBool) -> Option<Vec<u8>> {
@@ -515,6 +590,28 @@ mod tests {
         thumbs.ensure("/tmp/b.mp4", f64::NAN);
         thumbs.ensure("/tmp/b.mp4", 0.5);
         assert!(!thumbs.requested.contains("/tmp/b.mp4"));
+    }
+
+    #[test]
+    fn disk_cache_roundtrip_and_freshness() {
+        let dir = std::env::temp_dir().join(format!("macplayer-thumbcache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("clip.mkv");
+        std::fs::write(&media, b"x").unwrap();
+        let cache_file = thumb_cache_file(&dir, &media.to_string_lossy(), 3);
+        // Miss before anything is written.
+        assert!(read_thumb_cache(&cache_file, &media.to_string_lossy()).is_none());
+        // Write, then hit.
+        write_thumb_cache(&cache_file, b"png-bytes").unwrap();
+        assert_eq!(
+            read_thumb_cache(&cache_file, &media.to_string_lossy()),
+            Some(b"png-bytes".to_vec())
+        );
+        // The media file becoming newer invalidates the cache.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&media, b"y").unwrap();
+        assert!(read_thumb_cache(&cache_file, &media.to_string_lossy()).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

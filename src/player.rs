@@ -126,7 +126,7 @@ pub struct Player {
     renderer: Option<Arc<Mutex<Renderer>>>,
     engine: Option<Engine>,
     startup_error: Option<String>,
-    ipc_rx: Receiver<Vec<String>>,
+    ipc_rx: Receiver<crate::IpcMessage>,
     /// Request/result channels for the off-thread folder expansion worker.
     expander: Option<Sender<(u64, Vec<String>, bool)>>,
     expanded_rx: Receiver<(u64, Vec<String>, bool)>,
@@ -209,6 +209,8 @@ pub struct Player {
     now_playing_rx: Option<std::sync::mpsc::Receiver<crate::nowplaying::NowPlayingCommand>>,
     now_playing_tx: Option<std::sync::mpsc::Sender<crate::nowplaying::NowPlayingCommand>>,
     now_playing_last: f64,
+    /// Set once the Now Playing card has been wiped for the idle screen.
+    now_playing_cleared: bool,
     // -- update checker ----------------------------------------------------
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     update_available: Option<String>,
@@ -259,7 +261,7 @@ impl Player {
     pub fn new(
         ctx: Context,
         args: Vec<String>,
-        ipc_rx: Receiver<Vec<String>>,
+        ipc_rx: Receiver<crate::IpcMessage>,
         settings: Settings,
         verbose: bool,
         fullscreen: bool,
@@ -281,7 +283,9 @@ impl Player {
             std::thread::Builder::new()
                 .name("update-check".into())
                 .spawn(move || {
-                    if let Some(tag) = crate::update::check_for_update() {
+                    if let crate::update::UpdateStatus::Available(tag) =
+                        crate::update::check_for_update()
+                    {
                         let _ = update_tx.send(tag);
                     }
                 })
@@ -323,6 +327,7 @@ impl Player {
             now_playing_rx: Some(now_playing_rx),
             now_playing_tx: Some(now_playing_tx),
             now_playing_last: 0.0,
+            now_playing_cleared: false,
             update_rx: Some(update_rx),
             update_available: None,
             services: Box::new(PlatformServices),
@@ -767,7 +772,11 @@ impl Player {
                 {
                     self.playlist.set_duration(&path, d);
                     if !is_url(&path) {
-                        self.thumbs.queue(&path, d);
+                        // The worker decodes ten frames per file — skip it
+                        // entirely when no consumer is enabled.
+                        if self.settings.hover_thumbnails || self.settings.continue_watching {
+                            self.thumbs.queue(&path, d);
+                        }
                     }
                 }
             }
@@ -910,7 +919,9 @@ impl Player {
                     };
                     self.set_visualizer(mode);
                 }
-                if self.thumbs.available() {
+                if (self.settings.hover_thumbnails || self.settings.continue_watching)
+                    && self.thumbs.available()
+                {
                     let path = self.current_path.clone();
                     let duration = self.duration();
                     if let Some(path) = path.filter(|p| !is_url(p)) {
@@ -2438,6 +2449,40 @@ impl Player {
     }
 
     /// Re-apply the appearance globals (theme, accent, language) after preferences change.
+    /// Apply one remotely patched setting immediately where it can take
+    /// effect live; everything else is simply persisted (GUI is the writer).
+    fn apply_runtime_setting(&mut self, ctx: &Context, key: &str, value: &serde_json::Value) {
+        match key {
+            "volume" => {
+                if let Some(volume) = value.as_i64() {
+                    self.set_volume(volume);
+                }
+            }
+            "mute" => {
+                if let Some(muted) = value.as_bool() {
+                    self.set_prop("mute", muted);
+                }
+            }
+            "theme" | "accent" | "accent_custom" | "language" => {
+                self.apply_appearance(ctx);
+            }
+            "now_playing" => {
+                if self.settings.now_playing && self.now_playing.is_none() {
+                    if let Some(tx) = self.now_playing_tx.clone() {
+                        self.now_playing = crate::nowplaying::NowPlaying::new(tx);
+                    }
+                } else if !self.settings.now_playing
+                    && let Some(now_playing) = self.now_playing.take()
+                {
+                    now_playing.clear();
+                }
+            }
+            // hover_thumbnails / row_previews / cover_art / continue_watching
+            // are read live each frame; window geometry keys apply on restart.
+            _ => {}
+        }
+    }
+
     /// Push the configured accent (preset or custom hex) into the skin.
     fn apply_accent(&self) {
         Player::apply_accent_for(&self.settings);
@@ -3585,9 +3630,48 @@ impl Player {
 
         self.handle_escape(ctx);
 
-        while let Ok(paths) = self.ipc_rx.try_recv() {
-            if !paths.is_empty() {
-                self.pending.open_paths(paths, false);
+        while let Ok(message) = self.ipc_rx.try_recv() {
+            match message {
+                crate::IpcMessage::Open(paths) => {
+                    if !paths.is_empty() {
+                        self.pending.open_paths(paths, false);
+                    }
+                }
+                crate::IpcMessage::SetSetting { key, value } => {
+                    let map = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+                    match self.settings.apply_patch(map) {
+                        crate::settings::PatchResult::Rejected => {
+                            self.osd_error(format!("could not apply {key}"), 2500);
+                        }
+                        verdict => {
+                            self.apply_runtime_setting(ctx, &key, &value);
+                            self.save_settings();
+                            if verdict == crate::settings::PatchResult::Applied {
+                                self.osd(format!("{key} updated"));
+                            }
+                        }
+                    }
+                }
+                crate::IpcMessage::ResetSettings => {
+                    self.settings = crate::settings::Settings::default();
+                    self.apply_appearance(ctx);
+                    self.apply_settings(true);
+                    self.playlist.clear();
+                    self.sync_playlist_settings();
+                    self.save_settings();
+                    self.osd("Settings reset to defaults");
+                }
+                crate::IpcMessage::Clear(collection) => match collection.as_str() {
+                    "history" => self.settings.clear_history(),
+                    "recent" => self.settings.recent.clear(),
+                    "positions" => self.settings.positions.clear(),
+                    "bookmarks" => self.settings.bookmarks.clear(),
+                    "playlist" => {
+                        self.playlist.clear();
+                        self.sync_playlist_settings();
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -3647,9 +3731,14 @@ impl Player {
                     elapsed: self.position(),
                     playing: self.is_playing(),
                 });
-            } else {
+            } else if !self.now_playing_cleared {
                 now_playing.clear();
+                self.now_playing_cleared = true;
             }
+        }
+        if self.has_file() {
+            // The card was wiped while idle; re-arm for the next file.
+            self.now_playing_cleared = false;
         }
         // Still waiting on the expander? Announce it once, after a beat.
         if let Some((generation, started, shown)) = self.expander_pending
@@ -3681,6 +3770,19 @@ impl Player {
         }
         self.sleep_timer_tick();
         self.thumbs.drain();
+        // Theme "auto": egui resolves the system appearance; the hand-drawn
+        // chrome reads the skin's atomic, so reconcile it every frame or the
+        // two palettes drift apart.
+        if self.settings.theme == "auto" {
+            let resolved = match ctx.theme() {
+                egui::Theme::Light => crate::skin::Theme::Light,
+                _ => crate::skin::Theme::Dark,
+            };
+            if skin::current_theme() != resolved {
+                skin::set_theme(resolved);
+                ctx.request_repaint();
+            }
+        }
         let new_viewport_h = ctx.content_rect().height().max(1.0);
         if (self.viewport_h - new_viewport_h).abs() > 0.5 {
             self.viewport_h = new_viewport_h;
@@ -4602,10 +4704,13 @@ impl Player {
                 colors.text_dim,
             );
 
-            // Update-available pill (fed by the startup checker).
+            // Update-available pill (fed by the startup checker); pinned to
+            // the top-right corner so it never collides with the card row.
             if let Some(tag) = &self.update_available {
-                let pill =
-                    Rect::from_center_size(pos2(center.x, center.y + 78.0), vec2(300.0, 26.0));
+                let pill = Rect::from_min_size(
+                    pos2(rect.right() - 260.0, rect.top() + 14.0),
+                    vec2(244.0, 26.0),
+                );
                 let pill_resp = ui
                     .interact(pill, Id::new("update-pill"), Sense::click())
                     .on_hover_text(i18n::tr("Download"));
@@ -4654,6 +4759,9 @@ impl Player {
                     .take(6)
                     .collect();
                 if !entries.is_empty() {
+                    // Never let the row overflow narrow windows.
+                    let max_cards = (((rect.width() - 40.0) / 160.0).floor() as usize).max(1);
+                    let entries: Vec<_> = entries.into_iter().take(max_cards).collect();
                     let card_w = 148.0f32;
                     let card_h = 96.0f32;
                     let gap = 12.0f32;

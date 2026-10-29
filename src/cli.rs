@@ -72,6 +72,50 @@ fn load() -> Settings {
     Settings::load()
 }
 
+/// Outcome of a mutating command: applied here, or delegated to the GUI.
+enum Mutation {
+    Applied,
+    Delegated,
+}
+
+/// Apply one mutation: delegate to the running GUI over IPC (it is the single
+/// settings writer while it runs), otherwise mutate the file directly.
+fn mutate(message: crate::IpcMessage, local: impl FnOnce() -> Result<(), String>) -> Mutation {
+    match crate::send_ipc_message(&message) {
+        crate::Handoff::Acked => Mutation::Delegated,
+        crate::Handoff::NoInstance => match local() {
+            Ok(()) => Mutation::Applied,
+            Err(error) => {
+                eprintln!("save failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        crate::Handoff::NotAcked => {
+            eprintln!("warning: the running instance is not acknowledging; applying locally");
+            match local() {
+                Ok(()) => Mutation::Applied,
+                Err(error) => {
+                    eprintln!("save failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+fn report(mutation: Mutation, what: &str) -> i32 {
+    match mutation {
+        Mutation::Applied => {
+            println!("{what}");
+            0
+        }
+        Mutation::Delegated => {
+            println!("{what} (applied via the running instance)");
+            0
+        }
+    }
+}
+
 fn save(settings: &Settings) -> Result<(), String> {
     settings.try_save()
 }
@@ -140,43 +184,66 @@ fn cmd_settings(args: &[String]) -> i32 {
             }
         }
         Some("set") => {
-            let (Some(key), Some(raw)) = (args.get(1), args.get(2)) else {
+            // Multi-word values are joined; JSON parsing first (quoted
+            // strings, booleans, numbers), plain text as a string fallback.
+            let raw = args[2..].join(" ");
+            if raw.is_empty() {
                 eprintln!("usage: settings set <key> <value>");
                 return 1;
-            };
-            // Values parse as JSON first (booleans, numbers, strings with
-            // quotes); a bare word is treated as a string.
-            let value = serde_json::from_str::<serde_json::Value>(raw)
-                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
-            let mut settings = load();
-            let map = serde_json::Map::from_iter([(key.clone(), value)]);
-            if !settings.apply_patch(map) {
-                eprintln!("could not apply {key} (unknown key or bad value)");
-                return 1;
             }
-            match save(&settings) {
-                Ok(()) => {
-                    println!("{key} saved");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
+            let key = args[1].clone();
+            let mut value = serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+            // Type-align with the current setting: bare numbers for string
+            // keys become strings, integer-valued floats become integers.
+            let current = load();
+            let current_value = serde_json::to_value(&current)
+                .ok()
+                .and_then(|v| v.get(&key).cloned());
+            if matches!(current_value, Some(serde_json::Value::String(_)))
+                && !matches!(value, serde_json::Value::String(_))
+            {
+                value = serde_json::Value::String(raw.clone());
+            }
+            if let serde_json::Value::Number(number) = &value
+                && let Some(as_f64) = number.as_f64()
+                && as_f64.fract() == 0.0
+                && as_f64.abs() < 9.0e15
+                && let Some(as_int) = serde_json::Number::from_i128(as_f64 as i128)
+            {
+                value = serde_json::Value::Number(as_int);
+            }
+
+            // Validate against the real settings first, so an invalid patch
+            // never reaches the running GUI.
+            let mut settings = load();
+            let map = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+            match settings.apply_patch(map) {
+                crate::settings::PatchResult::Rejected => {
+                    eprintln!("could not apply {key} (unknown key or bad value)");
                     1
+                }
+                verdict => {
+                    let mutation = mutate(
+                        crate::IpcMessage::SetSetting {
+                            key: key.clone(),
+                            value: value.clone(),
+                        },
+                        || save(&settings),
+                    );
+                    let suffix = match verdict {
+                        crate::settings::PatchResult::Applied => String::new(),
+                        _ => " (unchanged)".to_string(),
+                    };
+                    report(mutation, &format!("{key} = {}{suffix}", value))
                 }
             }
         }
         Some("reset") => {
-            let settings = Settings::default();
-            match save(&settings) {
-                Ok(()) => {
-                    println!("settings reset to defaults");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::ResetSettings, || {
+                save(&Settings::default())
+            });
+            report(mutation, "settings reset to defaults")
         }
         _ => {
             eprintln!("usage: settings list | get <key> | set <key> <value> | reset");
@@ -189,18 +256,12 @@ fn cmd_history(args: &[String]) -> i32 {
     let settings = load();
     match args.first().map(String::as_str) {
         Some("clear") => {
-            let mut settings = settings;
-            settings.clear_history();
-            match save(&settings) {
-                Ok(()) => {
-                    println!("history cleared");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::Clear("history".into()), || {
+                let mut settings = settings;
+                settings.clear_history();
+                save(&settings)
+            });
+            report(mutation, "history cleared")
         }
         _ => {
             let limit = args
@@ -226,18 +287,12 @@ fn cmd_recent(args: &[String]) -> i32 {
     let settings = load();
     match args.first().map(String::as_str) {
         Some("clear") => {
-            let mut settings = settings;
-            settings.recent.clear();
-            match save(&settings) {
-                Ok(()) => {
-                    println!("recent cleared");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::Clear("recent".into()), || {
+                let mut settings = settings;
+                settings.recent.clear();
+                save(&settings)
+            });
+            report(mutation, "recent cleared")
         }
         _ => {
             for path in &settings.recent {
@@ -256,35 +311,22 @@ fn cmd_playlist(args: &[String]) -> i32 {
                 eprintln!("usage: playlist add <path>...");
                 return 1;
             }
-            let mut settings = load();
-            for path in crate::util::expand_paths(paths) {
-                settings.playlist_paths.push(path);
-            }
-            match save(&settings) {
-                Ok(()) => {
-                    println!("playlist now holds {} items", settings.playlist_paths.len());
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let expanded = crate::util::expand_paths(paths);
+            let mutation = mutate(crate::IpcMessage::Open(expanded.clone()), || {
+                let mut settings = load();
+                settings.playlist_paths.extend(expanded.clone());
+                save(&settings)
+            });
+            report(mutation, "playlist items added")
         }
         Some("clear") => {
-            let mut settings = load();
-            settings.playlist_paths.clear();
-            settings.playlist_current = None;
-            match save(&settings) {
-                Ok(()) => {
-                    println!("playlist cleared");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::Clear("playlist".into()), || {
+                let mut settings = load();
+                settings.playlist_paths.clear();
+                settings.playlist_current = None;
+                save(&settings)
+            });
+            report(mutation, "playlist cleared")
         }
         _ => {
             let settings = load();
@@ -305,18 +347,12 @@ fn cmd_positions(args: &[String]) -> i32 {
     let settings = load();
     match args.first().map(String::as_str) {
         Some("clear") => {
-            let mut settings = settings;
-            settings.positions.clear();
-            match save(&settings) {
-                Ok(()) => {
-                    println!("positions cleared");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::Clear("positions".into()), || {
+                let mut settings = settings;
+                settings.positions.clear();
+                save(&settings)
+            });
+            report(mutation, "positions cleared")
         }
         _ => {
             let limit = args
@@ -335,18 +371,12 @@ fn cmd_bookmarks(args: &[String]) -> i32 {
     let settings = load();
     match args.first().map(String::as_str) {
         Some("clear") => {
-            let mut settings = settings;
-            settings.bookmarks.clear();
-            match save(&settings) {
-                Ok(()) => {
-                    println!("bookmarks cleared");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("save failed: {error}");
-                    1
-                }
-            }
+            let mutation = mutate(crate::IpcMessage::Clear("bookmarks".into()), || {
+                let mut settings = settings;
+                settings.bookmarks.clear();
+                save(&settings)
+            });
+            report(mutation, "bookmarks cleared")
         }
         _ => {
             let limit = args
@@ -389,25 +419,39 @@ fn cmd_open(args: &[String]) -> i32 {
         eprintln!("usage: open <path>...");
         return 1;
     }
-    if crate::send_to_running(args) {
-        println!("handed {} item(s) to the running instance", args.len());
-        0
-    } else {
-        eprintln!("no running instance accepted the handoff");
-        1
+    // Normalize exactly like the GUI launch path, so relative paths and `~/`
+    // resolve against THIS directory, not the receiver's.
+    let paths: Vec<String> = args.iter().map(|p| crate::normalize_cli_path(p)).collect();
+    match crate::send_ipc_message(&crate::IpcMessage::Open(paths.clone())) {
+        crate::Handoff::Acked => {
+            println!("handed {} item(s) to the running instance", paths.len());
+            0
+        }
+        crate::Handoff::NoInstance => {
+            eprintln!("no running instance — start MacPlayer first");
+            1
+        }
+        crate::Handoff::NotAcked => {
+            eprintln!("the running instance did not accept the handoff");
+            1
+        }
     }
 }
 
 fn cmd_update_check() -> i32 {
     match crate::update::check_for_update() {
-        Some(tag) => {
+        crate::update::UpdateStatus::Available(tag) => {
             println!("update available: {tag}");
             println!("{}", crate::update::releases_page());
             0
         }
-        None => {
-            println!("up to date (or offline)");
+        crate::update::UpdateStatus::UpToDate => {
+            println!("up to date");
             0
+        }
+        crate::update::UpdateStatus::Unknown => {
+            println!("could not reach the update server (offline?)");
+            1
         }
     }
 }
@@ -438,7 +482,8 @@ fn cmd_selftest() -> i32 {
     let patched = settings.apply_patch(serde_json::Map::from_iter([(
         "volume".to_string(),
         serde_json::json!(37),
-    )])) && settings.volume == 37;
+    )])) != crate::settings::PatchResult::Rejected
+        && settings.volume == 37;
     check("settings patch apply", patched);
 
     // Folder expansion on a real temp tree.

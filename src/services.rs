@@ -133,25 +133,26 @@ impl Services for PlatformServices {
         {
             // `open -R` reveals the item in Finder; a bare `open` would launch the
             // file with its default application instead.
+            // status() waits and reaps — spawn() would leak a zombie per call.
             let _ = std::process::Command::new("open")
                 .arg("-R")
                 .arg(path)
-                .spawn();
+                .status();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+            let _ = std::process::Command::new("xdg-open").arg(path).status();
         }
     }
 
     fn open_url(&self, url: &str) {
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("open").arg(url).spawn();
+            let _ = std::process::Command::new("open").arg(url).status();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            let _ = std::process::Command::new("xdg-open").arg(url).status();
         }
     }
 }

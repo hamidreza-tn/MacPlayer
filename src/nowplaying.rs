@@ -45,10 +45,6 @@ mod stub {
         pub fn update(&self, _info: &NowPlayingInfo) {}
         pub fn clear(&self) {}
     }
-
-    pub fn channel() -> (Sender<NowPlayingCommand>, Receiver<NowPlayingCommand>) {
-        channel()
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -177,8 +173,7 @@ mod macos {
     use std::ptr::NonNull;
 }
 
-/// Re-export so the player can name the channel types without cfg noise.
-#[cfg(target_os = "macos")]
+/// Command channel for the integration (both platform variants).
 pub fn channel() -> (
     std::sync::mpsc::Sender<NowPlayingCommand>,
     std::sync::mpsc::Receiver<NowPlayingCommand>,

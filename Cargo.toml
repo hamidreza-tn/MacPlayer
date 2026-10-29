@@ -1,6 +1,6 @@
 [package]
 name = "macplayer"
-version = "1.10.0"
+version = "1.10.1"
 edition = "2024"
 license = "MIT"
 description = "A fast, native media player for macOS built with Rust, egui and libmpv"
@@ -9,7 +9,7 @@ repository = "https://github.com/hamidreza-tn/MacPlayer"
 [dependencies]
 arboard = "3.6.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links", "accesskit"] }
 egui = "0.36.2"
 egui_glow = "0.36.2"
 glow = "0.17.0"

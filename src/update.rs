@@ -34,22 +34,20 @@ pub fn fetch_latest_tag() -> Option<String> {
     extract_tag(&text)
 }
 
-/// Pull `"tag_name":"v1.9.4"` out of the release JSON (field order agnostic).
+/// Pull the `tag_name` field out of the release JSON via a real parser, so
+/// the key can never be confused with a lookalike inside another string.
 fn extract_tag(json: &str) -> Option<String> {
-    let key = "\"tag_name\"";
-    let start = json.find(key)? + key.len();
-    let rest = &json[start..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    let quote = after.strip_prefix('"')?;
-    let end = quote.find('"')?;
-    let tag = &quote[..end];
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tag = value.get("tag_name")?.as_str()?;
     (!tag.is_empty()).then(|| tag.to_string())
 }
 
-/// Parse "v1.9.4" / "1.9.4" into a comparable triple.
+/// Parse "v1.9.4" / "1.9.4" / "v2.0.0-rc1" into a comparable triple
+/// (pre-release and build suffixes are stripped, so an RC of a newer
+/// release still counts as newer).
 pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     let digits = tag.trim().trim_start_matches(['v', 'V']);
+    let digits = digits.split(['-', '+']).next()?;
     let mut parts = digits.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -68,11 +66,25 @@ pub fn is_newer(latest: &str) -> bool {
     latest > current
 }
 
-/// One-shot check: `Some(tag)` when an update is available, `None` otherwise
-/// (offline, timeout, same version). Bounded by curl's own timeout.
-pub fn check_for_update() -> Option<String> {
-    let tag = fetch_latest_tag()?;
-    is_newer(&tag).then_some(tag)
+/// Outcome of an update check: `fetch_latest_tag` failing (offline, no curl,
+/// timeout) is reported distinctly from "no update".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// A newer release tag is published.
+    Available(String),
+    /// The latest tag is not newer than the running version.
+    UpToDate,
+    /// The check could not run (offline, no curl, timeout).
+    Unknown,
+}
+
+/// One-shot check, bounded by curl's own timeout.
+pub fn check_for_update() -> UpdateStatus {
+    match fetch_latest_tag() {
+        None => UpdateStatus::Unknown,
+        Some(tag) if is_newer(&tag) => UpdateStatus::Available(tag),
+        Some(_) => UpdateStatus::UpToDate,
+    }
 }
 
 #[cfg(test)]

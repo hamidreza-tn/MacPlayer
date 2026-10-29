@@ -16,6 +16,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
 pub const MAX_BOOKMARKS: usize = 100;
+
+/// Result of [`Settings::apply_patch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchResult {
+    /// The value changed (after normalization).
+    Applied,
+    /// The requested value matches what is already stored.
+    Unchanged,
+    /// Unknown key or a value type the key cannot hold.
+    Rejected,
+}
 pub const MAX_BOOKMARK_PATH_LEN: usize = 4096;
 pub const MAX_BOOKMARK_TITLE_LEN: usize = 512;
 pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
@@ -424,24 +435,34 @@ impl Settings {
         serde_json::from_value::<Settings>(current).ok()
     }
 
-    /// Apply a JSON object patch (the CLI `settings set` path). Returns false
-    /// when the key is unknown or the value type is wrong; the merge pipeline
-    /// (per-key reconciliation + normalize) keeps everything else valid.
-    pub fn apply_patch(&mut self, map: serde_json::Map<String, Json>) -> bool {
+    /// Apply a JSON object patch (the CLI `settings set` path).
+    ///
+    /// The merge pipeline canonicalizes values (lowercasing colors, trimming
+    /// codepage signs, …), so the result is compared against the previous
+    /// state instead of the raw request: `Applied` when the value changed,
+    /// `Unchanged` when it settled back to the same value, and `Rejected`
+    /// only when the merge dropped the key (unknown key / wrong value type).
+    pub fn apply_patch(&mut self, map: serde_json::Map<String, Json>) -> PatchResult {
         let Some((key, requested)) = map.into_iter().next() else {
-            return false;
+            return PatchResult::Rejected;
         };
         let single = serde_json::Map::from_iter([(key.clone(), requested.clone())]);
+        let before = serde_json::to_value(&*self)
+            .ok()
+            .and_then(|value| value.get(&key).cloned());
         let mut probe = self.clone();
         probe.merge(single);
-        let applied = serde_json::to_value(&probe)
+        let after = serde_json::to_value(&probe)
             .ok()
-            .and_then(|value| value.get(&key).cloned())
-            .is_some_and(|after| after == requested);
-        if applied {
-            *self = probe;
+            .and_then(|value| value.get(&key).cloned());
+        match (before, after) {
+            (Some(before), Some(after)) if after != before => {
+                *self = probe;
+                PatchResult::Applied
+            }
+            (Some(_), Some(after)) if after == requested => PatchResult::Unchanged,
+            _ => PatchResult::Rejected,
         }
-        applied
     }
 
     pub fn try_save(&self) -> Result<(), String> {
