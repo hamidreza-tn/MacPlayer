@@ -19,13 +19,24 @@ window. Hardware decoded, fully themeable, English and Persian.
 
 ---
 
+## Screenshots
+
+<p>
+  <img width="49%" alt="Welcome screen" src="docs/screenshots/welcome.png">
+  <img width="49%" alt="Playlist drawer" src="docs/screenshots/playlist.png">
+  <img width="49%" alt="Quick settings" src="docs/screenshots/settings-popover.png">
+  <img width="49%" alt="Preferences" src="docs/screenshots/preferences.png">
+</p>
+
 ## Table of contents
 
+- [Screenshots](#screenshots)
 - [Why MacPlayer](#why-macplayer)
 - [Features](#features)
 - [Download](#download)
 - [Build from source](#build-from-source)
 - [Command line](#command-line)
+- [Headless CLI](#headless-cli)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Settings, history and diagnostics](#settings-history-and-diagnostics)
 - [Project structure](#project-structure)
@@ -47,7 +58,7 @@ beyond libmpv.
 - **Quiet by default** — floating chrome fades out while you watch; the cursor hides with it.
 - **Keyboard-first** — a macOS-convention keymap plus a `⌘K` command palette over the entire menu tree.
 - **Bilingual** — complete English and Persian (RTL-shaped) UI, switchable live.
-- **Honest engineering** — atomic settings saves, a size-capped rotating diagnostic log, crash reporting, and 69 unit tests that need no display or audio device.
+- **Honest engineering** — atomic settings saves, a size-capped rotating diagnostic log, crash reporting, and 86 unit tests that need no display or audio device.
 
 ## Features
 
@@ -75,15 +86,19 @@ beyond libmpv.
 - Live playback progress on the playing row, total duration in the header, filter-as-you-type
 - Background duration probing, seekbar hover thumbnails and video previews on
   every playlist row (via ffmpeg, when present)
+- **Continue watching** cards on the welcome screen with one-click resume
 - Watch history, recent files, export to `.m3u8`
 
 **Interface**
 
-- Light & dark themes with five accent colors — applied live
+- Light & dark themes with five accent colors — applied live; **match-system (auto)** theme and a custom accent picker
+- **Accessible** — the interface is exposed to assistive technology via AccessKit
+- Every optional behavior has an on/off switch in `Preferences → General → Features` (continue watching, cover art, hover thumbnails, row previews, Now Playing, update check)
 - `⌘K` command palette with shortcut hints, sharing one command source with the menus
 - Fullscreen, windowed and mini-player layouts; trackpad gestures (pinch → fullscreen, `⌘`/`Ctrl`-scroll → zoom, two-finger horizontal scroll → seek)
 - Single-instance file forwarding, drag-and-drop (files, folders, subtitles), clipboard opening
-- Media keys `F7`/`F8`/`F9` and hardware media-key support
+- Media keys `F7`/`F8`/`F9`, hardware media-key support, and **Now Playing in Control Center** (title, elapsed time, remote commands)
+- **Update checker** against GitHub Releases with a badge on the welcome screen, and one-click issue reporting with bundled diagnostics
 
 ## Download
 
@@ -145,6 +160,27 @@ Options:
 
 Opening another copy normally **forwards its files to the running instance**
 over a Unix socket; use `--new` when a separate window is genuinely needed.
+
+### Headless CLI
+
+`macplayer --cli <command>` never opens a window — it drives the player's
+data and logic for scripting, automation and CI. Exit codes are 0/1.
+
+```text
+macplayer --cli info                     # paths, versions, appearance
+macplayer --cli settings list|get|set|reset
+macplayer --cli history [N] | history clear
+macplayer --cli playlist list|add|clear
+macplayer --cli positions [N] | positions clear
+macplayer --cli bookmarks [N] | bookmarks clear
+macplayer --cli logs [N]                 # tail the diagnostic log
+macplayer --cli open <path>...           # hand files to the running instance
+macplayer --cli update-check             # query GitHub Releases
+macplayer --cli selftest                 # internal sanity checks
+```
+
+Mutating commands apply through the running instance when one exists (the GUI
+is the single settings writer), and write the settings file directly otherwise.
 
 ## Keyboard shortcuts
 
@@ -267,6 +303,9 @@ src/                         Rust application
 ├── thumbs.rs                ffmpeg-backed seekbar + playlist row previews
 ├── services.rs              Platform shell (file dialogs, clipboard, reveal)
 ├── i18n.rs                  English/Persian string table
+├── cli.rs                   Headless command-line interface
+├── update.rs                GitHub Releases update checker
+├── nowplaying.rs            macOS Control Center integration
 ├── logging.rs               Rotating diagnostic log
 └── util.rs, value.rs, ffi.rs
 
