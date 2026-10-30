@@ -69,6 +69,9 @@ pub struct Thumbnails {
     cover_order: Vec<String>,
     /// Paths whose extraction was attempted (success or not).
     covers_tried: HashSet<String>,
+    /// Failed attempts with their timestamp; retried after a cool-down so a
+    /// transient hiccup is not permanent for the session.
+    covers_failed: HashMap<String, Instant>,
     cover_textures: HashMap<String, TextureHandle>,
 }
 
@@ -85,6 +88,7 @@ impl Thumbnails {
                 .name("thumbs".into())
                 .spawn(move || {
                     let cache_dir = crate::settings::config_dir().join("Caches").join("thumbs");
+                    prune_thumb_cache(&cache_dir, THUMB_CACHE_MAX_BYTES);
                     worker_loop(
                         ffmpeg,
                         job_rx,
@@ -136,6 +140,7 @@ impl Thumbnails {
             cover_stop,
             covers: HashMap::new(),
             cover_order: Vec::new(),
+            covers_failed: HashMap::new(),
             covers_tried: HashSet::new(),
             cover_textures: HashMap::new(),
         }
@@ -201,16 +206,24 @@ impl Thumbnails {
         }
         while let Ok((path, art)) = self.cover_results.try_recv() {
             self.covers_tried.insert(path.clone());
-            if let Some(png) = art.filter(|png| !png.is_empty()) {
-                self.cover_order.retain(|p| p != &path);
-                self.cover_order.push(path.clone());
-                while self.cover_order.len() > COVER_CACHE_FILES {
-                    let evict = self.cover_order.remove(0);
-                    self.covers.remove(&evict);
-                    self.cover_textures.remove(&evict);
-                    self.covers_tried.remove(&evict);
+            match art.filter(|png| !png.is_empty()) {
+                Some(png) => {
+                    self.covers_failed.remove(&path);
+                    self.cover_order.retain(|p| p != &path);
+                    self.cover_order.push(path.clone());
+                    while self.cover_order.len() > COVER_CACHE_FILES {
+                        let evict = self.cover_order.remove(0);
+                        self.covers.remove(&evict);
+                        self.cover_textures.remove(&evict);
+                        self.covers_tried.remove(&evict);
+                    }
+                    self.covers.insert(path, png);
                 }
-                self.covers.insert(path, png);
+                None => {
+                    // No attached art (or a transient failure): allow a
+                    // retry after a cool-down instead of a permanent skip.
+                    self.covers_failed.insert(path, Instant::now());
+                }
             }
         }
     }
@@ -281,6 +294,14 @@ impl Thumbnails {
     /// once; returns `Some` as soon as the decoded art is uploaded. Returns
     /// the handle plus a freshness flag (first upload this call).
     pub fn cover(&mut self, ctx: &Context, path: &str) -> Option<(&TextureHandle, bool)> {
+        // A previously failed extraction becomes retryable after the
+        // cool-down (the media may have changed on disk, or ffmpeg hiccuped).
+        if let Some(failed_at) = self.covers_failed.get(path)
+            && failed_at.elapsed() >= Duration::from_secs(60)
+        {
+            self.covers_failed.remove(path);
+            self.covers_tried.remove(path);
+        }
         if self.covers_tried.contains(path) {
             if !self.covers.contains_key(path) {
                 return None;
@@ -413,6 +434,39 @@ fn preview_frames(
             decode_frame(ffmpeg, path, at, stop)
         })
         .collect()
+}
+
+/// Cache budget: when the directory exceeds this, oldest-modified PNGs are
+/// removed first (a full library of 4K previews stays well under it).
+const THUMB_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Keep the thumbnail disk cache within its budget (oldest files first).
+fn prune_thumb_cache(dir: &std::path::Path, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), entry.path()))
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let mut remaining = total;
+    for (_, size, path) in files {
+        if remaining <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            remaining -= size;
+        }
+    }
 }
 
 /// Stable, collision-resistant cache file name: FNV-1a of the path plus the

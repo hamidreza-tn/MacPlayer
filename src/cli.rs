@@ -110,6 +110,10 @@ fn report(mutation: Mutation, what: &str) -> i32 {
             0
         }
         Mutation::Delegated => {
+            // The ack confirms the message was queued, not applied: give the
+            // GUI one frame plus its background save a moment to land, so a
+            // follow-up read (`playlist list`, `settings get`) is fresh.
+            std::thread::sleep(std::time::Duration::from_millis(400));
             println!("{what} (applied via the running instance)");
             0
         }
@@ -165,6 +169,11 @@ fn cmd_settings(args: &[String]) -> i32 {
                 eprintln!("usage: settings get <key>");
                 return 1;
             };
+            // When the GUI is running it owns the settings: ask it to flush
+            // once so this read is not up to an autosave interval stale.
+            if crate::send_ipc_message(&crate::IpcMessage::SaveNow) == crate::Handoff::Acked {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
             let settings = load();
             match serde_json::to_value(&settings) {
                 Ok(value) => match value.get(key) {
@@ -312,12 +321,15 @@ fn cmd_playlist(args: &[String]) -> i32 {
                 return 1;
             }
             let expanded = crate::util::expand_paths(paths);
-            let mutation = mutate(crate::IpcMessage::Open(expanded.clone()), || {
+            let count = expanded.len();
+            let mutation = mutate(crate::IpcMessage::PlaylistAdd(expanded), || {
                 let mut settings = load();
-                settings.playlist_paths.extend(expanded.clone());
+                settings
+                    .playlist_paths
+                    .extend(crate::util::expand_paths(paths));
                 save(&settings)
             });
-            report(mutation, "playlist items added")
+            report(mutation, &format!("{count} playlist item(s) added"))
         }
         Some("clear") => {
             let mutation = mutate(crate::IpcMessage::Clear("playlist".into()), || {

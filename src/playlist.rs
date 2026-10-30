@@ -56,6 +56,10 @@ pub struct Item {
     pub title: String,
     pub duration: Option<f64>,
     pub status: MediaStatus,
+    /// Content-based video flag from ffprobe (`None` = not probed yet).
+    /// Extension alone lies: `.mkv` files can be audio-only while `.mp3`
+    /// files can carry an attached-picture video stream.
+    pub has_video: Option<bool>,
 }
 
 /// Which row-art features the player currently has enabled (settings-driven).
@@ -97,7 +101,7 @@ enum Job {
 /// Fills in durations with ffprobe in the background (skipped when ffprobe is missing).
 struct DurationProber {
     jobs: Option<SyncSender<Job>>,
-    results: Receiver<(u64, String, f64)>,
+    results: Receiver<(u64, String, f64, bool)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     /// Probe requests that did not fit the bounded job channel; flushed back
@@ -108,7 +112,7 @@ struct DurationProber {
 impl DurationProber {
     fn new() -> Self {
         let (job_tx, job_rx) = sync_channel::<Job>(64);
-        let (result_tx, result_rx) = sync_channel::<(u64, String, f64)>(128);
+        let (result_tx, result_rx) = sync_channel::<(u64, String, f64, bool)>(128);
         let stop = Arc::new(AtomicBool::new(false));
         match which("ffprobe") {
             Some(ffprobe) => {
@@ -122,13 +126,15 @@ impl DurationProber {
                             }
                             match job {
                                 Job::Probe { generation, path } => {
-                                    if let Some(duration) = probe(&ffprobe, &path, &worker_stop) {
+                                    if let Some(probed) = probe(&ffprobe, &path, &worker_stop) {
+                                        let (duration, has_video) =
+                                            (probed.duration, probed.has_video);
                                         // try_send: with the drawer closed nothing
                                         // drains the bounded channel, and a blocking
                                         // send here would deadlock `Drop` on quit.
                                         // A dropped duration only leaves that row's
                                         // readout as "unavailable".
-                                        let result = (generation, path, duration);
+                                        let result = (generation, path, duration, has_video);
                                         match result_tx.try_send(result) {
                                             Ok(()) => {}
                                             // Full: drawer closed, nothing drains —
@@ -182,7 +188,7 @@ impl DurationProber {
     }
 
     fn drain(&self, generation: u64, items: &mut [Item]) {
-        while let Ok((result_generation, path, duration)) = self.results.try_recv() {
+        while let Ok((result_generation, path, duration, has_video)) = self.results.try_recv() {
             if result_generation != generation {
                 continue;
             }
@@ -190,8 +196,11 @@ impl DurationProber {
                 continue;
             }
             for item in items.iter_mut() {
-                if item.path == path && item.duration.is_none() {
-                    item.duration = Some(duration);
+                if item.path == path {
+                    if item.duration.is_none() {
+                        item.duration = Some(duration);
+                    }
+                    item.has_video = Some(has_video);
                 }
             }
         }
@@ -244,15 +253,23 @@ fn which(program: &str) -> Option<String> {
     crate::util::which(program)
 }
 
-fn probe(ffprobe: &str, path: &str, stop: &AtomicBool) -> Option<f64> {
+/// Probe outcome: duration plus whether any video stream exists (content
+/// truth — file extensions lie about this).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ProbeResult {
+    pub duration: f64,
+    pub has_video: bool,
+}
+
+fn probe(ffprobe: &str, path: &str, stop: &AtomicBool) -> Option<ProbeResult> {
     let mut child = Command::new(ffprobe)
         .args([
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "format=duration:stream=codec_type",
             "-of",
-            "csv=p=0",
+            "json",
             path,
         ])
         .stdout(Stdio::piped())
@@ -272,12 +289,26 @@ fn probe(ffprobe: &str, path: &str, stop: &AtomicBool) -> Option<f64> {
                 if !status.success() {
                     return None;
                 }
-                let duration = String::from_utf8(output.stdout)
-                    .ok()?
-                    .trim()
-                    .parse::<f64>()
-                    .ok()?;
-                return (duration.is_finite() && duration > 0.0).then_some(duration);
+                let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+                let duration = json
+                    .pointer("/format/duration")
+                    .and_then(|value| value.as_str())
+                    .and_then(|text| text.parse::<f64>().ok())?;
+                let has_video = json
+                    .pointer("/streams")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|streams| {
+                        streams.iter().any(|stream| {
+                            stream.get("codec_type").and_then(|v| v.as_str()) == Some("video")
+                        })
+                    });
+                if !duration.is_finite() || duration <= 0.0 {
+                    return None;
+                }
+                return Some(ProbeResult {
+                    duration,
+                    has_video,
+                });
             }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -479,6 +510,7 @@ impl Playlist {
             path: path.to_string(),
             title: title_of(path),
             duration: None,
+            has_video: None,
             status: if is_url(path) || Path::new(path).is_file() {
                 MediaStatus::Ready
             } else {
@@ -1649,6 +1681,7 @@ mod tests {
                     path: (*path).to_string(),
                     title: title_of(path),
                     duration: None,
+                    has_video: None,
                     status: MediaStatus::Ready,
                 })
                 .collect(),
@@ -1805,11 +1838,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn duration_probe_reads_successful_finite_output() {
-        let (dir, script) = executable_script(b"#!/bin/sh\nprintf '12.5\\n'\n");
+        let (dir, script) = executable_script(
+            b"#!/bin/sh\nprintf '{\"format\":{\"duration\":\"12.5\"},\"streams\":[{\"codec_type\":\"video\"}]}'\n",
+        );
         let stop = AtomicBool::new(false);
         assert_eq!(
             probe(&script.to_string_lossy(), "clip.mkv", &stop),
-            Some(12.5)
+            Some(ProbeResult {
+                duration: 12.5,
+                has_video: true,
+            })
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duration_probe_reports_audio_only_files() {
+        let (dir, script) = executable_script(
+            b"#!/bin/sh\nprintf '{\"format\":{\"duration\":\"9.0\"},\"streams\":[{\"codec_type\":\"audio\"}]}'\n",
+        );
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            probe(&script.to_string_lossy(), "song.mp3", &stop),
+            Some(ProbeResult {
+                duration: 9.0,
+                has_video: false,
+            })
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

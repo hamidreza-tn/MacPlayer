@@ -4,6 +4,47 @@ All notable changes to MacPlayer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.2] - 2026-10-30
+
+Third audit round: 8 defects found and fixed (2 major), plus storage,
+security and media-intelligence improvements.
+
+### Fixed
+
+- **`--cli playlist add` no longer replaces the playlist:** a dedicated
+  `PlaylistAdd` IPC message appends without touching playback. (The old
+  path reused the file-open handoff, which starts playback.)
+- **Update badge placement:** the welcome-screen badge no longer overlaps
+  the playlist/settings buttons in the top-right corner.
+- **IPC socket hardening:** the single-instance socket is chmod 0600 after
+  bind, so only the owning user can mutate settings or open files.
+- **Thumbnail disk cache pruning:** the preview cache is capped at 200 MB
+  (oldest-modified PNGs removed first) instead of growing forever.
+- **Content-based media routing:** ffprobe now reports whether a file has a
+  video stream — an `.mkv` that is audio-only gets cover art, and an `.mp3`
+  with an attached picture gets a real preview (file extensions lie).
+- **Cover-art retry:** a failed cover extraction retries after 60 s instead
+  of being skipped for the whole session.
+- **Control Center buffering:** during buffering the Now Playing card keeps
+  its Playing state with rate 0 (it previously flipped to Paused), and the
+  reported rate now follows the actual playback speed.
+- **Reset keeps feature switches:** `--cli settings reset` (and the GUI
+  path) no longer disable the user's enabled features.
+- **`--cli settings get` freshness:** with the GUI running, the CLI asks it
+  to flush settings before reading (no more up-to-10-seconds-stale reads).
+- **IPC decoder rewrite:** decodes the serde enum format natively with
+  per-variant fall-through (a malformed field no longer drops the whole
+  message) while remaining backward-compatible with the legacy payload.
+
+### Improved
+
+- `--new` instances still run the single-instance listener, so CLI
+  mutations reach the newest window instead of a phantom fallback write
+  that the GUI would revert.
+- The unit-variant IPC forms (`"SaveNow"`, `"ResetSettings"`) decode from
+  their real serde representation (bare strings) — this was a silent
+  file-forwarding regression caught by the post-fix E2E.
+
 ## [1.10.1] - 2026-10-27
 
 Second full-codebase audit: 19 defects found and fixed, plus quality and

@@ -83,22 +83,27 @@ fn main() {
     let settings = settings::Settings::load();
 
     // Single instance: if another copy is already running, hand the files over and exit.
+    // With `--new` the handoff check is skipped (a fresh window opens), but the
+    // instance server is still started so the CLI can reach THIS instance too.
     if !cli.new_instance && send_to_running(&args) {
         return;
     }
-    let (ipc_server, ipc_rx): (Option<InstanceServer>, Receiver<IpcMessage>) = if cli.new_instance {
-        let (_tx, rx) = channel();
-        (None, rx)
-    } else {
+    let (ipc_server, ipc_rx): (Option<InstanceServer>, Receiver<IpcMessage>) =
         match InstanceServer::start() {
             Ok((server, rx)) => (Some(server), rx),
+            // Another instance holds the well-known socket: this `--new` window
+            // runs without a listener (its CLI mutations then reach the primary).
+            Err(error) if cli.new_instance => {
+                let (_tx, rx) = channel();
+                logging::write(&format!("--new without instance listener: {error}"));
+                (None, rx)
+            }
             Err(error) => {
                 eprintln!("could not start the single-instance listener: {error}");
                 logging::write(&format!("single-instance listener: {error}"));
                 return;
             }
-        }
-    };
+        };
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("MacPlayer")
@@ -347,6 +352,13 @@ impl InstanceServer {
             }
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
+        // The socket carries settings mutations and playback handoff: only
+        // the owning user may connect (default bind perms are world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("set listener nonblocking: {error}"))?;
@@ -429,30 +441,73 @@ pub(crate) enum IpcMessage {
     /// Clear one stored collection: "history" | "recent" | "positions" |
     /// "bookmarks" | "playlist".
     Clear(String),
+    /// Append expanded paths to the playlist WITHOUT replacing it or starting
+    /// playback (`--cli playlist add`).
+    PlaylistAdd(Vec<String>),
     /// Restore defaults inside the running GUI (single-writer discipline).
     ResetSettings,
+    /// Ask the running GUI to flush its settings to disk (CLI `settings get`
+    /// then reads a fresh file).
+    SaveNow,
 }
 
 fn decode_ipc_payload(payload: &[u8]) -> Option<IpcMessage> {
-    let object: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    if let Some(paths) = object.get("paths").and_then(|v| v.as_array()) {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    // Current form: the externally-tagged serde serialization of IpcMessage.
+    // Every variant is tried independently and shape mismatches fall through,
+    // so a partial match never drops the whole message.
+    // Unit variants serialize as bare strings.
+    if let serde_json::Value::String(text) = &value {
+        match text.as_str() {
+            "ResetSettings" => return Some(IpcMessage::ResetSettings),
+            "SaveNow" => return Some(IpcMessage::SaveNow),
+            _ => {}
+        }
+    }
+    if let serde_json::Value::Object(map) = &value {
+        if let Some(data) = map.get("Open")
+            && let Some(paths) = decode_path_list(data)
+        {
+            return Some(IpcMessage::Open(paths));
+        }
+        if let Some(data) = map.get("PlaylistAdd")
+            && let Some(paths) = decode_path_list(data)
+        {
+            return Some(IpcMessage::PlaylistAdd(paths));
+        }
+        if let Some(data) = map.get("SetSetting")
+            && let Some(entry) = data.as_object()
+            && let Some(key) = entry.get("key").and_then(|v| v.as_str())
+            && let Some(setting_value) = entry.get("value")
+        {
+            return Some(IpcMessage::SetSetting {
+                key: key.to_string(),
+                value: setting_value.clone(),
+            });
+        }
+        if let Some(data) = map.get("Clear")
+            && let Some(what) = data.as_str()
+        {
+            return Some(IpcMessage::Clear(what.to_string()));
+        }
+    }
+    // Legacy form from older CLI versions: {"paths": [...]}.
+    if let Some(paths) = value.get("paths").and_then(|v| v.as_array()) {
         let paths: Option<Vec<String>> = paths
             .iter()
             .map(|path| path.as_str().map(str::to_owned))
             .collect();
         return paths.map(IpcMessage::Open);
     }
-    if let Some(entry) = object.get("settings").and_then(|v| v.as_object()) {
-        let (key, value) = entry.into_iter().next()?;
-        return Some(IpcMessage::SetSetting {
-            key: key.clone(),
-            value: value.clone(),
-        });
-    }
-    if let Some(command) = object.get("clear").and_then(|v| v.as_str()) {
-        return Some(IpcMessage::Clear(command.to_string()));
-    }
     None
+}
+
+/// Decode a JSON array of strings into owned paths (shared by Open/PlaylistAdd).
+fn decode_path_list(data: &serde_json::Value) -> Option<Vec<String>> {
+    data.as_array()?
+        .iter()
+        .map(|path| path.as_str().map(str::to_owned))
+        .collect()
 }
 
 #[cfg(test)]
@@ -486,12 +541,12 @@ mod tests {
     #[test]
     fn ipc_payload_decodes_settings_and_clear() {
         assert!(matches!(
-            decode_ipc_payload(br#"{"settings":{"volume":37}}"#),
+            decode_ipc_payload(br#"{"SetSetting":{"key":"volume","value":37}}"#),
             Some(crate::IpcMessage::SetSetting { key, value })
                 if key == "volume" && value == serde_json::json!(37)
         ));
         assert!(matches!(
-            decode_ipc_payload(br#"{"clear":"history"}"#),
+            decode_ipc_payload(br#"{"Clear":"history"}"#),
             Some(crate::IpcMessage::Clear(what)) if what == "history"
         ));
         assert_eq!(
@@ -499,6 +554,19 @@ mod tests {
             None,
             "unrecognized payloads fail closed"
         );
+    }
+
+    #[test]
+    fn ipc_payload_decodes_unit_variants_as_bare_strings() {
+        assert!(matches!(
+            decode_ipc_payload(br#""SaveNow""#),
+            Some(crate::IpcMessage::SaveNow)
+        ));
+        assert!(matches!(
+            decode_ipc_payload(br#""ResetSettings""#),
+            Some(crate::IpcMessage::ResetSettings)
+        ));
+        assert_eq!(decode_ipc_payload(br#"{"SaveNow":null}"#), None);
     }
 
     #[test]

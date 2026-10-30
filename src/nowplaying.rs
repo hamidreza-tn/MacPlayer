@@ -36,6 +36,7 @@ mod stub {
         pub duration: f64,
         pub elapsed: f64,
         pub playing: bool,
+        pub rate: f64,
     }
 
     impl NowPlaying {
@@ -66,6 +67,7 @@ mod macos {
         pub duration: f64,
         pub elapsed: f64,
         pub playing: bool,
+        pub rate: f64,
     }
 
     /// Owns the registered remote-command targets so they stay alive for the
@@ -128,7 +130,7 @@ mod macos {
                 let key_duration = NSString::from_str("MPMediaItemPropertyPlaybackDuration");
                 let key_elapsed = NSString::from_str("MPNowPlayingInfoPropertyElapsedPlaybackTime");
                 let title = NSString::from_str(&info.title);
-                let rate = NSNumber::numberWithDouble(if info.playing { 1.0 } else { 0.0 });
+                let rate = NSNumber::numberWithDouble(if info.playing { info.rate } else { 0.0 });
                 let duration = NSNumber::numberWithDouble(info.duration.max(0.0));
                 let elapsed = NSNumber::numberWithDouble(info.elapsed.max(0.0));
                 // Upcast every value to the root object type for the dictionary.

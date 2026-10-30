@@ -3653,7 +3653,31 @@ impl Player {
                     }
                 }
                 crate::IpcMessage::ResetSettings => {
+                    // "Reset" means data + data-driven settings: the user's
+                    // feature switches and appearance survive.
+                    let (continue_watching, cover_art, now_playing, update_check) = (
+                        self.settings.continue_watching,
+                        self.settings.cover_art,
+                        self.settings.now_playing,
+                        self.settings.update_check,
+                    );
+                    let (hover_thumbnails, row_previews, accent, accent_custom, language) = (
+                        self.settings.hover_thumbnails,
+                        self.settings.row_previews,
+                        self.settings.accent.clone(),
+                        self.settings.accent_custom.clone(),
+                        self.settings.language.clone(),
+                    );
                     self.settings = crate::settings::Settings::default();
+                    self.settings.continue_watching = continue_watching;
+                    self.settings.cover_art = cover_art;
+                    self.settings.now_playing = now_playing;
+                    self.settings.update_check = update_check;
+                    self.settings.hover_thumbnails = hover_thumbnails;
+                    self.settings.row_previews = row_previews;
+                    self.settings.accent = accent;
+                    self.settings.accent_custom = accent_custom;
+                    self.settings.language = language;
                     self.apply_appearance(ctx);
                     self.apply_settings(true);
                     self.playlist.clear();
@@ -3661,6 +3685,19 @@ impl Player {
                     self.save_settings();
                     self.osd("Settings reset to defaults");
                 }
+                crate::IpcMessage::PlaylistAdd(paths) => {
+                    let first = self.playlist.add(&paths);
+                    self.sync_playlist_settings();
+                    self.save_settings();
+                    self.update_title();
+                    let _ = first;
+                    self.osd(format!(
+                        "{} {}",
+                        paths.len(),
+                        i18n::tr("files to the playlist")
+                    ));
+                }
+                crate::IpcMessage::SaveNow => self.save_settings(),
                 crate::IpcMessage::Clear(collection) => match collection.as_str() {
                     "history" => self.settings.clear_history(),
                     "recent" => self.settings.recent.clear(),
@@ -3715,6 +3752,11 @@ impl Player {
         {
             self.now_playing_last = self.now;
             if self.has_file() {
+                let buffering = self
+                    .state
+                    .get("paused-for-cache")
+                    .map(|v| v.as_bool())
+                    .unwrap_or(false);
                 let title = self
                     .state
                     .get("media-title")
@@ -3725,11 +3767,23 @@ impl Player {
                             .map(|path| crate::util::title_of(path).to_string())
                     })
                     .unwrap_or_else(|| "MacPlayer".into());
+                // Buffering keeps the Playing card (so the controls stay
+                // live) but reports rate 0, matching what is on screen.
+                let playing = self.is_playing() || buffering;
+                let rate = if self.is_playing() {
+                    self.state
+                        .get("speed")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0)
+                } else {
+                    0.0
+                };
                 now_playing.update(&crate::nowplaying::NowPlayingInfo {
                     title,
                     duration: self.duration(),
                     elapsed: self.position(),
-                    playing: self.is_playing(),
+                    playing,
+                    rate,
                 });
             } else if !self.now_playing_cleared {
                 now_playing.clear();
@@ -4708,8 +4762,8 @@ impl Player {
             // the top-right corner so it never collides with the card row.
             if let Some(tag) = &self.update_available {
                 let pill = Rect::from_min_size(
-                    pos2(rect.right() - 260.0, rect.top() + 14.0),
-                    vec2(244.0, 26.0),
+                    pos2(rect.left() + 16.0, rect.top() + 14.0),
+                    vec2(258.0, 26.0),
                 );
                 let pill_resp = ui
                     .interact(pill, Id::new("update-pill"), Sense::click())
