@@ -19,18 +19,8 @@ window. Hardware decoded, fully themeable, English and Persian.
 
 ---
 
-## Screenshots
-
-<p>
-  <img width="49%" alt="Welcome screen" src="docs/screenshots/welcome.png">
-  <img width="49%" alt="Playlist drawer" src="docs/screenshots/playlist.png">
-  <img width="49%" alt="Quick settings" src="docs/screenshots/settings-popover.png">
-  <img width="49%" alt="Preferences" src="docs/screenshots/preferences.png">
-</p>
-
 ## Table of contents
 
-- [Screenshots](#screenshots)
 - [Why MacPlayer](#why-macplayer)
 - [Features](#features)
 - [Download](#download)
